@@ -132,11 +132,13 @@ def _validate_policy(
         errors.append("Missing or invalid v=DMARC1")
 
     p = tags.get("p")
-    if p is None or p.lower() not in POLICY_VALUES:
+    p_invalid = p is None or p.lower() not in POLICY_VALUES
+    if p_invalid:
         errors.append("Missing or invalid p value")
 
     sp = tags.get("sp")
-    if sp is not None and sp.lower() not in POLICY_VALUES:
+    sp_invalid = sp is not None and sp.lower() not in POLICY_VALUES
+    if sp_invalid:
         errors.append("Invalid sp value")
 
     adkim = tags.get("adkim", "r")
@@ -186,6 +188,17 @@ def _validate_policy(
                 else:
                     ruf = parsed or []
 
+    if not strict and (p_invalid or sp_invalid) and rua:
+        # RFC 7489 Section 6.6.3(6): if p/sp is invalid but rua has at least one
+        # valid URI, continue processing as if a record with p=none was found.
+        errors = [
+            error
+            for error in errors
+            if error not in {"Missing or invalid p value", "Invalid sp value"}
+        ]
+        p = "none"
+        sp = None
+
     if errors:
         return None, errors
 
@@ -214,6 +227,8 @@ def _parse_strict(record: str, domain: str) -> tuple[Optional[DmarcPolicy], list
 
     if pairs[0][0] != "v":
         errors.append("v=DMARC1 must be first tag")
+    if len(pairs) < 2 or pairs[1][0] != "p":
+        errors.append("p tag must immediately follow v in strict mode")
 
     tags: dict[str, str] = {}
     for tag, value in pairs:
@@ -331,11 +346,15 @@ def _resolve_dmarc_txt_records(
     return normalized
 
 
+def _record_starts_with_dmarc_version(record: str) -> bool:
+    compact = record.strip().strip('"').lstrip().lower().replace(" ", "")
+    return compact.startswith("v=dmarc1")
+
+
 def _select_candidate_record(txt_records: list[str]) -> tuple[Optional[str], list[str]]:
     candidates = []
     for record in txt_records:
-        compact = record.lower().replace(" ", "")
-        if "v=dmarc1" in compact:
+        if _record_starts_with_dmarc_version(record):
             candidates.append(record)
     if not candidates:
         return None, []
