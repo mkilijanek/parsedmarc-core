@@ -1849,7 +1849,7 @@ def _main():
     }
 
     try:
-        process_reports(results)
+        process_reports(parsing_results)
     except ParserError as error:
         logger.error(error.__str__())
         exit(1)

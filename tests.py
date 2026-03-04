@@ -557,13 +557,29 @@ aggregate_url = http://127.0.0.1:9
                 "argv",
                 ["parsedmarc", "-c", cfg_path, sample_path],
             ):
+                fake_result = {
+                    "report_type": "aggregate",
+                    "report": {
+                        "report_metadata": {
+                            "org_name": "example.org",
+                            "report_id": "r-1",
+                        },
+                        "policy_published": {"domain": "example.org"},
+                        "records": [],
+                    },
+                }
                 with patch.object(
-                    parsedmarc.cli.webhook.WebhookClient,
-                    "save_aggregate_report_to_webhook",
-                    side_effect=RuntimeError("webhook send failed"),
+                    parsedmarc.cli,
+                    "parse_report_file",
+                    return_value=fake_result,
                 ):
-                    with self.assertRaises(SystemExit) as system_exit:
-                        parsedmarc.cli._main()
+                    with patch.object(
+                        parsedmarc.cli.webhook.WebhookClient,
+                        "save_aggregate_report_to_webhook",
+                        side_effect=RuntimeError("webhook send failed"),
+                    ):
+                        with self.assertRaises(SystemExit) as system_exit:
+                            parsedmarc.cli._main()
             self.assertEqual(system_exit.exception.code, 1)
         finally:
             os.remove(cfg_path)
@@ -629,7 +645,7 @@ class TestGmailConnection(unittest.TestCase):
         raw = urlsafe_b64encode(b"Subject: test\n\nbody").decode()
         messages_api.get.return_value.execute.return_value = {"raw": raw}
         content = connection.fetch_message("m1")
-        self.assertIn(b"Subject: test", content)
+        self.assertIn("Subject: test", content)
 
     def testMoveAndDeleteMessage(self):
         connection = self._build_connection()
@@ -1025,7 +1041,7 @@ class TestImapConnection(unittest.TestCase):
             mocked_client.select_folder.assert_called_with("INBOX")
 
             connection.fetch_messages("INBOX", since="2026-03-01")
-            mocked_client.search.assert_called_with(["SINCE", "2026-03-01"])
+            mocked_client.search.assert_called_with("SINCE 2026-03-01")
 
             mocked_client.fetch_message.return_value = "raw-message"
             self.assertEqual(connection.fetch_message(1), "raw-message")
