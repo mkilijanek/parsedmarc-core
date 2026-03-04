@@ -645,6 +645,128 @@ class TestGraphConnection(unittest.TestCase):
                 allow_unencrypted_storage=False,
             )
 
+    def testGenerateCredentialDeviceCode(self):
+        fake_credential = object()
+        with patch.object(graph_module, "_get_cache_args", return_value={"cached": True}):
+            with patch.object(
+                graph_module,
+                "DeviceCodeCredential",
+                return_value=fake_credential,
+            ) as mocked:
+                result = _generate_credential(
+                    graph_module.AuthMethod.DeviceCode.name,
+                    Path("/tmp/token"),
+                    client_id="cid",
+                    client_secret="secret",
+                    username="user",
+                    password="pass",
+                    tenant_id="tenant",
+                    allow_unencrypted_storage=True,
+                )
+        self.assertIs(result, fake_credential)
+        mocked.assert_called_once()
+
+    def testGenerateCredentialUsernamePassword(self):
+        fake_credential = object()
+        with patch.object(graph_module, "_get_cache_args", return_value={"cached": True}):
+            with patch.object(
+                graph_module,
+                "UsernamePasswordCredential",
+                return_value=fake_credential,
+            ) as mocked:
+                result = _generate_credential(
+                    graph_module.AuthMethod.UsernamePassword.name,
+                    Path("/tmp/token"),
+                    client_id="cid",
+                    client_secret="secret",
+                    username="user",
+                    password="pass",
+                    tenant_id="tenant",
+                    allow_unencrypted_storage=False,
+                )
+        self.assertIs(result, fake_credential)
+        mocked.assert_called_once()
+
+    def testGenerateCredentialClientSecret(self):
+        fake_credential = object()
+        with patch.object(
+            graph_module, "ClientSecretCredential", return_value=fake_credential
+        ) as mocked:
+            result = _generate_credential(
+                graph_module.AuthMethod.ClientSecret.name,
+                Path("/tmp/token"),
+                client_id="cid",
+                client_secret="secret",
+                username="user",
+                password="pass",
+                tenant_id="tenant",
+                allow_unencrypted_storage=False,
+            )
+        self.assertIs(result, fake_credential)
+        mocked.assert_called_once_with(
+            client_id="cid", tenant_id="tenant", client_secret="secret"
+        )
+
+    def testInitUsesSharedMailboxScopes(self):
+        class FakeCredential:
+            def __init__(self):
+                self.authenticate = MagicMock(return_value="auth-record")
+
+        fake_credential = FakeCredential()
+        with patch.object(
+            graph_module, "_generate_credential", return_value=fake_credential
+        ):
+            with patch.object(graph_module, "_cache_auth_record") as cache_auth:
+                with patch.object(graph_module, "GraphClient") as graph_client:
+                    MSGraphConnection(
+                        auth_method=graph_module.AuthMethod.DeviceCode.name,
+                        mailbox="shared@example.com",
+                        graph_url="https://graph.microsoft.com",
+                        client_id="cid",
+                        client_secret="secret",
+                        username="owner@example.com",
+                        password="pass",
+                        tenant_id="tenant",
+                        token_file="/tmp/token-file",
+                        allow_unencrypted_storage=True,
+                    )
+        fake_credential.authenticate.assert_called_once_with(
+            scopes=["Mail.ReadWrite.Shared"]
+        )
+        cache_auth.assert_called_once()
+        graph_client.assert_called_once()
+        self.assertEqual(
+            graph_client.call_args.kwargs.get("scopes"), ["Mail.ReadWrite.Shared"]
+        )
+
+    def testInitClientSecretSkipsAuthenticate(self):
+        class FakeClientSecretCredential:
+            pass
+
+        fake_credential = FakeClientSecretCredential()
+        with patch.object(
+            graph_module, "ClientSecretCredential", FakeClientSecretCredential
+        ):
+            with patch.object(
+                graph_module, "_generate_credential", return_value=fake_credential
+            ):
+                with patch.object(graph_module, "_cache_auth_record") as cache_auth:
+                    with patch.object(graph_module, "GraphClient") as graph_client:
+                        MSGraphConnection(
+                            auth_method=graph_module.AuthMethod.ClientSecret.name,
+                            mailbox="mailbox@example.com",
+                            graph_url="https://graph.microsoft.com",
+                            client_id="cid",
+                            client_secret="secret",
+                            username="mailbox@example.com",
+                            password="pass",
+                            tenant_id="tenant",
+                            token_file="/tmp/token-file",
+                            allow_unencrypted_storage=True,
+                        )
+        cache_auth.assert_not_called()
+        self.assertNotIn("scopes", graph_client.call_args.kwargs)
+
     def testCreateFolderAndMoveErrors(self):
         connection = MSGraphConnection.__new__(MSGraphConnection)
         connection.mailbox_name = "mailbox@example.com"
@@ -657,6 +779,19 @@ class TestGraphConnection(unittest.TestCase):
         connection._client.post.return_value = _FakeGraphResponse(409, {})
         connection.create_folder("Archive")
 
+    def testCreateFolderSubfolderSuccess(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.post.return_value = _FakeGraphResponse(201, {})
+        connection._find_folder_id_with_parent = MagicMock(side_effect=["parent-id"])
+        connection.create_folder("Parent/Child")
+        connection._find_folder_id_with_parent.assert_called_once_with("Parent", None)
+        connection._client.post.assert_called_once_with(
+            "/users/mailbox@example.com/mailFolders/parent-id/childFolders",
+            json={"displayName": "Child"},
+        )
+
     def testMarkReadDeleteFailures(self):
         connection = MSGraphConnection.__new__(MSGraphConnection)
         connection.mailbox_name = "mailbox@example.com"
@@ -668,6 +803,83 @@ class TestGraphConnection(unittest.TestCase):
         connection._client.delete.return_value = _FakeGraphResponse(500, {"error": "x"})
         with self.assertRaises(RuntimeWarning):
             connection.delete_message("m1")
+
+    def testFetchMessagesNormalizesDefaults(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._find_folder_id_from_folder_path = MagicMock(return_value="folder-id")
+        connection._get_all_messages = MagicMock(return_value=[{"id": "1"}])
+        message_ids = connection.fetch_messages("Inbox")
+        self.assertEqual(message_ids, ["1"])
+        connection._get_all_messages.assert_called_once_with(
+            "/users/mailbox@example.com/mailFolders/folder-id/messages", 0, None
+        )
+
+    def testGetAllMessagesInitialRequestFailure(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(500, text="boom")
+        with self.assertRaises(RuntimeError):
+            connection._get_all_messages("/url", batch_size=5, since=None)
+
+    def testGetAllMessagesNextPageFailure(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        first_response = _FakeGraphResponse(
+            200, {"value": [{"id": "1"}], "@odata.nextLink": "next-url"}
+        )
+        second_response = _FakeGraphResponse(500, text="boom")
+        connection._client = MagicMock()
+        connection._client.get.side_effect = [first_response, second_response]
+        with self.assertRaises(RuntimeError):
+            connection._get_all_messages("/url", batch_size=0, since=None)
+
+    def testFindFolderIdWithParentFallsBackToWellKnown(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(500, {"error": "x"})
+        connection._get_well_known_folder_id = MagicMock(return_value="inbox-id")
+        self.assertEqual(
+            connection._find_folder_id_with_parent("Inbox", None), "inbox-id"
+        )
+
+    def testFindFolderIdWithParentListFailure(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(500, {"error": "x"})
+        with self.assertRaises(RuntimeWarning):
+            connection._find_folder_id_with_parent("Child", "parent-id")
+
+    def testFindFolderIdFromFolderPathNested(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._find_folder_id_with_parent = MagicMock(
+            side_effect=["first-id", "second-id"]
+        )
+        folder_id = connection._find_folder_id_from_folder_path("A/B")
+        self.assertEqual(folder_id, "second-id")
+        self.assertEqual(connection._find_folder_id_with_parent.call_count, 2)
+
+    def testGetWellKnownFolderIdPaths(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        self.assertIsNone(connection._get_well_known_folder_id("Not-Alias"))
+        connection._client.get.return_value = _FakeGraphResponse(404, {})
+        self.assertIsNone(connection._get_well_known_folder_id("Inbox"))
+        connection._client.get.return_value = _FakeGraphResponse(200, {"id": "x"})
+        self.assertEqual(connection._get_well_known_folder_id("Inbox"), "x")
+
+    def testWatchRunsCallback(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        callback = MagicMock()
+        with patch.object(
+            graph_module, "sleep", side_effect=[None, _BreakLoop("stop")]
+        ):
+            with self.assertRaises(_BreakLoop):
+                connection.watch(callback, check_timeout=1)
+        callback.assert_called_once_with(connection)
 
 
 class TestImapConnection(unittest.TestCase):
