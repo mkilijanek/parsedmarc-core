@@ -137,7 +137,7 @@ The full set of configuration options are:
   - `offline` - bool: Do not use online queries for geolocation
       or DNS
   - `always_use_local_files` - Disables the download of the reverse DNS map
-  - `local_reverse_dns_map_path` - Overrides the default local file path to use for the reverse DNS map
+  - `reverse_dns_map_path` - Overrides the default local file path to use for the reverse DNS map
   - `reverse_dns_map_url` - Overrides the default download URL for the reverse DNS map
   - `nameservers` - str: A comma separated list of
       DNS resolvers (Default: `[Cloudflare's public resolvers]`)
@@ -149,7 +149,8 @@ The full set of configuration options are:
   - `log_file` - str: Write log messages to a file at this path
   - `n_procs` - int: Number of process to run in parallel when
       parsing in CLI mode (Default: `1`)
-  - `dmarc_strict_mode` - str: DMARC DNS policy parsing mode for internal APIs.
+  - `dmarc_strict_mode` - str: DMARC DNS policy parsing mode used by DMARC DNS
+      policy helper APIs (`parse_dmarc_record()`, `discover_dmarc_policy()`).
       Values: `auto` (strict then fallback), `strict`, or `legacy` (fallback-only).
       Default: `auto`.
 
@@ -304,7 +305,7 @@ The full set of configuration options are:
 - `kafka`
   - `hosts` - str: A comma separated list of Kafka hosts
   - `user` - str: The Kafka user
-  - `passsword` - str: The Kafka password
+  - `password` - str: The Kafka password
   - `ssl` - bool: Use an encrypted SSL/TLS connection (Default: `True`)
   - `skip_certificate_verification` - bool: Skip certificate
     verification (not recommended)

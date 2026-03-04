@@ -35,6 +35,13 @@
    :members:
 ```
 
+## parsedmarc.dmarc_policy
+
+```{eval-rst}
+.. automodule:: parsedmarc.dmarc_policy
+   :members:
+```
+
 ## Indices and tables
 
 - {ref}`genindex`

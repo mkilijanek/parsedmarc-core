@@ -44,6 +44,8 @@ and Valimail.
 - Optionally send the results to Elasticsearch, Opensearch, and/or Splunk, for use
     with premade dashboards
 - Optionally send reports to Apache Kafka
+- Provides DMARC DNS policy parsing/discovery helpers (`parse_dmarc_record()`,
+    `discover_dmarc_policy()`) with strict/legacy compatibility modes
 
 ## Python Compatibility
 
