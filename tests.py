@@ -4,13 +4,15 @@
 from __future__ import absolute_import, print_function, unicode_literals
 
 import os
+import sys
+import tempfile
 import unittest
 from base64 import urlsafe_b64encode
 from glob import glob
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from unittest.mock import MagicMock
 from unittest.mock import patch
+from unittest.mock import MagicMock
 
 from lxml import etree
 from googleapiclient.errors import HttpError
@@ -18,11 +20,12 @@ from httplib2 import Response
 from imapclient.exceptions import IMAPClientError
 
 import parsedmarc
+import parsedmarc.cli
+from parsedmarc.mail.graph import MSGraphConnection
 from parsedmarc.mail.gmail import GmailConnection
 from parsedmarc.mail.gmail import _get_creds
-from parsedmarc.mail.graph import MSGraphConnection
-from parsedmarc.mail.graph import _generate_credential
 from parsedmarc.mail.graph import _get_cache_args
+from parsedmarc.mail.graph import _generate_credential
 from parsedmarc.mail.graph import _load_token
 from parsedmarc.mail.imap import IMAPConnection
 import parsedmarc.mail.gmail as gmail_module
@@ -184,6 +187,271 @@ class Test(unittest.TestCase):
             print("Passed!")
 
 
+class _FakePSL:
+    def privatesuffix(self, domain):
+        domain = domain.lower()
+        if domain.endswith(".example.co.uk"):
+            return "example.co.uk"
+        if domain.endswith(".example.com"):
+            return "example.com"
+        return domain
+
+    def publicsuffix(self, domain):
+        domain = domain.lower()
+        if domain.endswith(".co.uk"):
+            return "co.uk"
+        if domain.endswith(".com"):
+            return "com"
+        return domain.split(".")[-1]
+
+
+class TestDmarcPolicy(unittest.TestCase):
+    def testStrictValidRecord(self):
+        txt = "v=DMARC1; p=reject; adkim=s; aspf=r; pct=100; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.p, "reject")
+        self.assertEqual(policy.adkim, "s")
+        self.assertEqual(policy.rua, ["mailto:dmarc@example.com"])
+
+    def testStrictInvalidUnknownTagFallbackValid(self):
+        txt = "v=DMARC1; p=quarantine; x-unknown=test; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertTrue(any("Unknown tag in strict mode" in error for error in errors))
+
+    def testStrictInvalidDuplicateTagFallbackValid(self):
+        txt = "v=DMARC1; p=none; p=reject; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(policy.p, "none")
+        self.assertTrue(any("Duplicate tag in strict mode" in error for error in errors))
+
+    def testStrictInvalidVNotFirstFallbackValid(self):
+        txt = "p=none; v=DMARC1; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertTrue(any("v=DMARC1 must be first tag" in error for error in errors))
+
+    def testInvalidUnrecoverableBadVersion(self):
+        txt = "v=DMARC2; p=reject"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertTrue(any("invalid v=DMARC1" in error for error in errors))
+
+    def testInvalidUnrecoverablePctOutOfRange(self):
+        txt = "v=DMARC1; p=reject; pct=101"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertTrue(any("pct must be in range 0..100" in error for error in errors))
+
+    def testInvalidUnrecoverableMalformedRua(self):
+        txt = "v=DMARC1; p=reject; rua=https://example.com/report"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertTrue(any("Malformed URI" in error for error in errors))
+
+    def testIdnNormalization(self):
+        normalized = parsedmarc.normalize_domain("żółć.pl")
+        self.assertEqual(normalized, "xn--kda4b0koi.pl")
+        self.assertTrue(
+            parsedmarc.domains_equal_for_alignment("ŻÓŁĆ.pl", "xn--kda4b0koi.pl")
+        )
+
+    def testPsdDiscoveryEnabledAutoMode(self):
+        records = {
+            "_dmarc.mail.example.co.uk": [],
+            "_dmarc.example.co.uk": [],
+            "_dmarc.co.uk": ["v=DMARC1; p=reject; rua=mailto:psd@co.uk"],
+        }
+
+        def resolver(name, record_type):
+            if record_type != "TXT":
+                return []
+            return records.get(name, [])
+
+        policy, discovery_path, mode = parsedmarc.discover_dmarc_policy(
+            "mail.example.co.uk",
+            dns_resolver=resolver,
+            psl_provider=_FakePSL(),
+            flags={"enable_psd": True, "dmarc_strict_mode": "auto"},
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(policy.source, "psd")
+        self.assertEqual(mode, "strict")
+        self.assertEqual(
+            discovery_path,
+            [
+                "_dmarc.mail.example.co.uk:0",
+                "_dmarc.example.co.uk:0",
+                "_dmarc.co.uk:1",
+            ],
+        )
+
+    def testPsdIgnoredInLegacyMode(self):
+        records = {
+            "_dmarc.mail.example.co.uk": [],
+            "_dmarc.example.co.uk": [],
+            "_dmarc.co.uk": ["v=DMARC1; p=reject; rua=mailto:psd@co.uk"],
+        }
+
+        def resolver(name, record_type):
+            if record_type != "TXT":
+                return []
+            return records.get(name, [])
+
+        policy, discovery_path, mode = parsedmarc.discover_dmarc_policy(
+            "mail.example.co.uk",
+            dns_resolver=resolver,
+            psl_provider=_FakePSL(),
+            flags={"enable_psd": True, "dmarc_strict_mode": "legacy"},
+        )
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertEqual(
+            discovery_path,
+            ["_dmarc.mail.example.co.uk:0", "_dmarc.example.co.uk:0"],
+        )
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeGraphClient:
+    def get(self, url, params=None):
+        if "/mailFolders/inbox?$select=id,displayName" in url:
+            return _FakeResponse(200, {"id": "inbox-id", "displayName": "Inbox"})
+
+        if "/mailFolders?$filter=displayName eq 'Inbox'" in url:
+            return _FakeResponse(
+                404,
+                {
+                    "error": {
+                        "code": "ErrorItemNotFound",
+                        "message": "Default folder Root not found.",
+                    }
+                },
+            )
+
+        if "/mailFolders?$filter=displayName eq 'Custom'" in url:
+            return _FakeResponse(
+                404,
+                {
+                    "error": {
+                        "code": "ErrorItemNotFound",
+                        "message": "Default folder Root not found.",
+                    }
+                },
+            )
+        return _FakeResponse(404, {"error": {"code": "NotFound"}})
+
+
+class _DummyMailboxConnection:
+    def __init__(self):
+        self.fetch_calls = []
+
+    def create_folder(self, folder_name):
+        return None
+
+    def fetch_messages(self, reports_folder, **kwargs):
+        self.fetch_calls.append({"reports_folder": reports_folder, **kwargs})
+        return []
+
+    def fetch_message(self, message_id, **kwargs):
+        return ""
+
+    def delete_message(self, message_id):
+        return None
+
+    def move_message(self, message_id, folder_name):
+        return None
+
+    def keepalive(self):
+        return None
+
+    def watch(self, check_callback, check_timeout):
+        return None
+
+
+class TestIssueFixes(unittest.TestCase):
+    def testMsGraphWellKnownFolderFallback(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "shared@example.com"
+        connection._client = _FakeGraphClient()
+
+        folder_id = connection._find_folder_id_from_folder_path("Inbox")
+        self.assertEqual(folder_id, "inbox-id")
+
+    def testMsGraphUnknownFolderStillFails(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "shared@example.com"
+        connection._client = _FakeGraphClient()
+
+        with self.assertRaises(RuntimeWarning):
+            connection._find_folder_id_from_folder_path("Custom")
+
+    def testMailboxBatchModeAvoidsExtraFullFetch(self):
+        connection = _DummyMailboxConnection()
+        parsedmarc.get_dmarc_reports_from_mailbox(
+            connection=connection,
+            reports_folder="INBOX",
+            test=True,
+            batch_size=10,
+            create_folders=False,
+        )
+        self.assertEqual(len(connection.fetch_calls), 1)
+
+    def testCliFailOnOutputErrorExitsNonZero(self):
+        sample_paths = sorted(glob("samples/aggregate/*.xml"))
+        self.assertTrue(len(sample_paths) > 0)
+        sample_path = sample_paths[0]
+
+        config_text = """
+[general]
+silent = True
+offline = True
+always_use_local_files = True
+save_aggregate = True
+fail_on_output_error = True
+
+[webhook]
+aggregate_url = http://127.0.0.1:9
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg_file:
+            cfg_file.write(config_text)
+            cfg_path = cfg_file.name
+
+        try:
+            with patch.object(
+                sys,
+                "argv",
+                ["parsedmarc", "-c", cfg_path, sample_path],
+            ):
+                with patch.object(
+                    parsedmarc.cli.webhook.WebhookClient,
+                    "save_aggregate_report_to_webhook",
+                    side_effect=RuntimeError("webhook send failed"),
+                ):
+                    with self.assertRaises(SystemExit) as system_exit:
+                        parsedmarc.cli._main()
+            self.assertEqual(system_exit.exception.code, 1)
+        finally:
+            os.remove(cfg_path)
+
+
 class _FakeGraphResponse:
     def __init__(self, status_code, payload=None, text=""):
         self.status_code = status_code
@@ -244,7 +512,7 @@ class TestGmailConnection(unittest.TestCase):
         raw = urlsafe_b64encode(b"Subject: test\n\nbody").decode()
         messages_api.get.return_value.execute.return_value = {"raw": raw}
         content = connection.fetch_message("m1")
-        self.assertIn("Subject: test", content)
+        self.assertIn(b"Subject: test", content)
 
     def testMoveAndDeleteMessage(self):
         connection = self._build_connection()
@@ -344,9 +612,7 @@ class TestGraphConnection(unittest.TestCase):
         connection = MSGraphConnection.__new__(MSGraphConnection)
         connection.mailbox_name = "mailbox@example.com"
         connection._client = MagicMock()
-        connection._client.get.return_value = _FakeGraphResponse(
-            200, text="email-content"
-        )
+        connection._client.get.return_value = _FakeGraphResponse(200, text="email-content")
         connection.mark_message_read = MagicMock()
         content = connection.fetch_message("123", mark_read=True)
         self.assertEqual(content, "email-content")
@@ -409,6 +675,27 @@ class TestGraphConnection(unittest.TestCase):
         self.assertIs(result, fake_credential)
         mocked.assert_called_once()
 
+    def testGenerateCredentialUsernamePassword(self):
+        fake_credential = object()
+        with patch.object(graph_module, "_get_cache_args", return_value={"cached": True}):
+            with patch.object(
+                graph_module,
+                "UsernamePasswordCredential",
+                return_value=fake_credential,
+            ) as mocked:
+                result = _generate_credential(
+                    graph_module.AuthMethod.UsernamePassword.name,
+                    Path("/tmp/token"),
+                    client_id="cid",
+                    client_secret="secret",
+                    username="user",
+                    password="pass",
+                    tenant_id="tenant",
+                    allow_unencrypted_storage=False,
+                )
+        self.assertIs(result, fake_credential)
+        mocked.assert_called_once()
+
     def testGenerateCredentialClientSecret(self):
         fake_credential = object()
         with patch.object(
@@ -461,6 +748,34 @@ class TestGraphConnection(unittest.TestCase):
             graph_client.call_args.kwargs.get("scopes"), ["Mail.ReadWrite.Shared"]
         )
 
+    def testInitClientSecretSkipsAuthenticate(self):
+        class FakeClientSecretCredential:
+            pass
+
+        fake_credential = FakeClientSecretCredential()
+        with patch.object(
+            graph_module, "ClientSecretCredential", FakeClientSecretCredential
+        ):
+            with patch.object(
+                graph_module, "_generate_credential", return_value=fake_credential
+            ):
+                with patch.object(graph_module, "_cache_auth_record") as cache_auth:
+                    with patch.object(graph_module, "GraphClient") as graph_client:
+                        MSGraphConnection(
+                            auth_method=graph_module.AuthMethod.ClientSecret.name,
+                            mailbox="mailbox@example.com",
+                            graph_url="https://graph.microsoft.com",
+                            client_id="cid",
+                            client_secret="secret",
+                            username="mailbox@example.com",
+                            password="pass",
+                            tenant_id="tenant",
+                            token_file="/tmp/token-file",
+                            allow_unencrypted_storage=True,
+                        )
+        cache_auth.assert_not_called()
+        self.assertNotIn("scopes", graph_client.call_args.kwargs)
+
     def testCreateFolderAndMoveErrors(self):
         connection = MSGraphConnection.__new__(MSGraphConnection)
         connection.mailbox_name = "mailbox@example.com"
@@ -469,8 +784,22 @@ class TestGraphConnection(unittest.TestCase):
         connection._find_folder_id_from_folder_path = MagicMock(return_value="dest")
         with self.assertRaises(RuntimeWarning):
             connection.move_message("m1", "Archive")
+
         connection._client.post.return_value = _FakeGraphResponse(409, {})
         connection.create_folder("Archive")
+
+    def testCreateFolderSubfolderSuccess(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.post.return_value = _FakeGraphResponse(201, {})
+        connection._find_folder_id_with_parent = MagicMock(side_effect=["parent-id"])
+        connection.create_folder("Parent/Child")
+        connection._find_folder_id_with_parent.assert_called_once_with("Parent", None)
+        connection._client.post.assert_called_once_with(
+            "/users/mailbox@example.com/mailFolders/parent-id/childFolders",
+            json={"displayName": "Child"},
+        )
 
     def testMarkReadDeleteFailures(self):
         connection = MSGraphConnection.__new__(MSGraphConnection)
@@ -479,9 +808,87 @@ class TestGraphConnection(unittest.TestCase):
         connection._client.patch.return_value = _FakeGraphResponse(500, {"error": "x"})
         with self.assertRaises(RuntimeWarning):
             connection.mark_message_read("m1")
+
         connection._client.delete.return_value = _FakeGraphResponse(500, {"error": "x"})
         with self.assertRaises(RuntimeWarning):
             connection.delete_message("m1")
+
+    def testFetchMessagesNormalizesDefaults(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._find_folder_id_from_folder_path = MagicMock(return_value="folder-id")
+        connection._get_all_messages = MagicMock(return_value=[{"id": "1"}])
+        message_ids = connection.fetch_messages("Inbox")
+        self.assertEqual(message_ids, ["1"])
+        connection._get_all_messages.assert_called_once_with(
+            "/users/mailbox@example.com/mailFolders/folder-id/messages", 0, None
+        )
+
+    def testGetAllMessagesInitialRequestFailure(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(500, text="boom")
+        with self.assertRaises(RuntimeError):
+            connection._get_all_messages("/url", batch_size=5, since=None)
+
+    def testGetAllMessagesNextPageFailure(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        first_response = _FakeGraphResponse(
+            200, {"value": [{"id": "1"}], "@odata.nextLink": "next-url"}
+        )
+        second_response = _FakeGraphResponse(500, text="boom")
+        connection._client = MagicMock()
+        connection._client.get.side_effect = [first_response, second_response]
+        with self.assertRaises(RuntimeError):
+            connection._get_all_messages("/url", batch_size=0, since=None)
+
+    def testFindFolderIdWithParentFallsBackToWellKnown(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(500, {"error": "x"})
+        connection._get_well_known_folder_id = MagicMock(return_value="inbox-id")
+        self.assertEqual(
+            connection._find_folder_id_with_parent("Inbox", None), "inbox-id"
+        )
+
+    def testFindFolderIdWithParentListFailure(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(500, {"error": "x"})
+        with self.assertRaises(RuntimeWarning):
+            connection._find_folder_id_with_parent("Child", "parent-id")
+
+    def testFindFolderIdFromFolderPathNested(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._find_folder_id_with_parent = MagicMock(
+            side_effect=["first-id", "second-id"]
+        )
+        folder_id = connection._find_folder_id_from_folder_path("A/B")
+        self.assertEqual(folder_id, "second-id")
+        self.assertEqual(connection._find_folder_id_with_parent.call_count, 2)
+
+    def testGetWellKnownFolderIdPaths(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        self.assertIsNone(connection._get_well_known_folder_id("Not-Alias"))
+        connection._client.get.return_value = _FakeGraphResponse(404, {})
+        self.assertIsNone(connection._get_well_known_folder_id("Inbox"))
+        connection._client.get.return_value = _FakeGraphResponse(200, {"id": "x"})
+        self.assertEqual(connection._get_well_known_folder_id("Inbox"), "x")
+
+    def testWatchRunsCallback(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        callback = MagicMock()
+        with patch.object(
+            graph_module, "sleep", side_effect=[None, _BreakLoop("stop")]
+        ):
+            with self.assertRaises(_BreakLoop):
+                connection.watch(callback, check_timeout=1)
+        callback.assert_called_once_with(connection)
 
 
 class TestImapConnection(unittest.TestCase):
@@ -492,19 +899,26 @@ class TestImapConnection(unittest.TestCase):
             connection = IMAPConnection(
                 "imap.example.com", user="user", password="pass"
             )
+
             connection.create_folder("Archive")
             mocked_client.create_folder.assert_called_once_with("Archive")
+
             mocked_client.search.return_value = [1, 2]
             self.assertEqual(connection.fetch_messages("INBOX"), [1, 2])
             mocked_client.select_folder.assert_called_with("INBOX")
+
             connection.fetch_messages("INBOX", since="2026-03-01")
-            mocked_client.search.assert_called_with("SINCE 2026-03-01")
+            mocked_client.search.assert_called_with(["SINCE", "2026-03-01"])
+
             mocked_client.fetch_message.return_value = "raw-message"
             self.assertEqual(connection.fetch_message(1), "raw-message")
+
             connection.delete_message(7)
             mocked_client.delete_messages.assert_called_once_with([7])
+
             connection.move_message(8, "Archive")
             mocked_client.move_messages.assert_called_once_with([8], "Archive")
+
             connection.keepalive()
             mocked_client.noop.assert_called_once()
 
@@ -518,6 +932,7 @@ class TestImapConnection(unittest.TestCase):
             connection = IMAPConnection(
                 "imap.example.com", user="user", password="pass"
             )
+
             calls = {"count": 0}
 
             def fake_imap_constructor(*args, **kwargs):

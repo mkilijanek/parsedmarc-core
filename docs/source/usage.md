@@ -137,7 +137,7 @@ The full set of configuration options are:
   - `offline` - bool: Do not use online queries for geolocation
       or DNS
   - `always_use_local_files` - Disables the download of the reverse DNS map
-  - `local_reverse_dns_map_path` - Overrides the default local file path to use for the reverse DNS map
+  - `reverse_dns_map_path` - Overrides the default local file path to use for the reverse DNS map
   - `reverse_dns_map_url` - Overrides the default download URL for the reverse DNS map
   - `nameservers` - str: A comma separated list of
       DNS resolvers (Default: `[Cloudflare's public resolvers]`)
@@ -146,9 +146,16 @@ The full set of configuration options are:
   - `dns_timeout` - float: DNS timeout period
   - `debug` - bool: Print debugging messages
   - `silent` - bool: Only print errors (Default: `True`)
+  - `fail_on_output_error` - bool: Exit with a non-zero status code when a
+      configured output destination (e.g. Elasticsearch/OpenSearch/Splunk/S3)
+      returns an error during save/publish operations. Default: `False`.
   - `log_file` - str: Write log messages to a file at this path
   - `n_procs` - int: Number of process to run in parallel when
       parsing in CLI mode (Default: `1`)
+  - `dmarc_strict_mode` - str: DMARC DNS policy parsing mode used by DMARC DNS
+      policy helper APIs (`parse_dmarc_record()`, `discover_dmarc_policy()`).
+      Values: `auto` (strict then fallback), `strict`, or `legacy` (fallback-only).
+      Default: `auto`.
 
     :::{note}
     Setting this to a number larger than one can improve
@@ -258,6 +265,17 @@ The full set of configuration options are:
   - `user` - str: Basic auth username
   - `password` - str: Basic auth password
   - `api_key` - str: API key
+
+    :::{note}
+    For Elasticsearch API key auth, use a base64 value of `<id>:<api_key>`
+    from the Elasticsearch `_security/api_key` response. Example:
+
+    ```bash
+    echo -n '<id>:<api_key>' | base64
+    ```
+
+    Use `-n` to avoid a trailing newline in the encoded value.
+    :::
   - `ssl` - bool: Use an encrypted SSL/TLS connection
     (Default: `True`)
   - `timeout` - float: Timeout in seconds (Default: 60)
@@ -301,7 +319,7 @@ The full set of configuration options are:
 - `kafka`
   - `hosts` - str: A comma separated list of Kafka hosts
   - `user` - str: The Kafka user
-  - `passsword` - str: The Kafka password
+  - `password` - str: The Kafka password
   - `ssl` - bool: Use an encrypted SSL/TLS connection (Default: `True`)
   - `skip_certificate_verification` - bool: Skip certificate
     verification (not recommended)

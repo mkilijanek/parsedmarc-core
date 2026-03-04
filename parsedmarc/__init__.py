@@ -63,6 +63,20 @@ from parsedmarc.utils import (
     timestamp_to_human,
 )
 
+from parsedmarc.constants import __version__
+from parsedmarc.utils import get_base_domain, get_ip_address_info
+from parsedmarc.utils import is_outlook_msg, convert_outlook_msg
+from parsedmarc.utils import parse_email
+from parsedmarc.utils import timestamp_to_human, human_timestamp_to_datetime
+from parsedmarc.dmarc_policy import (
+    DmarcPolicy,
+    parse_dmarc_record,
+    discover_dmarc_policy,
+    normalize_domain,
+    domains_equal_for_alignment,
+)
+
+
 logger.debug("parsedmarc v{0}".format(__version__))
 
 feedback_report_regex = re.compile(r"^([\w\-]+): (.+)$", re.MULTILINE)
@@ -1983,13 +1997,11 @@ def get_dmarc_reports_from_mailbox(
                 i + 1, message_limit, msg_uid
             )
         )
-        message_id: Union[int, str]
-        if isinstance(connection, IMAPConnection):
-            message_id = int(msg_uid)
-            msg_content = connection.fetch_message(message_id)
-        elif isinstance(connection, MSGraphConnection):
-            message_id = str(msg_uid)
-            msg_content = connection.fetch_message(message_id, mark_read=not test)
+        if isinstance(connection, MSGraphConnection):
+            if test:
+                msg_content = connection.fetch_message(msg_uid, mark_read=False)
+            else:
+                msg_content = connection.fetch_message(msg_uid, mark_read=True)
         else:
             message_id = str(msg_uid) if not isinstance(msg_uid, str) else msg_uid
             msg_content = connection.fetch_message(message_id)
@@ -2137,14 +2149,17 @@ def get_dmarc_reports_from_mailbox(
         "smtp_tls_reports": smtp_tls_reports,
     }
 
-    if current_time:
-        total_messages = len(
-            connection.fetch_messages(reports_folder, since=current_time)
-        )
+    if not test and not batch_size:
+        if current_time:
+            total_messages = len(
+                connection.fetch_messages(reports_folder, since=current_time)
+            )
+        else:
+            total_messages = len(connection.fetch_messages(reports_folder))
     else:
-        total_messages = len(connection.fetch_messages(reports_folder))
+        total_messages = 0
 
-    if not test and not batch_size and total_messages > 0:
+    if total_messages > 0:
         # Process emails that came in during the last run
         results = get_dmarc_reports_from_mailbox(
             connection=connection,
