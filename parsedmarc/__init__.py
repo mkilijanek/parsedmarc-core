@@ -39,7 +39,7 @@ from parsedmarc.mail import (
 )
 
 from parsedmarc.constants import __version__
-from parsedmarc.utils import get_base_domain, get_ip_address_info
+from parsedmarc.utils import get_base_domain, get_ip_address_info, query_dns
 from parsedmarc.utils import is_outlook_msg, convert_outlook_msg
 from parsedmarc.utils import parse_email
 from parsedmarc.utils import timestamp_to_human, human_timestamp_to_datetime
@@ -375,7 +375,7 @@ def _parse_report_record(
         new_record["identifiers"] = record["identifiers"].copy()
     new_record["auth_results"] = OrderedDict([("dkim", []), ("spf", [])])
     if type(new_record["identifiers"]["header_from"]) is str:
-        lowered_from = new_record["identifiers"]["header_from"].lower()
+        lowered_from = normalize_domain(new_record["identifiers"]["header_from"])
     else:
         lowered_from = ""
     new_record["identifiers"]["header_from"] = lowered_from
@@ -392,7 +392,7 @@ def _parse_report_record(
         auth_results["dkim"] = [auth_results["dkim"]]
     for result in auth_results["dkim"]:
         if "domain" in result and result["domain"] is not None:
-            new_result = OrderedDict([("domain", result["domain"])])
+            new_result = OrderedDict([("domain", normalize_domain(result["domain"]))])
             if "selector" in result and result["selector"] is not None:
                 new_result["selector"] = result["selector"]
             else:
@@ -407,7 +407,7 @@ def _parse_report_record(
         auth_results["spf"] = [auth_results["spf"]]
     for result in auth_results["spf"]:
         if "domain" in result and result["domain"] is not None:
-            new_result = OrderedDict([("domain", result["domain"])])
+            new_result = OrderedDict([("domain", normalize_domain(result["domain"]))])
             if "scope" in result and result["scope"] is not None:
                 new_result["scope"] = result["scope"]
             else:
@@ -425,14 +425,14 @@ def _parse_report_record(
             if "domain" in spf_result:
                 envelope_from = spf_result["domain"]
         if envelope_from is not None:
-            envelope_from = str(envelope_from).lower()
+            envelope_from = normalize_domain(str(envelope_from))
         new_record["identifiers"]["envelope_from"] = envelope_from
 
     elif new_record["identifiers"]["envelope_from"] is None:
         if len(auth_results["spf"]) > 0:
             envelope_from = new_record["auth_results"]["spf"][-1]["domain"]
             if envelope_from is not None:
-                envelope_from = str(envelope_from).lower()
+                envelope_from = normalize_domain(str(envelope_from))
             new_record["identifiers"]["envelope_from"] = envelope_from
 
     envelope_to = None
@@ -651,6 +651,9 @@ def parse_aggregate_report_xml(
     timeout: Optional[float] = 2.0,
     keep_alive: Optional[Callable] = None,
     normalize_timespan_threshold_hours: float = 24.0,
+    dmarc_strict_mode: str = "auto",
+    dmarc_enable_psd: bool = False,
+    dmarc_validate_policy_dns: bool = False,
 ) -> OrderedDict[str, Any]:
     """Parses a DMARC XML report string and returns a consistent OrderedDict
 
@@ -666,6 +669,9 @@ def parse_aggregate_report_xml(
         timeout (float): Sets the DNS timeout in seconds
         keep_alive (callable): Keep alive function
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        dmarc_strict_mode (str): DMARC policy parse mode (`auto`, `strict`, `legacy`)
+        dmarc_enable_psd (bool): Enable PSD lookup for DMARC policy discovery
+        dmarc_validate_policy_dns (bool): Validate report policy against DNS discovery
 
     Returns:
         OrderedDict: The parsed aggregate DMARC report
@@ -763,7 +769,11 @@ def parse_aggregate_report_xml(
         if type(policy_published) is list:
             policy_published = policy_published[0]
         new_policy_published = OrderedDict()
-        new_policy_published["domain"] = policy_published["domain"]
+        policy_domain = policy_published["domain"]
+        if policy_domain is None:
+            policy_domain = ""
+        policy_domain = normalize_domain(str(policy_domain))
+        new_policy_published["domain"] = policy_domain
         adkim = "r"
         if "adkim" in policy_published:
             if policy_published["adkim"] is not None:
@@ -790,6 +800,68 @@ def parse_aggregate_report_xml(
             if policy_published["fo"] is not None:
                 fo = policy_published["fo"]
         new_policy_published["fo"] = fo
+
+        published_policy_txt = "v=DMARC1; p={0}; adkim={1}; aspf={2}; sp={3}; pct={4}; fo={5}".format(
+            new_policy_published["p"],
+            new_policy_published["adkim"],
+            new_policy_published["aspf"],
+            new_policy_published["sp"],
+            new_policy_published["pct"],
+            new_policy_published["fo"],
+        )
+        parsed_policy, _parsed_mode, _parsed_errors = parse_dmarc_record(
+            published_policy_txt,
+            domain=policy_domain,
+            dmarc_strict_mode=dmarc_strict_mode,
+        )
+        if parsed_policy is not None:
+            new_policy_published["domain"] = parsed_policy.domain or policy_domain
+            new_policy_published["adkim"] = parsed_policy.adkim
+            new_policy_published["aspf"] = parsed_policy.aspf
+            new_policy_published["p"] = parsed_policy.p
+            new_policy_published["sp"] = parsed_policy.sp or parsed_policy.p
+            new_policy_published["pct"] = str(parsed_policy.pct)
+            new_policy_published["fo"] = parsed_policy.fo
+        elif _parsed_errors:
+            logger.debug(
+                "DMARC policy_published parse fallback for %s: %s",
+                policy_domain,
+                "; ".join(_parsed_errors),
+            )
+
+        if dmarc_validate_policy_dns and not offline and policy_domain:
+            flags = {
+                "dmarc_strict_mode": dmarc_strict_mode,
+                "enable_psd": dmarc_enable_psd,
+            }
+
+            def _dns_resolver(name, record_type):
+                return query_dns(
+                    name,
+                    record_type,
+                    nameservers=nameservers,
+                    timeout=timeout,
+                )
+
+            discovered_policy, discovery_path, discovery_mode = discover_dmarc_policy(
+                policy_domain,
+                dns_resolver=_dns_resolver,
+                flags=flags,
+            )
+            if discovered_policy:
+                logger.debug(
+                    "Discovered DMARC policy for %s via %s in %s mode (%s)",
+                    policy_domain,
+                    discovered_policy.source,
+                    discovery_mode,
+                    " -> ".join(discovery_path),
+                )
+            else:
+                logger.debug(
+                    "No usable DMARC DNS policy discovered for %s (%s)",
+                    policy_domain,
+                    " -> ".join(discovery_path),
+                )
         new_report["policy_published"] = new_policy_published
 
         if type(report["record"]) is list:
@@ -929,6 +1001,9 @@ def parse_aggregate_report_file(
     dns_timeout: Optional[float] = 2.0,
     keep_alive: Optional[Callable] = None,
     normalize_timespan_threshold_hours: Optional[float] = 24.0,
+    dmarc_strict_mode: str = "auto",
+    dmarc_enable_psd: bool = False,
+    dmarc_validate_policy_dns: bool = False,
 ) -> OrderedDict[str, any]:
     """Parses a file at the given path, a file-like object. or bytes as an
     aggregate DMARC report
@@ -945,6 +1020,9 @@ def parse_aggregate_report_file(
         dns_timeout (float): Sets the DNS timeout in seconds
         keep_alive (callable): Keep alive function
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        dmarc_strict_mode (str): DMARC policy parse mode (`auto`, `strict`, `legacy`)
+        dmarc_enable_psd (bool): Enable PSD lookup for DMARC policy discovery
+        dmarc_validate_policy_dns (bool): Validate report policy against DNS discovery
 
     Returns:
         OrderedDict: The parsed DMARC aggregate report
@@ -966,6 +1044,9 @@ def parse_aggregate_report_file(
         timeout=dns_timeout,
         keep_alive=keep_alive,
         normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+        dmarc_strict_mode=dmarc_strict_mode,
+        dmarc_enable_psd=dmarc_enable_psd,
+        dmarc_validate_policy_dns=dmarc_validate_policy_dns,
     )
 
 
@@ -1403,6 +1484,9 @@ def parse_report_email(
     strip_attachment_payloads: Optional[bool] = False,
     keep_alive: Optional[callable] = None,
     normalize_timespan_threshold_hours: Optional[float] = 24.0,
+    dmarc_strict_mode: str = "auto",
+    dmarc_enable_psd: bool = False,
+    dmarc_validate_policy_dns: bool = False,
 ) -> OrderedDict[str, Any]:
     """
     Parses a DMARC report from an email
@@ -1420,6 +1504,9 @@ def parse_report_email(
             forensic report results
         keep_alive (callable): keep alive function
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        dmarc_strict_mode (str): DMARC policy parse mode (`auto`, `strict`, `legacy`)
+        dmarc_enable_psd (bool): Enable PSD lookup for DMARC policy discovery
+        dmarc_validate_policy_dns (bool): Validate report policy against DNS discovery
 
     Returns:
         OrderedDict:
@@ -1533,6 +1620,9 @@ def parse_report_email(
                         timeout=dns_timeout,
                         keep_alive=keep_alive,
                         normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+                        dmarc_strict_mode=dmarc_strict_mode,
+                        dmarc_enable_psd=dmarc_enable_psd,
+                        dmarc_validate_policy_dns=dmarc_validate_policy_dns,
                     )
                     result = OrderedDict(
                         [("report_type", "aggregate"), ("report", aggregate_report)]
@@ -1601,6 +1691,9 @@ def parse_report_file(
     offline: Optional[bool] = False,
     keep_alive: Optional[Callable] = None,
     normalize_timespan_threshold_hours: Optional[float] = 24,
+    dmarc_strict_mode: str = "auto",
+    dmarc_enable_psd: bool = False,
+    dmarc_validate_policy_dns: bool = False,
 ) -> OrderedDict[str, Any]:
     """Parses a DMARC aggregate or forensic file at the given path, a
     file-like object. or bytes
@@ -1618,6 +1711,9 @@ def parse_report_file(
         reverse_dns_map_url (str): URL to a reverse DNS map
         offline (bool): Do not make online queries for geolocation or DNS
         keep_alive (callable): Keep alive function
+        dmarc_strict_mode (str): DMARC policy parse mode (`auto`, `strict`, `legacy`)
+        dmarc_enable_psd (bool): Enable PSD lookup for DMARC policy discovery
+        dmarc_validate_policy_dns (bool): Validate report policy against DNS discovery
 
     Returns:
         OrderedDict: The parsed DMARC report
@@ -1646,6 +1742,9 @@ def parse_report_file(
             dns_timeout=dns_timeout,
             keep_alive=keep_alive,
             normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+            dmarc_strict_mode=dmarc_strict_mode,
+            dmarc_enable_psd=dmarc_enable_psd,
+            dmarc_validate_policy_dns=dmarc_validate_policy_dns,
         )
         results = OrderedDict([("report_type", "aggregate"), ("report", report)])
     except InvalidAggregateReport:
@@ -1667,6 +1766,9 @@ def parse_report_file(
                     strip_attachment_payloads=sa,
                     keep_alive=keep_alive,
                     normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+                    dmarc_strict_mode=dmarc_strict_mode,
+                    dmarc_enable_psd=dmarc_enable_psd,
+                    dmarc_validate_policy_dns=dmarc_validate_policy_dns,
                 )
             except InvalidDMARCReport:
                 raise ParserError("Not a valid report")
@@ -1685,6 +1787,9 @@ def get_dmarc_reports_from_mbox(
     reverse_dns_map_url: Optional[str] = None,
     offline: Optional[bool] = False,
     normalize_timespan_threshold_hours: Optional[float] = 24.0,
+    dmarc_strict_mode: str = "auto",
+    dmarc_enable_psd: bool = False,
+    dmarc_validate_policy_dns: bool = False,
 ) -> OrderedDict[str, OrderedDict[str, Any]]:
     """Parses a mailbox in mbox format containing e-mails with attached
     DMARC reports
@@ -1702,6 +1807,9 @@ def get_dmarc_reports_from_mbox(
         ip_db_path (str): Path to a MMDB file from MaxMind or DBIP
         offline (bool): Do not make online queries for geolocation or DNS
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        dmarc_strict_mode (str): DMARC policy parse mode (`auto`, `strict`, `legacy`)
+        dmarc_enable_psd (bool): Enable PSD lookup for DMARC policy discovery
+        dmarc_validate_policy_dns (bool): Validate report policy against DNS discovery
 
     Returns:
         OrderedDict: Lists of ``aggregate_reports``, ``forensic_reports``, and ``smtp_tls_reports``
@@ -1732,6 +1840,9 @@ def get_dmarc_reports_from_mbox(
                     dns_timeout=dns_timeout,
                     strip_attachment_payloads=sa,
                     normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+                    dmarc_strict_mode=dmarc_strict_mode,
+                    dmarc_enable_psd=dmarc_enable_psd,
+                    dmarc_validate_policy_dns=dmarc_validate_policy_dns,
                 )
                 if parsed_email["report_type"] == "aggregate":
                     report_org = parsed_email["report"]["report_metadata"]["org_name"]
@@ -1782,6 +1893,9 @@ def get_dmarc_reports_from_mailbox(
     since: Optional[datetime] = None,
     create_folders: Optional[bool] = True,
     normalize_timespan_threshold_hours: Optional[float] = 24,
+    dmarc_strict_mode: str = "auto",
+    dmarc_enable_psd: bool = False,
+    dmarc_validate_policy_dns: bool = False,
 ) -> OrderedDict[str, OrderedDict[str, Any]]:
     """
     Fetches and parses DMARC reports from a mailbox
@@ -1809,6 +1923,9 @@ def get_dmarc_reports_from_mailbox(
         create_folders (bool): Whether to create the destination folders
             (not used in watch)
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        dmarc_strict_mode (str): DMARC policy parse mode (`auto`, `strict`, `legacy`)
+        dmarc_enable_psd (bool): Enable PSD lookup for DMARC policy discovery
+        dmarc_validate_policy_dns (bool): Validate report policy against DNS discovery
 
     Returns:
         OrderedDict: Lists of ``aggregate_reports``, ``forensic_reports``, and ``smtp_tls_reports``
@@ -1927,6 +2044,9 @@ def get_dmarc_reports_from_mailbox(
                 strip_attachment_payloads=sa,
                 keep_alive=connection.keepalive,
                 normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+                dmarc_strict_mode=dmarc_strict_mode,
+                dmarc_enable_psd=dmarc_enable_psd,
+                dmarc_validate_policy_dns=dmarc_validate_policy_dns,
             )
             if parsed_email["report_type"] == "aggregate":
                 report_org = parsed_email["report"]["report_metadata"]["org_name"]
@@ -2082,6 +2202,9 @@ def get_dmarc_reports_from_mailbox(
             offline=offline,
             since=current_time,
             normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+            dmarc_strict_mode=dmarc_strict_mode,
+            dmarc_enable_psd=dmarc_enable_psd,
+            dmarc_validate_policy_dns=dmarc_validate_policy_dns,
         )
 
     return results
@@ -2106,6 +2229,9 @@ def watch_inbox(
     strip_attachment_payloads: Optional[bool] = False,
     batch_size: Optional[int] = None,
     normalize_timespan_threshold_hours: Optional[float] = 24,
+    dmarc_strict_mode: str = "auto",
+    dmarc_enable_psd: bool = False,
+    dmarc_validate_policy_dns: bool = False,
 ):
     """
     Watches the mailbox for new messages and
@@ -2132,6 +2258,9 @@ def watch_inbox(
             forensic report samples with None
         batch_size (int): Number of messages to read and process before saving
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        dmarc_strict_mode (str): DMARC policy parse mode (`auto`, `strict`, `legacy`)
+        dmarc_enable_psd (bool): Enable PSD lookup for DMARC policy discovery
+        dmarc_validate_policy_dns (bool): Validate report policy against DNS discovery
     """
 
     def check_callback(connection):
@@ -2153,6 +2282,9 @@ def watch_inbox(
             batch_size=batch_size,
             create_folders=False,
             normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+            dmarc_strict_mode=dmarc_strict_mode,
+            dmarc_enable_psd=dmarc_enable_psd,
+            dmarc_validate_policy_dns=dmarc_validate_policy_dns,
         )
         callback(res)
 

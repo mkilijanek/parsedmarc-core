@@ -78,6 +78,9 @@ def cli_parse(
     reverse_dns_map_path,
     reverse_dns_map_url,
     normalize_timespan_threshold_hours,
+    dmarc_strict_mode,
+    dmarc_enable_psd,
+    dmarc_validate_policy_dns,
     conn,
 ):
     """Separated this function for multiprocessing"""
@@ -93,6 +96,9 @@ def cli_parse(
             dns_timeout=dns_timeout,
             strip_attachment_payloads=sa,
             normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+            dmarc_strict_mode=dmarc_strict_mode,
+            dmarc_enable_psd=dmarc_enable_psd,
+            dmarc_validate_policy_dns=dmarc_validate_policy_dns,
         )
         conn.send([file_results, file_path])
     except ParserError as error:
@@ -668,6 +674,8 @@ def _main():
         webhook_timeout=60,
         normalize_timespan_threshold_hours=24.0,
         dmarc_strict_mode="auto",
+        dmarc_enable_psd=False,
+        dmarc_validate_policy_dns=False,
         fail_on_output_error=False,
     )
     args = arg_parser.parse_args()
@@ -699,6 +707,12 @@ def _main():
                     )
                     strict_mode = "auto"
                 opts.dmarc_strict_mode = strict_mode
+            if "dmarc_enable_psd" in general_config:
+                opts.dmarc_enable_psd = general_config.getboolean("dmarc_enable_psd")
+            if "dmarc_validate_policy_dns" in general_config:
+                opts.dmarc_validate_policy_dns = general_config.getboolean(
+                    "dmarc_validate_policy_dns"
+                )
             if "index_prefix_domain_map" in general_config:
                 with open(general_config["index_prefix_domain_map"]) as f:
                     index_prefix_domain_map = yaml.safe_load(f)
@@ -1484,6 +1498,9 @@ def _main():
                     opts.reverse_dns_map_path,
                     opts.reverse_dns_map_url,
                     opts.normalize_timespan_threshold_hours,
+                    opts.dmarc_strict_mode,
+                    opts.dmarc_enable_psd,
+                    opts.dmarc_validate_policy_dns,
                     child_conn,
                 ),
             )
@@ -1535,6 +1552,9 @@ def _main():
             reverse_dns_map_url=opts.reverse_dns_map_url,
             offline=opts.offline,
             normalize_timespan_threshold_hours=opts.normalize_timespan_threshold_hours,
+            dmarc_strict_mode=opts.dmarc_strict_mode,
+            dmarc_enable_psd=opts.dmarc_enable_psd,
+            dmarc_validate_policy_dns=opts.dmarc_validate_policy_dns,
         )
         aggregate_reports += reports["aggregate_reports"]
         forensic_reports += reports["forensic_reports"]
@@ -1645,6 +1665,9 @@ def _main():
                 strip_attachment_payloads=opts.strip_attachment_payloads,
                 since=opts.mailbox_since,
                 normalize_timespan_threshold_hours=opts.normalize_timespan_threshold_hours,
+                dmarc_strict_mode=opts.dmarc_strict_mode,
+                dmarc_enable_psd=opts.dmarc_enable_psd,
+                dmarc_validate_policy_dns=opts.dmarc_validate_policy_dns,
             )
 
             aggregate_reports += reports["aggregate_reports"]
@@ -1712,6 +1735,9 @@ def _main():
                 reverse_dns_map_url=opts.reverse_dns_map_url,
                 offline=opts.offline,
                 normalize_timespan_threshold_hours=opts.normalize_timespan_threshold_hours,
+                dmarc_strict_mode=opts.dmarc_strict_mode,
+                dmarc_enable_psd=opts.dmarc_enable_psd,
+                dmarc_validate_policy_dns=opts.dmarc_validate_policy_dns,
             )
         except FileExistsError as error:
             logger.error("{0}".format(error.__str__()))
