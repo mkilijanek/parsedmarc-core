@@ -207,7 +207,7 @@ class _FakePSL:
 
 class TestDmarcPolicy(unittest.TestCase):
     def testStrictValidRecord(self):
-        txt = "v=DMARC1; p=reject; adkim=s; aspf=r; pct=100; rua=mailto:dmarc@example.com"
+        txt = "v=DMARC1; p=reject; adkim=s; aspf=r; rua=mailto:dmarc@example.com"
         policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
         self.assertEqual(mode, "strict")
         self.assertEqual(errors, [])
@@ -237,16 +237,44 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertEqual(mode, "fallback")
         self.assertTrue(any("v=DMARC1 must be first tag" in error for error in errors))
 
-    def testStrictRequiresPImmediatelyAfterV(self):
+    def testStrictAllowsPAfterOtherTags(self):
         txt = "v=DMARC1; rua=mailto:dmarc@example.com; p=none"
         policy, mode, errors = parsedmarc.parse_dmarc_record(
             txt, domain="example.com", dmarc_strict_mode="strict"
         )
-        self.assertIsNone(policy)
-        self.assertIsNone(mode)
-        self.assertTrue(
-            any("p tag must immediately follow v in strict mode" in error for error in errors)
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.p, "none")
+
+    def testStrictValidRecordWithNpPsdT(self):
+        txt = (
+            "v=DMARC1; p=reject; sp=quarantine; np=none; psd=y; t=y; "
+            "rua=mailto:dmarc@example.com"
         )
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.np, "none")
+        self.assertEqual(policy.psd, "y")
+        self.assertEqual(policy.t, "y")
+
+    def testStrictRejectsHistoricalTagButFallbackAccepts(self):
+        txt = "v=DMARC1; p=none; pct=100; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertTrue(any("Unknown tag in strict mode" in error for error in errors))
+        self.assertEqual(policy.pct, 100)
+
+    def testMissingPDefaultsToNone(self):
+        txt = "v=DMARC1; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.p, "none")
 
     def testInvalidUnrecoverableBadVersion(self):
         txt = "v=DMARC2; p=reject"
@@ -307,6 +335,17 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertEqual(mode, "fallback")
         self.assertEqual(policy.p, "none")
         self.assertEqual(policy.sp, None)
+        self.assertEqual(errors, [])
+
+    def testLegacyInvalidNpWithValidRuaFallsBackToNone(self):
+        txt = "v=DMARC1; p=reject; np=invalid; rua=mailto:agg@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="legacy"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(policy.p, "none")
+        self.assertEqual(policy.np, None)
         self.assertEqual(errors, [])
 
     def testIdnNormalization(self):
