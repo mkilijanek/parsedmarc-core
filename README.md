@@ -48,6 +48,8 @@ Thanks to all
 Library consumers can use `parse_dmarc_record()` and
 `discover_dmarc_policy()` to evaluate DMARC DNS policies in
 `strict`, `auto`, or `legacy` compatibility modes, including IDN-aware lookups.
+The same policy parser is also used during aggregate report parsing to normalize
+`policy_published` values consistently.
 
 ## Python Compatibility
 

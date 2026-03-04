@@ -153,9 +153,15 @@ The full set of configuration options are:
   - `n_procs` - int: Number of process to run in parallel when
       parsing in CLI mode (Default: `1`)
   - `dmarc_strict_mode` - str: DMARC DNS policy parsing mode used by DMARC DNS
-      policy helper APIs (`parse_dmarc_record()`, `discover_dmarc_policy()`).
+      policy helper APIs (`parse_dmarc_record()`, `discover_dmarc_policy()`) and
+      aggregate report policy normalization.
       Values: `auto` (strict then fallback), `strict`, or `legacy` (fallback-only).
       Default: `auto`.
+  - `dmarc_enable_psd` - bool: Enables PSD DMARC lookup in DMARC policy discovery.
+      Default: `False`.
+  - `dmarc_validate_policy_dns` - bool: Perform DNS DMARC policy discovery while
+      parsing aggregate reports and log discovery path/mode for troubleshooting.
+      Default: `False`.
 
     :::{note}
     Setting this to a number larger than one can improve

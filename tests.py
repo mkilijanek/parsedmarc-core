@@ -207,7 +207,7 @@ class _FakePSL:
 
 class TestDmarcPolicy(unittest.TestCase):
     def testStrictValidRecord(self):
-        txt = "v=DMARC1; p=reject; adkim=s; aspf=r; pct=100; rua=mailto:dmarc@example.com"
+        txt = "v=DMARC1; p=reject; adkim=s; aspf=r; rua=mailto:dmarc@example.com"
         policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
         self.assertEqual(mode, "strict")
         self.assertEqual(errors, [])
@@ -216,7 +216,7 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertEqual(policy.rua, ["mailto:dmarc@example.com"])
 
     def testStrictInvalidUnknownTagFallbackValid(self):
-        txt = "v=DMARC1; p=quarantine; x-unknown=test; rua=mailto:dmarc@example.com"
+        txt = "v=DMARC1; p=quarantine; xunknown=test; rua=mailto:dmarc@example.com"
         policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
         self.assertIsNotNone(policy)
         self.assertEqual(mode, "fallback")
@@ -236,6 +236,45 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertIsNotNone(policy)
         self.assertEqual(mode, "fallback")
         self.assertTrue(any("v=DMARC1 must be first tag" in error for error in errors))
+
+    def testStrictAllowsPAfterOtherTags(self):
+        txt = "v=DMARC1; rua=mailto:dmarc@example.com; p=none"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="strict"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.p, "none")
+
+    def testStrictValidRecordWithNpPsdT(self):
+        txt = (
+            "v=DMARC1; p=reject; sp=quarantine; np=none; psd=y; t=y; "
+            "rua=mailto:dmarc@example.com"
+        )
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.np, "none")
+        self.assertEqual(policy.psd, "y")
+        self.assertEqual(policy.t, "y")
+
+    def testStrictRejectsHistoricalTagButFallbackAccepts(self):
+        txt = "v=DMARC1; p=none; pct=100; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertTrue(any("Unknown tag in strict mode" in error for error in errors))
+        self.assertEqual(policy.pct, 100)
+
+    def testMissingPDefaultsToNone(self):
+        txt = "v=DMARC1; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.p, "none")
 
     def testInvalidUnrecoverableBadVersion(self):
         txt = "v=DMARC2; p=reject"
@@ -257,6 +296,57 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertIsNone(policy)
         self.assertIsNone(mode)
         self.assertTrue(any("Malformed URI" in error for error in errors))
+
+    def testStrictModeRejectsUnknownTag(self):
+        txt = "v=DMARC1; p=reject; xfoo=bar"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="strict"
+        )
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertTrue(any("Unknown tag in strict mode" in error for error in errors))
+
+    def testLegacyModeAcceptsMinorUriListDeviations(self):
+        txt = "v=DMARC1; p=none; rua=mailto:agg@example.com,"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="legacy"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.rua, ["mailto:agg@example.com"])
+
+    def testLegacyInvalidPWithValidRuaFallsBackToNone(self):
+        txt = "v=DMARC1; p=invalid; rua=mailto:agg@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="legacy"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(policy.p, "none")
+        self.assertEqual(errors, [])
+
+    def testLegacyInvalidSpWithValidRuaFallsBackToNone(self):
+        txt = "v=DMARC1; p=reject; sp=invalid; rua=mailto:agg@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="legacy"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(policy.p, "none")
+        self.assertEqual(policy.sp, None)
+        self.assertEqual(errors, [])
+
+    def testLegacyInvalidNpWithValidRuaFallsBackToNone(self):
+        txt = "v=DMARC1; p=reject; np=invalid; rua=mailto:agg@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="legacy"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(policy.p, "none")
+        self.assertEqual(policy.np, None)
+        self.assertEqual(errors, [])
 
     def testIdnNormalization(self):
         normalized = parsedmarc.normalize_domain("żółć.pl")
@@ -318,6 +408,124 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertEqual(
             discovery_path,
             ["_dmarc.mail.example.co.uk:0", "_dmarc.example.co.uk:0"],
+        )
+
+    def testDiscoveryRejectsMultipleDmarcRecords(self):
+        records = {
+            "_dmarc.example.com": [
+                "v=DMARC1; p=none",
+                "v=DMARC1; p=reject",
+            ]
+        }
+
+        def resolver(name, record_type):
+            if record_type != "TXT":
+                return []
+            return records.get(name, [])
+
+        policy, discovery_path, mode = parsedmarc.discover_dmarc_policy(
+            "example.com",
+            dns_resolver=resolver,
+            flags={"dmarc_strict_mode": "auto"},
+        )
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertEqual(discovery_path, ["_dmarc.example.com:2"])
+
+    def testDiscoveryConcatenatesChunkedTxtRecords(self):
+        records = {
+            "_dmarc.example.com": [
+                (b"v=DMARC1; p=reject", b"; rua=mailto:agg@example.com"),
+            ]
+        }
+
+        def resolver(name, record_type):
+            if record_type != "TXT":
+                return []
+            return records.get(name, [])
+
+        policy, _discovery_path, mode = parsedmarc.discover_dmarc_policy(
+            "example.com",
+            dns_resolver=resolver,
+            flags={"dmarc_strict_mode": "auto"},
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "strict")
+        self.assertEqual(policy.p, "reject")
+
+    def testDiscoveryIgnoresRecordWithoutLeadingVTag(self):
+        records = {
+            "_dmarc.example.com": [
+                "p=reject; v=DMARC1; rua=mailto:agg@example.com",
+            ]
+        }
+
+        def resolver(name, record_type):
+            if record_type != "TXT":
+                return []
+            return records.get(name, [])
+
+        policy, _discovery_path, mode = parsedmarc.discover_dmarc_policy(
+            "example.com",
+            dns_resolver=resolver,
+            flags={"dmarc_strict_mode": "auto"},
+        )
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+
+    def testAggregateParserNormalizesPolicyDomain(self):
+        xml = """
+<feedback>
+  <report_metadata>
+    <org_name>example.org</org_name>
+    <email>dmarc@example.org</email>
+    <report_id>id-1</report_id>
+    <date_range>
+      <begin>1700000000</begin>
+      <end>1700003600</end>
+    </date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>żółć.pl</domain>
+    <adkim>S</adkim>
+    <aspf>R</aspf>
+    <p>REJECT</p>
+    <sp>NONE</sp>
+    <pct>100</pct>
+    <fo>0</fo>
+  </policy_published>
+  <record>
+    <row>
+      <source_ip>203.0.113.1</source_ip>
+      <count>1</count>
+      <policy_evaluated>
+        <disposition>none</disposition>
+        <dkim>pass</dkim>
+        <spf>pass</spf>
+      </policy_evaluated>
+    </row>
+    <identifiers>
+      <header_from>żółć.pl</header_from>
+    </identifiers>
+    <auth_results>
+      <dkim>
+        <domain>żółć.pl</domain>
+        <selector>s1</selector>
+        <result>pass</result>
+      </dkim>
+      <spf>
+        <domain>żółć.pl</domain>
+        <scope>mfrom</scope>
+        <result>pass</result>
+      </spf>
+    </auth_results>
+  </record>
+</feedback>
+"""
+        report = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
+        self.assertEqual(report["policy_published"]["domain"], "xn--kda4b0koi.pl")
+        self.assertEqual(
+            report["records"][0]["identifiers"]["header_from"], "xn--kda4b0koi.pl"
         )
 
 
@@ -440,13 +648,29 @@ aggregate_url = http://127.0.0.1:9
                 "argv",
                 ["parsedmarc", "-c", cfg_path, sample_path],
             ):
+                fake_result = {
+                    "report_type": "aggregate",
+                    "report": {
+                        "report_metadata": {
+                            "org_name": "example.org",
+                            "report_id": "r-1",
+                        },
+                        "policy_published": {"domain": "example.org"},
+                        "records": [],
+                    },
+                }
                 with patch.object(
-                    parsedmarc.cli.webhook.WebhookClient,
-                    "save_aggregate_report_to_webhook",
-                    side_effect=RuntimeError("webhook send failed"),
+                    parsedmarc.cli,
+                    "parse_report_file",
+                    return_value=fake_result,
                 ):
-                    with self.assertRaises(SystemExit) as system_exit:
-                        parsedmarc.cli._main()
+                    with patch.object(
+                        parsedmarc.cli.webhook.WebhookClient,
+                        "save_aggregate_report_to_webhook",
+                        side_effect=RuntimeError("webhook send failed"),
+                    ):
+                        with self.assertRaises(SystemExit) as system_exit:
+                            parsedmarc.cli._main()
             self.assertEqual(system_exit.exception.code, 1)
         finally:
             os.remove(cfg_path)
@@ -512,7 +736,7 @@ class TestGmailConnection(unittest.TestCase):
         raw = urlsafe_b64encode(b"Subject: test\n\nbody").decode()
         messages_api.get.return_value.execute.return_value = {"raw": raw}
         content = connection.fetch_message("m1")
-        self.assertIn(b"Subject: test", content)
+        self.assertIn("Subject: test", content)
 
     def testMoveAndDeleteMessage(self):
         connection = self._build_connection()
@@ -908,7 +1132,7 @@ class TestImapConnection(unittest.TestCase):
             mocked_client.select_folder.assert_called_with("INBOX")
 
             connection.fetch_messages("INBOX", since="2026-03-01")
-            mocked_client.search.assert_called_with(["SINCE", "2026-03-01"])
+            mocked_client.search.assert_called_with("SINCE 2026-03-01")
 
             mocked_client.fetch_message.return_value = "raw-message"
             self.assertEqual(connection.fetch_message(1), "raw-message")

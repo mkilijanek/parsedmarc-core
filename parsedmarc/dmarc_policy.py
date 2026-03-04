@@ -9,11 +9,28 @@ from typing import Callable, Optional
 import re
 
 
-KNOWN_TAGS = {"v", "p", "sp", "adkim", "aspf", "pct", "rua", "ruf", "fo", "rf", "ri"}
+STRICT_KNOWN_TAGS = {
+    "v",
+    "p",
+    "sp",
+    "np",
+    "adkim",
+    "aspf",
+    "rua",
+    "ruf",
+    "fo",
+    "psd",
+    "t",
+}
+FALLBACK_KNOWN_TAGS = STRICT_KNOWN_TAGS | {"pct", "rf", "ri"}
 URI_TAGS = {"rua", "ruf"}
 POLICY_VALUES = {"none", "quarantine", "reject"}
 ALIGNMENT_VALUES = {"r", "s"}
 FO_VALUES = {"0", "1", "d", "s"}
+PSD_VALUES = {"y", "n", "u"}
+TEST_VALUES = {"y", "n"}
+STRICT_TAG_RE = re.compile(r"^[a-z][a-z0-9]*$")
+LOOSE_TAG_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 MAILTO_URI_RE = re.compile(r"^mailto:([^!]+)(?:!(\d+)([kKmMgGtT]?))?$")
 MAILBOX_RE = re.compile(
     r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
@@ -29,6 +46,7 @@ class DmarcPolicy:
     domain: str
     p: str
     sp: Optional[str] = None
+    np: Optional[str] = None
     adkim: str = "r"
     aspf: str = "r"
     pct: int = 100
@@ -37,6 +55,8 @@ class DmarcPolicy:
     fo: str = "0"
     rf: Optional[str] = None
     ri: int = 86400
+    psd: str = "u"
+    t: str = "n"
     mode: str = "fallback"
     source: str = "subdomain"
     raw_record: str = ""
@@ -61,7 +81,11 @@ def domains_equal_for_alignment(left: str, right: str) -> bool:
     return normalize_domain(left) == normalize_domain(right)
 
 
-def _split_tag_value_pairs(record: str) -> tuple[list[tuple[str, str]], list[str]]:
+def _split_tag_value_pairs(
+    record: str,
+    *,
+    strict: bool = False,
+) -> tuple[list[tuple[str, str]], list[str]]:
     errors: list[str] = []
     pairs: list[tuple[str, str]] = []
     for part in [p.strip() for p in record.split(";") if p.strip()]:
@@ -71,17 +95,29 @@ def _split_tag_value_pairs(record: str) -> tuple[list[tuple[str, str]], list[str
         tag, value = part.split("=", 1)
         tag = tag.strip().lower()
         value = value.strip()
-        if not re.match(r"^[a-z][a-z0-9_-]*$", tag):
+        tag_re = STRICT_TAG_RE if strict else LOOSE_TAG_RE
+        if not tag_re.match(tag):
             errors.append(f"Invalid tag name: {tag}")
             continue
         pairs.append((tag, value))
     return pairs, errors
 
 
-def _parse_mailto_uri_list(value: str) -> tuple[Optional[list[str]], list[str]]:
+def _parse_mailto_uri_list(
+    value: str,
+    *,
+    strict: bool = True,
+) -> tuple[Optional[list[str]], list[str]]:
     errors: list[str] = []
     uris: list[str] = []
-    for raw_uri in [p.strip() for p in value.split(",") if p.strip()]:
+    parts = [p.strip() for p in value.split(",")]
+    if not value.strip():
+        return None, ["Malformed URI list: empty value"]
+    for raw_uri in parts:
+        if not raw_uri:
+            if strict:
+                errors.append("Malformed URI list: empty URI entry")
+            continue
         match = MAILTO_URI_RE.match(raw_uri)
         if not match:
             errors.append(f"Malformed URI: {raw_uri}")
@@ -95,12 +131,18 @@ def _parse_mailto_uri_list(value: str) -> tuple[Optional[list[str]], list[str]]:
             continue
         uris.append(f"mailto:{mailbox.lower()}")
 
+    if not uris and strict:
+        errors.append("Malformed URI list: no valid URIs")
     if errors:
         return None, errors
     return uris, []
 
 
-def _validate_policy(tags: dict[str, str]) -> tuple[Optional[dict[str, object]], list[str]]:
+def _validate_policy(
+    tags: dict[str, str],
+    *,
+    strict: bool = False,
+) -> tuple[Optional[dict[str, object]], list[str]]:
     errors: list[str] = []
 
     v = tags.get("v", "")
@@ -108,12 +150,21 @@ def _validate_policy(tags: dict[str, str]) -> tuple[Optional[dict[str, object]],
         errors.append("Missing or invalid v=DMARC1")
 
     p = tags.get("p")
-    if p is None or p.lower() not in POLICY_VALUES:
+    p_invalid = p is not None and p.lower() not in POLICY_VALUES
+    if p is None:
+        p = "none"
+    if p_invalid:
         errors.append("Missing or invalid p value")
 
     sp = tags.get("sp")
-    if sp is not None and sp.lower() not in POLICY_VALUES:
+    sp_invalid = sp is not None and sp.lower() not in POLICY_VALUES
+    if sp_invalid:
         errors.append("Invalid sp value")
+
+    np = tags.get("np")
+    np_invalid = np is not None and np.lower() not in POLICY_VALUES
+    if np_invalid:
+        errors.append("Invalid np value")
 
     adkim = tags.get("adkim", "r")
     if adkim.lower() not in ALIGNMENT_VALUES:
@@ -122,6 +173,14 @@ def _validate_policy(tags: dict[str, str]) -> tuple[Optional[dict[str, object]],
     aspf = tags.get("aspf", "r")
     if aspf.lower() not in ALIGNMENT_VALUES:
         errors.append("Invalid aspf value")
+
+    psd = tags.get("psd", "u").lower()
+    if psd not in PSD_VALUES:
+        errors.append("Invalid psd value")
+
+    t = tags.get("t", "n").lower()
+    if t not in TEST_VALUES:
+        errors.append("Invalid t value")
 
     pct_raw = tags.get("pct", "100")
     if not pct_raw.isdigit():
@@ -153,7 +212,7 @@ def _validate_policy(tags: dict[str, str]) -> tuple[Optional[dict[str, object]],
     ruf: list[str] = []
     for uri_tag in URI_TAGS:
         if uri_tag in tags:
-            parsed, uri_errors = _parse_mailto_uri_list(tags[uri_tag])
+            parsed, uri_errors = _parse_mailto_uri_list(tags[uri_tag], strict=strict)
             if uri_errors:
                 errors.extend(uri_errors)
             else:
@@ -162,12 +221,31 @@ def _validate_policy(tags: dict[str, str]) -> tuple[Optional[dict[str, object]],
                 else:
                     ruf = parsed or []
 
+    if not strict and (p_invalid or sp_invalid or np_invalid) and rua:
+        # RFC 7489 Section 6.6.3(6): if policy tags are invalid but rua has at
+        # least one valid URI, continue processing as if a record with p=none
+        # was found.
+        errors = [
+            error
+            for error in errors
+            if error
+            not in {
+                "Missing or invalid p value",
+                "Invalid sp value",
+                "Invalid np value",
+            }
+        ]
+        p = "none"
+        sp = None
+        np = None
+
     if errors:
         return None, errors
 
     return {
         "p": p.lower(),
         "sp": sp.lower() if sp is not None else None,
+        "np": np.lower() if np is not None else None,
         "adkim": adkim.lower(),
         "aspf": aspf.lower(),
         "pct": pct,
@@ -176,12 +254,14 @@ def _validate_policy(tags: dict[str, str]) -> tuple[Optional[dict[str, object]],
         "fo": fo,
         "rf": rf,
         "ri": ri,
+        "psd": psd,
+        "t": t,
     }, []
 
 
 def _parse_strict(record: str, domain: str) -> tuple[Optional[DmarcPolicy], list[str]]:
     errors: list[str] = []
-    pairs, pair_errors = _split_tag_value_pairs(record)
+    pairs, pair_errors = _split_tag_value_pairs(record, strict=True)
     errors.extend(pair_errors)
 
     if not pairs:
@@ -190,13 +270,12 @@ def _parse_strict(record: str, domain: str) -> tuple[Optional[DmarcPolicy], list
 
     if pairs[0][0] != "v":
         errors.append("v=DMARC1 must be first tag")
-
     tags: dict[str, str] = {}
     for tag, value in pairs:
         if tag in tags:
             errors.append(f"Duplicate tag in strict mode: {tag}")
             continue
-        if tag not in KNOWN_TAGS:
+        if tag not in STRICT_KNOWN_TAGS:
             errors.append(f"Unknown tag in strict mode: {tag}")
             continue
         tags[tag] = value
@@ -204,7 +283,7 @@ def _parse_strict(record: str, domain: str) -> tuple[Optional[DmarcPolicy], list
     if errors:
         return None, errors
 
-    values, validation_errors = _validate_policy(tags)
+    values, validation_errors = _validate_policy(tags, strict=True)
     if validation_errors:
         return None, validation_errors
 
@@ -213,18 +292,18 @@ def _parse_strict(record: str, domain: str) -> tuple[Optional[DmarcPolicy], list
 
 def _parse_fallback(record: str, domain: str) -> tuple[Optional[DmarcPolicy], list[str]]:
     errors: list[str] = []
-    pairs, pair_errors = _split_tag_value_pairs(record)
+    pairs, pair_errors = _split_tag_value_pairs(record, strict=False)
     errors.extend(pair_errors)
 
     tags: dict[str, str] = {}
     for tag, value in pairs:
-        if tag not in KNOWN_TAGS:
+        if tag not in FALLBACK_KNOWN_TAGS:
             continue
         if tag in tags:
             continue
         tags[tag] = value
 
-    values, validation_errors = _validate_policy(tags)
+    values, validation_errors = _validate_policy(tags, strict=False)
     if validation_errors:
         errors.extend(validation_errors)
         return None, errors
@@ -287,14 +366,41 @@ def _resolve_dmarc_txt_records(
         records = dns_resolver(lookup_name, "TXT")
     except Exception:
         return []
-    return [r.strip() for r in records if isinstance(r, str) and r.strip()]
+    normalized: list[str] = []
+    for record in records:
+        normalized_record = ""
+        if isinstance(record, bytes):
+            normalized_record = record.decode("utf-8", errors="replace")
+        elif isinstance(record, str):
+            normalized_record = record
+        elif isinstance(record, (list, tuple)):
+            chunks: list[str] = []
+            for part in record:
+                if isinstance(part, bytes):
+                    chunks.append(part.decode("utf-8", errors="replace"))
+                elif isinstance(part, str):
+                    chunks.append(part)
+            normalized_record = "".join(chunks)
+        if normalized_record.strip():
+            normalized.append(normalized_record.strip())
+    return normalized
 
 
-def _select_candidate_record(txt_records: list[str]) -> Optional[str]:
+def _record_starts_with_dmarc_version(record: str) -> bool:
+    compact = record.strip().strip('"').lstrip().lower().replace(" ", "")
+    return compact.startswith("v=dmarc1")
+
+
+def _select_candidate_record(txt_records: list[str]) -> tuple[Optional[str], list[str]]:
+    candidates = []
     for record in txt_records:
-        if "v=dmarc1" in record.lower().replace(" ", ""):
-            return record
-    return None
+        if _record_starts_with_dmarc_version(record):
+            candidates.append(record)
+    if not candidates:
+        return None, []
+    if len(candidates) > 1:
+        return None, [f"Multiple DMARC records found: {len(candidates)}"]
+    return candidates[0], []
 
 
 def discover_dmarc_policy(
@@ -309,7 +415,9 @@ def discover_dmarc_policy(
     if flags is None:
         flags = {}
 
-    strict_mode = (flags.get("dmarc_strict_mode") or "auto").lower()
+    strict_mode = (flags.get("dmarc_strict_mode") or "auto").strip().lower()
+    if strict_mode not in {"auto", "strict", "legacy"}:
+        strict_mode = "auto"
     enable_psd = bool(flags.get("enable_psd", False))
 
     normalized_domain = normalize_domain(domain)
@@ -347,7 +455,9 @@ def discover_dmarc_policy(
         if not txt_records:
             continue
 
-        candidate = _select_candidate_record(txt_records)
+        candidate, candidate_errors = _select_candidate_record(txt_records)
+        if candidate_errors:
+            continue
         if candidate is None:
             continue
 

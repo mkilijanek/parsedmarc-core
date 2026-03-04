@@ -9,6 +9,9 @@
 - Add IDN normalization (U-label to A-label) for DMARC policy lookup and
   domain comparison helpers.
 - Add optional PSD DMARC discovery support in strict/auto workflows.
+- Wire DMARCbis policy parsing into aggregate report normalization and add
+  optional DNS policy validation (`general.dmarc_validate_policy_dns`) with PSD
+  control (`general.dmarc_enable_psd`).
 - Add a resilient MS Graph folder lookup fallback for well-known folders when
   root folder listing fails with `Default folder Root not found`.
 - Reduce mailbox watch overhead by skipping unnecessary full-folder follow-up
