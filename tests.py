@@ -237,6 +237,17 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertEqual(mode, "fallback")
         self.assertTrue(any("v=DMARC1 must be first tag" in error for error in errors))
 
+    def testStrictRequiresPImmediatelyAfterV(self):
+        txt = "v=DMARC1; rua=mailto:dmarc@example.com; p=none"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="strict"
+        )
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertTrue(
+            any("p tag must immediately follow v in strict mode" in error for error in errors)
+        )
+
     def testInvalidUnrecoverableBadVersion(self):
         txt = "v=DMARC2; p=reject"
         policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
@@ -276,6 +287,27 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertEqual(mode, "fallback")
         self.assertEqual(errors, [])
         self.assertEqual(policy.rua, ["mailto:agg@example.com"])
+
+    def testLegacyInvalidPWithValidRuaFallsBackToNone(self):
+        txt = "v=DMARC1; p=invalid; rua=mailto:agg@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="legacy"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(policy.p, "none")
+        self.assertEqual(errors, [])
+
+    def testLegacyInvalidSpWithValidRuaFallsBackToNone(self):
+        txt = "v=DMARC1; p=reject; sp=invalid; rua=mailto:agg@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(
+            txt, domain="example.com", dmarc_strict_mode="legacy"
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertEqual(policy.p, "none")
+        self.assertEqual(policy.sp, None)
+        self.assertEqual(errors, [])
 
     def testIdnNormalization(self):
         normalized = parsedmarc.normalize_domain("żółć.pl")
@@ -381,6 +413,26 @@ class TestDmarcPolicy(unittest.TestCase):
         self.assertIsNotNone(policy)
         self.assertEqual(mode, "strict")
         self.assertEqual(policy.p, "reject")
+
+    def testDiscoveryIgnoresRecordWithoutLeadingVTag(self):
+        records = {
+            "_dmarc.example.com": [
+                "p=reject; v=DMARC1; rua=mailto:agg@example.com",
+            ]
+        }
+
+        def resolver(name, record_type):
+            if record_type != "TXT":
+                return []
+            return records.get(name, [])
+
+        policy, _discovery_path, mode = parsedmarc.discover_dmarc_policy(
+            "example.com",
+            dns_resolver=resolver,
+            flags={"dmarc_strict_mode": "auto"},
+        )
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
 
     def testAggregateParserNormalizesPolicyDomain(self):
         xml = """
