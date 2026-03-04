@@ -1,5 +1,64 @@
 # Changelog
 
+## 9.1.1
+
+### Fixes
+
+- Fix the use of Elasticsearch and OpenSearch API keys (PR #660 fixes issue #653)
+
+### Changes
+
+- Drop support for Python 3.9 (PR #661)
+
+## 9.1.0
+
+## Enhancements
+
+- Add TCP and TLS support for syslog output. (#656)
+- Skip DNS lookups in GitHub Actions to prevent DNS timeouts during tests timeouts. (#657)
+- Remove microseconds from DMARC aggregate report time ranges before parsing them.
+
+## 9.0.10
+
+- Support Python 3.14+
+
+## 9.0.9
+
+### Fixes
+
+- Validate that a string is base64-encoded before trying to base64 decode it. (PRs #648 and #649)
+
+## 9.0.8
+
+### Fixes
+
+- Fix logging configuration not propagating to child parser processes (#646).
+- Update `mailsuite` dependency to `?=1.11.1` to solve issues with iCloud IMAP (#493).
+
+## 9.0.7
+
+## Fixes
+
+- Fix IMAP `since` option (#PR 645 closes issues #581 and #643).
+
+## 9.0.6
+
+### Fixes
+
+- Fix #638.
+- Fix/clarify report extraction and parsing behavior for multiple input types (bytes, base64 strings, and file-like objects).
+- Fix type mismatches that could cause runtime issues in SMTP emailing and CLI option handling.
+
+### Improvements
+
+- Improve type hints across the library (Pylance/Pyright friendliness) and reduce false-positive linter errors.
+- Emails in Microsoft 365 are now marked read as they are read. This provides constancy with other mailbox types, and gives you a indication of when emails are being read as they are processed in batches. (Close #625)
+
+### Compatibility / Dependencies
+
+- Set Python requirement to `>=3.9,<3.14`.
+- Bump `mailsuite` requirement to `>=1.11.0`.
+
 ## 9.0.5
 
 ## Fixes
