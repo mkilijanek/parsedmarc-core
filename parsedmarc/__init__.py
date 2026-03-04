@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import binascii
+from collections import OrderedDict
 import email
 import email.utils
 import json
@@ -60,14 +61,9 @@ from parsedmarc.utils import (
     human_timestamp_to_datetime,
     is_outlook_msg,
     parse_email,
+    query_dns,
     timestamp_to_human,
 )
-
-from parsedmarc.constants import __version__
-from parsedmarc.utils import get_base_domain, get_ip_address_info, query_dns
-from parsedmarc.utils import is_outlook_msg, convert_outlook_msg
-from parsedmarc.utils import parse_email
-from parsedmarc.utils import timestamp_to_human, human_timestamp_to_datetime
 from parsedmarc.dmarc_policy import (
     DmarcPolicy,
     parse_dmarc_record,
