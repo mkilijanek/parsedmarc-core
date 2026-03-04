@@ -45,6 +45,10 @@ Thanks to all
   use with premade dashboards
 - Optionally send reports to Apache Kafka
 
+Library consumers can use `parse_dmarc_record()` and
+`discover_dmarc_policy()` to evaluate DMARC DNS policies in
+`strict`, `auto`, or `legacy` compatibility modes, including IDN-aware lookups.
+
 ## Python Compatibility
 
 This project supports the following Python versions, which are either actively maintained or are the default versions
@@ -61,4 +65,4 @@ for RHEL or Debian.
 | 3.11    | ✅         | Actively maintained; supported until June 2028 (Debian 12) |
 | 3.12    | ✅         | Actively maintained; supported until May 2035 (RHEL 10)    |
 | 3.13    | ✅         | Actively maintained; supported until June 2030 (Debian 13) |
-| 3.14    | ✅         | Actively maintained                                        |
+| 3.14    | ✅         | Supported (requires `imapclient>=3.1.0`) |

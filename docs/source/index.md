@@ -44,6 +44,8 @@ and Valimail.
 - Optionally send the results to Elasticsearch, Opensearch, and/or Splunk, for use
     with premade dashboards
 - Optionally send reports to Apache Kafka
+- Provides DMARC DNS policy parsing/discovery helpers (`parse_dmarc_record()`,
+    `discover_dmarc_policy()`) with strict/legacy compatibility modes
 
 ## Python Compatibility
 
@@ -61,7 +63,7 @@ for RHEL or Debian.
 | 3.11    | ✅         | Actively maintained; supported until June 2028 (Debian 12) |
 | 3.12    | ✅         | Actively maintained; supported until May 2035 (RHEL 10)    |
 | 3.13    | ✅         | Actively maintained; supported until June 2030 (Debian 13) |
-| 3.14    | ✅         | Actively maintained                                        |
+| 3.14    | ✅         | Supported (requires `imapclient>=3.1.0`) |
 
 ```{toctree}
 :caption: 'Contents'
