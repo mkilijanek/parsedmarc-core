@@ -9,11 +9,26 @@ from typing import Callable, Optional
 import re
 
 
-KNOWN_TAGS = {"v", "p", "sp", "adkim", "aspf", "pct", "rua", "ruf", "fo", "rf", "ri"}
+STRICT_KNOWN_TAGS = {
+    "v",
+    "p",
+    "sp",
+    "np",
+    "adkim",
+    "aspf",
+    "rua",
+    "ruf",
+    "fo",
+    "psd",
+    "t",
+}
+FALLBACK_KNOWN_TAGS = STRICT_KNOWN_TAGS | {"pct", "rf", "ri"}
 URI_TAGS = {"rua", "ruf"}
 POLICY_VALUES = {"none", "quarantine", "reject"}
 ALIGNMENT_VALUES = {"r", "s"}
 FO_VALUES = {"0", "1", "d", "s"}
+PSD_VALUES = {"y", "n", "u"}
+TEST_VALUES = {"y", "n"}
 STRICT_TAG_RE = re.compile(r"^[a-z][a-z0-9]*$")
 LOOSE_TAG_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 MAILTO_URI_RE = re.compile(r"^mailto:([^!]+)(?:!(\d+)([kKmMgGtT]?))?$")
@@ -31,6 +46,7 @@ class DmarcPolicy:
     domain: str
     p: str
     sp: Optional[str] = None
+    np: Optional[str] = None
     adkim: str = "r"
     aspf: str = "r"
     pct: int = 100
@@ -39,6 +55,8 @@ class DmarcPolicy:
     fo: str = "0"
     rf: Optional[str] = None
     ri: int = 86400
+    psd: str = "u"
+    t: str = "n"
     mode: str = "fallback"
     source: str = "subdomain"
     raw_record: str = ""
@@ -132,7 +150,9 @@ def _validate_policy(
         errors.append("Missing or invalid v=DMARC1")
 
     p = tags.get("p")
-    p_invalid = p is None or p.lower() not in POLICY_VALUES
+    p_invalid = p is not None and p.lower() not in POLICY_VALUES
+    if p is None:
+        p = "none"
     if p_invalid:
         errors.append("Missing or invalid p value")
 
@@ -141,6 +161,11 @@ def _validate_policy(
     if sp_invalid:
         errors.append("Invalid sp value")
 
+    np = tags.get("np")
+    np_invalid = np is not None and np.lower() not in POLICY_VALUES
+    if np_invalid:
+        errors.append("Invalid np value")
+
     adkim = tags.get("adkim", "r")
     if adkim.lower() not in ALIGNMENT_VALUES:
         errors.append("Invalid adkim value")
@@ -148,6 +173,14 @@ def _validate_policy(
     aspf = tags.get("aspf", "r")
     if aspf.lower() not in ALIGNMENT_VALUES:
         errors.append("Invalid aspf value")
+
+    psd = tags.get("psd", "u").lower()
+    if psd not in PSD_VALUES:
+        errors.append("Invalid psd value")
+
+    t = tags.get("t", "n").lower()
+    if t not in TEST_VALUES:
+        errors.append("Invalid t value")
 
     pct_raw = tags.get("pct", "100")
     if not pct_raw.isdigit():
@@ -188,16 +221,23 @@ def _validate_policy(
                 else:
                     ruf = parsed or []
 
-    if not strict and (p_invalid or sp_invalid) and rua:
-        # RFC 7489 Section 6.6.3(6): if p/sp is invalid but rua has at least one
-        # valid URI, continue processing as if a record with p=none was found.
+    if not strict and (p_invalid or sp_invalid or np_invalid) and rua:
+        # RFC 7489 Section 6.6.3(6): if policy tags are invalid but rua has at
+        # least one valid URI, continue processing as if a record with p=none
+        # was found.
         errors = [
             error
             for error in errors
-            if error not in {"Missing or invalid p value", "Invalid sp value"}
+            if error
+            not in {
+                "Missing or invalid p value",
+                "Invalid sp value",
+                "Invalid np value",
+            }
         ]
         p = "none"
         sp = None
+        np = None
 
     if errors:
         return None, errors
@@ -205,6 +245,7 @@ def _validate_policy(
     return {
         "p": p.lower(),
         "sp": sp.lower() if sp is not None else None,
+        "np": np.lower() if np is not None else None,
         "adkim": adkim.lower(),
         "aspf": aspf.lower(),
         "pct": pct,
@@ -213,6 +254,8 @@ def _validate_policy(
         "fo": fo,
         "rf": rf,
         "ri": ri,
+        "psd": psd,
+        "t": t,
     }, []
 
 
@@ -227,15 +270,12 @@ def _parse_strict(record: str, domain: str) -> tuple[Optional[DmarcPolicy], list
 
     if pairs[0][0] != "v":
         errors.append("v=DMARC1 must be first tag")
-    if len(pairs) < 2 or pairs[1][0] != "p":
-        errors.append("p tag must immediately follow v in strict mode")
-
     tags: dict[str, str] = {}
     for tag, value in pairs:
         if tag in tags:
             errors.append(f"Duplicate tag in strict mode: {tag}")
             continue
-        if tag not in KNOWN_TAGS:
+        if tag not in STRICT_KNOWN_TAGS:
             errors.append(f"Unknown tag in strict mode: {tag}")
             continue
         tags[tag] = value
@@ -257,7 +297,7 @@ def _parse_fallback(record: str, domain: str) -> tuple[Optional[DmarcPolicy], li
 
     tags: dict[str, str] = {}
     for tag, value in pairs:
-        if tag not in KNOWN_TAGS:
+        if tag not in FALLBACK_KNOWN_TAGS:
             continue
         if tag in tags:
             continue
