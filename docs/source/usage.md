@@ -149,6 +149,9 @@ The full set of configuration options are:
   - `log_file` - str: Write log messages to a file at this path
   - `n_procs` - int: Number of process to run in parallel when
       parsing in CLI mode (Default: `1`)
+  - `dmarc_strict_mode` - str: DMARC DNS policy parsing mode for internal APIs.
+      Values: `auto` (strict then fallback), `strict`, or `legacy` (fallback-only).
+      Default: `auto`.
 
     :::{note}
     Setting this to a number larger than one can improve

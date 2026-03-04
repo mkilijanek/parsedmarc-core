@@ -43,6 +43,13 @@ from parsedmarc.utils import get_base_domain, get_ip_address_info
 from parsedmarc.utils import is_outlook_msg, convert_outlook_msg
 from parsedmarc.utils import parse_email
 from parsedmarc.utils import timestamp_to_human, human_timestamp_to_datetime
+from parsedmarc.dmarc_policy import (
+    DmarcPolicy,
+    parse_dmarc_record,
+    discover_dmarc_policy,
+    normalize_domain,
+    domains_equal_for_alignment,
+)
 
 
 logger.debug("parsedmarc v{0}".format(__version__))

@@ -662,6 +662,7 @@ def _main():
         webhook_smtp_tls_url=None,
         webhook_timeout=60,
         normalize_timespan_threshold_hours=24.0,
+        dmarc_strict_mode="auto",
     )
     args = arg_parser.parse_args()
 
@@ -682,6 +683,16 @@ def _main():
                 opts.normalize_timespan_threshold_hours = general_config.getfloat(
                     "normalize_timespan_threshold_hours"
                 )
+            if "dmarc_strict_mode" in general_config:
+                strict_mode = general_config.get("dmarc_strict_mode", fallback="auto")
+                strict_mode = strict_mode.strip().lower()
+                if strict_mode not in ["auto", "strict", "legacy"]:
+                    logger.warning(
+                        "Invalid dmarc_strict_mode value '%s', using 'auto'",
+                        strict_mode,
+                    )
+                    strict_mode = "auto"
+                opts.dmarc_strict_mode = strict_mode
             if "index_prefix_domain_map" in general_config:
                 with open(general_config["index_prefix_domain_map"]) as f:
                     index_prefix_domain_map = yaml.safe_load(f)

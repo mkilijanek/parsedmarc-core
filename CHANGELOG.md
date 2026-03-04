@@ -1,5 +1,15 @@
 # Changelog
 
+## 9.1.0-h1
+
+### Improvements
+
+- Add DMARC DNS policy parsing/discovery helpers with strict (`DMARCbis`-aware),
+  fallback (`RFC 7489`-compatible), and auto mode behavior.
+- Add IDN normalization (U-label to A-label) for DMARC policy lookup and
+  domain comparison helpers.
+- Add optional PSD DMARC discovery support in strict/auto workflows.
+
 ## 9.0.5
 
 ## Fixes
