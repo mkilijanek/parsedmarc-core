@@ -230,6 +230,18 @@ index for each day to make it easy to comply with records
 retention regulations such as GDPR. For more information,
 check out the Elastic guide to [managing time-based indexes efficiently](https://www.elastic.co/blog/managing-time-based-indices-efficiently).
 
+## API key format
+
+If you configure `api_key` authentication in `parsedmarc`, use the base64
+encoding of `<id>:<api_key>` returned by Elasticsearch.
+
+```bash
+echo -n '<id>:<api_key>' | base64
+```
+
+Use `-n` to avoid adding a trailing newline, which causes authentication
+failures.
+
 [elasticsearch]: https://www.elastic.co/guide/en/elasticsearch/reference/current/rpm.html
 [export.ndjson]: https://raw.githubusercontent.com/domainaware/parsedmarc/master/kibana/export.ndjson
 [kibana]: https://www.elastic.co/guide/en/kibana/current/rpm.html

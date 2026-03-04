@@ -9,6 +9,13 @@
 - Add IDN normalization (U-label to A-label) for DMARC policy lookup and
   domain comparison helpers.
 - Add optional PSD DMARC discovery support in strict/auto workflows.
+- Add a resilient MS Graph folder lookup fallback for well-known folders when
+  root folder listing fails with `Default folder Root not found`.
+- Reduce mailbox watch overhead by skipping unnecessary full-folder follow-up
+  fetches when `batch_size` is configured.
+- Add `general.fail_on_output_error` to return non-zero exit status when
+  output sink publishing fails.
+- Clarify Elasticsearch API key format requirements in documentation.
 
 ## 9.0.5
 
