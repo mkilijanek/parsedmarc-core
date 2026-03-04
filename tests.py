@@ -7,14 +7,30 @@ import os
 import sys
 import tempfile
 import unittest
+from base64 import urlsafe_b64encode
 from glob import glob
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from unittest.mock import patch
+from unittest.mock import MagicMock
 
 from lxml import etree
+from googleapiclient.errors import HttpError
+from httplib2 import Response
+from imapclient.exceptions import IMAPClientError
 
 import parsedmarc
 import parsedmarc.cli
 from parsedmarc.mail.graph import MSGraphConnection
+from parsedmarc.mail.gmail import GmailConnection
+from parsedmarc.mail.gmail import _get_creds
+from parsedmarc.mail.graph import _get_cache_args
+from parsedmarc.mail.graph import _generate_credential
+from parsedmarc.mail.graph import _load_token
+from parsedmarc.mail.imap import IMAPConnection
+import parsedmarc.mail.gmail as gmail_module
+import parsedmarc.mail.graph as graph_module
+import parsedmarc.mail.imap as imap_module
 import parsedmarc.utils
 
 
@@ -425,6 +441,296 @@ aggregate_url = http://127.0.0.1:9
             self.assertEqual(system_exit.exception.code, 1)
         finally:
             os.remove(cfg_path)
+
+
+class _FakeGraphResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+class _BreakLoop(BaseException):
+    pass
+
+
+class TestGmailConnection(unittest.TestCase):
+    def _build_connection(self, *, paginate=True):
+        connection = GmailConnection.__new__(GmailConnection)
+        connection.include_spam_trash = False
+        connection.reports_label_id = "REPORTS"
+        connection.paginate_messages = paginate
+        connection.service = MagicMock()
+        return connection
+
+    def testFindLabelId(self):
+        connection = self._build_connection()
+        labels_api = connection.service.users.return_value.labels.return_value
+        labels_api.list.return_value.execute.return_value = {
+            "labels": [
+                {"id": "INBOX", "name": "INBOX"},
+                {"id": "REPORTS", "name": "Reports"},
+            ]
+        }
+        self.assertEqual(connection._find_label_id_for_label("Reports"), "REPORTS")
+        self.assertEqual(connection._find_label_id_for_label("MISSING"), "")
+
+    def testFetchMessagesWithPagination(self):
+        connection = self._build_connection(paginate=True)
+        messages_api = connection.service.users.return_value.messages.return_value
+
+        def list_side_effect(**kwargs):
+            response = MagicMock()
+            if kwargs.get("pageToken") is None:
+                response.execute.return_value = {
+                    "messages": [{"id": "a"}, {"id": "b"}],
+                    "nextPageToken": "n1",
+                }
+            else:
+                response.execute.return_value = {"messages": [{"id": "c"}]}
+            return response
+
+        messages_api.list.side_effect = list_side_effect
+        connection._find_label_id_for_label = MagicMock(return_value="REPORTS")
+        self.assertEqual(connection.fetch_messages("Reports"), ["a", "b", "c"])
+
+    def testFetchMessageDecoding(self):
+        connection = self._build_connection()
+        messages_api = connection.service.users.return_value.messages.return_value
+        raw = urlsafe_b64encode(b"Subject: test\n\nbody").decode()
+        messages_api.get.return_value.execute.return_value = {"raw": raw}
+        content = connection.fetch_message("m1")
+        self.assertIn(b"Subject: test", content)
+
+    def testMoveAndDeleteMessage(self):
+        connection = self._build_connection()
+        connection._find_label_id_for_label = MagicMock(return_value="ARCHIVE")
+        messages_api = connection.service.users.return_value.messages.return_value
+        messages_api.modify.return_value.execute.return_value = {}
+        connection.move_message("m1", "Archive")
+        messages_api.modify.assert_called_once()
+        connection.delete_message("m1")
+        messages_api.delete.assert_called_once_with(userId="me", id="m1")
+
+    def testGetCredsFromTokenFile(self):
+        creds = MagicMock()
+        creds.valid = True
+        with NamedTemporaryFile("w", delete=False) as token_file:
+            token_file.write("{}")
+            token_path = token_file.name
+        try:
+            with patch.object(
+                gmail_module.Credentials,
+                "from_authorized_user_file",
+                return_value=creds,
+            ):
+                returned = _get_creds(
+                    token_path, "credentials.json", ["scope"], 8080
+                )
+        finally:
+            os.remove(token_path)
+        self.assertEqual(returned, creds)
+
+    def testGetCredsWithOauthFlow(self):
+        expired_creds = MagicMock()
+        expired_creds.valid = False
+        expired_creds.expired = False
+        expired_creds.refresh_token = None
+        new_creds = MagicMock()
+        new_creds.valid = True
+        new_creds.to_json.return_value = '{"token":"x"}'
+        flow = MagicMock()
+        flow.run_local_server.return_value = new_creds
+
+        with NamedTemporaryFile("w", delete=False) as token_file:
+            token_file.write("{}")
+            token_path = token_file.name
+        try:
+            with patch.object(
+                gmail_module.Credentials,
+                "from_authorized_user_file",
+                return_value=expired_creds,
+            ):
+                with patch.object(
+                    gmail_module.InstalledAppFlow,
+                    "from_client_secrets_file",
+                    return_value=flow,
+                ):
+                    returned = _get_creds(
+                        token_path, "credentials.json", ["scope"], 8080
+                    )
+        finally:
+            os.remove(token_path)
+        self.assertEqual(returned, new_creds)
+        flow.run_local_server.assert_called_once()
+
+    def testCreateFolderConflictIgnored(self):
+        connection = self._build_connection()
+        labels_api = connection.service.users.return_value.labels.return_value
+        conflict = HttpError(Response({"status": "409"}), b"conflict")
+        labels_api.create.return_value.execute.side_effect = conflict
+        connection.create_folder("Existing")
+
+
+class TestGraphConnection(unittest.TestCase):
+    def testLoadTokenMissing(self):
+        self.assertIsNone(_load_token(Path("/tmp/definitely_missing_token_file")))
+
+    def testLoadTokenExisting(self):
+        with NamedTemporaryFile("w", delete=False) as token_file:
+            token_file.write("serialized-auth-record")
+            token_path = token_file.name
+        try:
+            self.assertEqual(_load_token(Path(token_path)), "serialized-auth-record")
+        finally:
+            os.remove(token_path)
+
+    def testGetAllMessagesPagination(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        first_response = _FakeGraphResponse(
+            200, {"value": [{"id": "1"}], "@odata.nextLink": "next-url"}
+        )
+        second_response = _FakeGraphResponse(200, {"value": [{"id": "2"}]})
+        connection._client = MagicMock()
+        connection._client.get.side_effect = [first_response, second_response]
+        messages = connection._get_all_messages("/url", batch_size=0, since=None)
+        self.assertEqual([msg["id"] for msg in messages], ["1", "2"])
+
+    def testFetchMessageMarksRead(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(200, text="email-content")
+        connection.mark_message_read = MagicMock()
+        content = connection.fetch_message("123", mark_read=True)
+        self.assertEqual(content, "email-content")
+        connection.mark_message_read.assert_called_once_with("123")
+
+    def testFindFolderIdNotFound(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.get.return_value = _FakeGraphResponse(200, {"value": []})
+        with self.assertRaises(RuntimeError):
+            connection._find_folder_id_with_parent("Missing", None)
+
+    def testGetCacheArgsWithAuthRecord(self):
+        with NamedTemporaryFile("w", delete=False) as token_file:
+            token_file.write("serialized")
+            token_path = Path(token_file.name)
+        try:
+            with patch.object(
+                graph_module.AuthenticationRecord,
+                "deserialize",
+                return_value="auth_record",
+            ):
+                args = _get_cache_args(token_path, allow_unencrypted_storage=False)
+            self.assertIn("authentication_record", args)
+        finally:
+            os.remove(token_path)
+
+    def testGenerateCredentialInvalid(self):
+        with self.assertRaises(RuntimeError):
+            _generate_credential(
+                "Nope",
+                Path("/tmp/token"),
+                client_id="x",
+                client_secret="y",
+                username="u",
+                password="p",
+                tenant_id="t",
+                allow_unencrypted_storage=False,
+            )
+
+    def testCreateFolderAndMoveErrors(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.post.return_value = _FakeGraphResponse(500, {"error": "x"})
+        connection._find_folder_id_from_folder_path = MagicMock(return_value="dest")
+        with self.assertRaises(RuntimeWarning):
+            connection.move_message("m1", "Archive")
+
+        connection._client.post.return_value = _FakeGraphResponse(409, {})
+        connection.create_folder("Archive")
+
+    def testMarkReadDeleteFailures(self):
+        connection = MSGraphConnection.__new__(MSGraphConnection)
+        connection.mailbox_name = "mailbox@example.com"
+        connection._client = MagicMock()
+        connection._client.patch.return_value = _FakeGraphResponse(500, {"error": "x"})
+        with self.assertRaises(RuntimeWarning):
+            connection.mark_message_read("m1")
+
+        connection._client.delete.return_value = _FakeGraphResponse(500, {"error": "x"})
+        with self.assertRaises(RuntimeWarning):
+            connection.delete_message("m1")
+
+
+class TestImapConnection(unittest.TestCase):
+    def testDelegatesToImapClient(self):
+        with patch.object(imap_module, "IMAPClient") as mocked_client_cls:
+            mocked_client = MagicMock()
+            mocked_client_cls.return_value = mocked_client
+            connection = IMAPConnection(
+                "imap.example.com", user="user", password="pass"
+            )
+
+            connection.create_folder("Archive")
+            mocked_client.create_folder.assert_called_once_with("Archive")
+
+            mocked_client.search.return_value = [1, 2]
+            self.assertEqual(connection.fetch_messages("INBOX"), [1, 2])
+            mocked_client.select_folder.assert_called_with("INBOX")
+
+            connection.fetch_messages("INBOX", since="2026-03-01")
+            mocked_client.search.assert_called_with(["SINCE", "2026-03-01"])
+
+            mocked_client.fetch_message.return_value = "raw-message"
+            self.assertEqual(connection.fetch_message(1), "raw-message")
+
+            connection.delete_message(7)
+            mocked_client.delete_messages.assert_called_once_with([7])
+
+            connection.move_message(8, "Archive")
+            mocked_client.move_messages.assert_called_once_with([8], "Archive")
+
+            connection.keepalive()
+            mocked_client.noop.assert_called_once()
+
+    def testWatchReconnectPath(self):
+        with patch.object(imap_module, "IMAPClient") as mocked_client_cls:
+            base_client = MagicMock()
+            base_client.host = "imap.example.com"
+            base_client.port = 993
+            base_client.ssl = True
+            mocked_client_cls.return_value = base_client
+            connection = IMAPConnection(
+                "imap.example.com", user="user", password="pass"
+            )
+
+            calls = {"count": 0}
+
+            def fake_imap_constructor(*args, **kwargs):
+                idle_callback = kwargs.get("idle_callback")
+                if calls["count"] == 0:
+                    calls["count"] += 1
+                    raise IMAPClientError("timeout")
+                if idle_callback is not None:
+                    idle_callback(base_client)
+                raise _BreakLoop()
+
+            callback = MagicMock()
+            with patch.object(imap_module, "sleep", return_value=None):
+                with patch.object(
+                    imap_module, "IMAPClient", side_effect=fake_imap_constructor
+                ):
+                    with self.assertRaises(_BreakLoop):
+                        connection.watch(callback, check_timeout=1)
+            callback.assert_called_once_with(connection)
 
 
 if __name__ == "__main__":
