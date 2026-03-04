@@ -2,30 +2,28 @@
 
 from __future__ import annotations
 
-from typing import Optional, Union, Any
-
-from collections import OrderedDict
+from typing import Any, Optional, Union
 
 from opensearchpy import (
-    Q,
-    connections,
-    Object,
+    Boolean,
+    Date,
     Document,
     Index,
-    Nested,
     InnerDoc,
     Integer,
-    Text,
-    Boolean,
     Ip,
-    Date,
+    Nested,
+    Object,
+    Q,
     Search,
+    Text,
+    connections,
 )
 from opensearchpy.helpers import reindex
 
+from parsedmarc import InvalidForensicReport
 from parsedmarc.log import logger
 from parsedmarc.utils import human_timestamp_to_datetime
-from parsedmarc import InvalidForensicReport
 
 
 class OpenSearchError(Exception):
@@ -104,7 +102,7 @@ class _AggregateReportDoc(Document):
     def add_spf_result(self, domain: str, scope: str, result: _SPFResult):
         self.spf_results.append(_SPFResult(domain=domain, scope=scope, result=result))
 
-    def save(self, **kwargs):
+    def save(self, **kwargs):  # pyright: ignore[reportIncompatibleMethodOverride]
         self.passed_dmarc = False
         self.passed_dmarc = self.spf_aligned or self.dkim_aligned
 
@@ -377,18 +375,18 @@ def migrate_indexes(
 
 
 def save_aggregate_report_to_opensearch(
-    aggregate_report: OrderedDict[str, Any],
+    aggregate_report: dict[str, Any],
     index_suffix: Optional[str] = None,
     index_prefix: Optional[str] = None,
-    monthly_indexes: Optional[bool] = False,
-    number_of_shards: Optional[int] = 1,
-    number_of_replicas: Optional[int] = 0,
+    monthly_indexes: bool = False,
+    number_of_shards: int = 1,
+    number_of_replicas: int = 0,
 ):
     """
     Saves a parsed DMARC aggregate report to OpenSearch
 
     Args:
-        aggregate_report (OrderedDict): A parsed forensic report
+        aggregate_report (dict): A parsed forensic report
         index_suffix (str): The suffix of the name of the index to save to
         index_prefix (str): The prefix of the name of the index to save to
         monthly_indexes (bool): Use monthly indexes instead of daily indexes
@@ -428,13 +426,12 @@ def save_aggregate_report_to_opensearch(
     query = org_name_query & report_id_query & domain_query
     query = query & begin_date_query & end_date_query
     search.query = query
+    begin_date_human = begin_date.strftime("%Y-%m-%d %H:%M:%SZ")
+    end_date_human = end_date.strftime("%Y-%m-%d %H:%M:%SZ")
 
     try:
         existing = search.execute()
     except Exception as error_:
-        begin_date_human = begin_date.strftime("%Y-%m-%d %H:%M:%SZ")
-        end_date_human = end_date.strftime("%Y-%m-%d %H:%M:%SZ")
-
         raise OpenSearchError(
             "OpenSearch's search for existing report \
             error: {}".format(error_.__str__())
@@ -539,10 +536,10 @@ def save_aggregate_report_to_opensearch(
 
 
 def save_forensic_report_to_opensearch(
-    forensic_report: OrderedDict[str, Any],
+    forensic_report: dict[str, Any],
     index_suffix: Optional[str] = None,
     index_prefix: Optional[str] = None,
-    monthly_indexes: Optional[bool] = False,
+    monthly_indexes: bool = False,
     number_of_shards: int = 1,
     number_of_replicas: int = 0,
 ):
@@ -550,7 +547,7 @@ def save_forensic_report_to_opensearch(
     Saves a parsed DMARC forensic report to OpenSearch
 
     Args:
-        forensic_report (OrderedDict): A parsed forensic report
+        forensic_report (dict): A parsed forensic report
         index_suffix (str): The suffix of the name of the index to save to
         index_prefix (str): The prefix of the name of the index to save to
         monthly_indexes (bool): Use monthly indexes instead of daily
@@ -570,7 +567,7 @@ def save_forensic_report_to_opensearch(
         sample_date = forensic_report["parsed_sample"]["date"]
         sample_date = human_timestamp_to_datetime(sample_date)
     original_headers = forensic_report["parsed_sample"]["headers"]
-    headers = OrderedDict()
+    headers: dict[str, Any] = {}
     for original_header in original_headers:
         headers[original_header.lower()] = original_headers[original_header]
 
@@ -706,18 +703,18 @@ def save_forensic_report_to_opensearch(
 
 
 def save_smtp_tls_report_to_opensearch(
-    report: OrderedDict[str, Any],
+    report: dict[str, Any],
     index_suffix: Optional[str] = None,
     index_prefix: Optional[str] = None,
-    monthly_indexes: Optional[bool] = False,
-    number_of_shards: Optional[int] = 1,
-    number_of_replicas: Optional[int] = 0,
+    monthly_indexes: bool = False,
+    number_of_shards: int = 1,
+    number_of_replicas: int = 0,
 ):
     """
     Saves a parsed SMTP TLS report to OpenSearch
 
     Args:
-        report (OrderedDict): A parsed SMTP TLS report
+        report (dict): A parsed SMTP TLS report
         index_suffix (str): The suffix of the name of the index to save to
         index_prefix (str): The prefix of the name of the index to save to
         monthly_indexes (bool): Use monthly indexes instead of daily indexes
