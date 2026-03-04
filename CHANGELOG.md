@@ -16,6 +16,8 @@
 - Add `general.fail_on_output_error` to return non-zero exit status when
   output sink publishing fails.
 - Clarify Elasticsearch API key format requirements in documentation.
+- Restore Python 3.14 support by requiring `imapclient>=3.1.0` and extending
+  CI test coverage to include Python 3.14.
 
 ## 9.0.5
 
