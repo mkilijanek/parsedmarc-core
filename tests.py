@@ -4,12 +4,16 @@
 from __future__ import absolute_import, print_function, unicode_literals
 
 import os
+import sys
+import tempfile
 import unittest
 from glob import glob
+from unittest.mock import patch
 
 from lxml import etree
 
 import parsedmarc
+import parsedmarc.cli
 import parsedmarc.utils
 
 # Detect if running in GitHub Actions to skip DNS lookups
@@ -164,6 +168,45 @@ class Test(unittest.TestCase):
             )["report"]
             parsedmarc.parsed_smtp_tls_reports_to_csv(parsed_report)
             print("Passed!")
+
+
+class TestOutputErrorHandling(unittest.TestCase):
+    def testFailOnOutputErrorExitsNonZero(self):
+        sample_paths = sorted(glob("samples/aggregate/*.xml"))
+        self.assertTrue(len(sample_paths) > 0)
+        sample_path = sample_paths[0]
+
+        config_text = """
+[general]
+silent = True
+offline = True
+always_use_local_files = True
+save_aggregate = True
+fail_on_output_error = True
+
+[webhook]
+aggregate_url = http://127.0.0.1:9
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg_file:
+            cfg_file.write(config_text)
+            cfg_path = cfg_file.name
+
+        try:
+            with patch.object(
+                sys,
+                "argv",
+                ["parsedmarc", "-c", cfg_path, sample_path],
+            ):
+                with patch.object(
+                    parsedmarc.cli.webhook.WebhookClient,
+                    "save_aggregate_report_to_webhook",
+                    side_effect=RuntimeError("webhook send failed"),
+                ):
+                    with self.assertRaises(SystemExit) as system_exit:
+                        parsedmarc.cli._main()
+            self.assertEqual(system_exit.exception.code, 1)
+        finally:
+            os.remove(cfg_path)
 
 
 if __name__ == "__main__":
