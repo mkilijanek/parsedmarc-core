@@ -146,6 +146,9 @@ The full set of configuration options are:
   - `dns_timeout` - float: DNS timeout period
   - `debug` - bool: Print debugging messages
   - `silent` - bool: Only print errors (Default: `True`)
+  - `fail_on_output_error` - bool: Exit with a non-zero status code if
+      any configured output destination fails while saving/publishing
+      reports (Default: `False`)
   - `log_file` - str: Write log messages to a file at this path
   - `n_procs` - int: Number of process to run in parallel when
       parsing in CLI mode (Default: `1`)
@@ -258,6 +261,10 @@ The full set of configuration options are:
   - `user` - str: Basic auth username
   - `password` - str: Basic auth password
   - `api_key` - str: API key
+  - `auth_type` - str: Authentication type: `basic` (default) or `awssigv4`
+  - `aws_region` - str: AWS region for SigV4 authentication
+    (required when `auth_type = awssigv4`)
+  - `aws_service` - str: AWS service for SigV4 signing (Default: `es`)
   - `ssl` - bool: Use an encrypted SSL/TLS connection
     (Default: `True`)
   - `timeout` - float: Timeout in seconds (Default: 60)
