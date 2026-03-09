@@ -46,6 +46,13 @@ from parsedmarc.mail import (
     MailboxConnection,
     MSGraphConnection,
 )
+from parsedmarc.dmarc_policy import (
+    DmarcPolicy,
+    discover_dmarc_policy,
+    domains_equal_for_alignment,
+    normalize_domain,
+    parse_dmarc_record,
+)
 from parsedmarc.types import (
     AggregateReport,
     ForensicReport,

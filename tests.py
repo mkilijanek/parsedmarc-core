@@ -166,5 +166,85 @@ class Test(unittest.TestCase):
             print("Passed!")
 
 
+class _FakePSL:
+    def privatesuffix(self, domain):
+        domain = domain.lower()
+        if domain.endswith(".example.co.uk"):
+            return "example.co.uk"
+        if domain.endswith(".example.com"):
+            return "example.com"
+        return domain
+
+    def publicsuffix(self, domain):
+        domain = domain.lower()
+        if domain.endswith(".co.uk"):
+            return "co.uk"
+        if domain.endswith(".com"):
+            return "com"
+        return domain.split(".")[-1]
+
+
+class TestDmarcPolicy(unittest.TestCase):
+    def testStrictValidRecord(self):
+        txt = "v=DMARC1; p=reject; adkim=s; aspf=r; pct=100; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertEqual(mode, "strict")
+        self.assertEqual(errors, [])
+        self.assertEqual(policy.p, "reject")
+        self.assertEqual(policy.adkim, "s")
+        self.assertEqual(policy.rua, ["mailto:dmarc@example.com"])
+
+    def testStrictInvalidUnknownTagFallbackValid(self):
+        txt = "v=DMARC1; p=quarantine; x-unknown=test; rua=mailto:dmarc@example.com"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNotNone(policy)
+        self.assertEqual(mode, "fallback")
+        self.assertTrue(any("Unknown tag in strict mode" in error for error in errors))
+
+    def testInvalidUnrecoverableBadVersion(self):
+        txt = "v=DMARC2; p=reject"
+        policy, mode, errors = parsedmarc.parse_dmarc_record(txt, domain="example.com")
+        self.assertIsNone(policy)
+        self.assertIsNone(mode)
+        self.assertTrue(any("invalid v=DMARC1" in error for error in errors))
+
+    def testIdnNormalization(self):
+        normalized = parsedmarc.normalize_domain("żółć.pl")
+        self.assertEqual(normalized, "xn--kda4b0koi.pl")
+        self.assertTrue(
+            parsedmarc.domains_equal_for_alignment("ŻÓŁĆ.pl", "xn--kda4b0koi.pl")
+        )
+
+    def testPsdDiscoveryEnabledAutoMode(self):
+        records = {
+            "_dmarc.mail.example.co.uk": [],
+            "_dmarc.example.co.uk": [],
+            "_dmarc.co.uk": ["v=DMARC1; p=reject; rua=mailto:psd@co.uk"],
+        }
+
+        def resolver(name, record_type):
+            if record_type != "TXT":
+                return []
+            return records.get(name, [])
+
+        policy, discovery_path, mode = parsedmarc.discover_dmarc_policy(
+            "mail.example.co.uk",
+            dns_resolver=resolver,
+            psl_provider=_FakePSL(),
+            flags={"enable_psd": True, "dmarc_strict_mode": "auto"},
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(policy.source, "psd")
+        self.assertEqual(mode, "strict")
+        self.assertEqual(
+            discovery_path,
+            [
+                "_dmarc.mail.example.co.uk:0",
+                "_dmarc.example.co.uk:0",
+                "_dmarc.co.uk:1",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

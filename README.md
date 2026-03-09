@@ -45,6 +45,10 @@ Thanks to all
   use with premade dashboards
 - Optionally send reports to Apache Kafka
 
+Library consumers can use `parse_dmarc_record()` and
+`discover_dmarc_policy()` to evaluate DMARC DNS policies in
+`strict`, `auto`, or `legacy` compatibility modes, including IDN-aware lookups.
+
 ## Python Compatibility
 
 This project supports the following Python versions, which are either actively maintained or are the default versions
