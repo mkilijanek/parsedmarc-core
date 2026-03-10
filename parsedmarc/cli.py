@@ -960,6 +960,14 @@ def _main():
             graph_config = config["msgraph"]
             opts.graph_token_file = graph_config.get("token_file", ".token")
 
+            def _require_graph_setting(setting: str) -> str:
+                if setting in graph_config:
+                    return graph_config[setting]
+                logger.critical(
+                    f"{setting} setting missing from the msgraph config section"
+                )
+                exit(-1)
+
             if "auth_method" not in graph_config:
                 logger.info(
                     "auth_method setting missing from the "
@@ -971,78 +979,35 @@ def _main():
                 opts.graph_auth_method = graph_config["auth_method"]
 
             if opts.graph_auth_method == AuthMethod.UsernamePassword.name:
-                if "user" in graph_config:
-                    opts.graph_user = graph_config["user"]
-                else:
-                    logger.critical(
-                        "user setting missing from the msgraph config section"
-                    )
-                    exit(-1)
-                if "password" in graph_config:
-                    opts.graph_password = graph_config["password"]
-                else:
-                    logger.critical(
-                        "password setting missing from the msgraph config section"
-                    )
-                    exit(-1)
-                if "client_secret" in graph_config:
-                    opts.graph_client_secret = graph_config["client_secret"]
-                else:
-                    logger.critical(
-                        "client_secret setting missing from the msgraph config section"
-                    )
-                    exit(-1)
+                opts.graph_user = _require_graph_setting("user")
+                opts.graph_password = _require_graph_setting("password")
+                opts.graph_client_secret = _require_graph_setting("client_secret")
 
             if opts.graph_auth_method == AuthMethod.DeviceCode.name:
                 if "user" in graph_config:
                     opts.graph_user = graph_config["user"]
 
             if opts.graph_auth_method != AuthMethod.UsernamePassword.name:
-                if "tenant_id" in graph_config:
-                    opts.graph_tenant_id = graph_config["tenant_id"]
-                else:
-                    logger.critical(
-                        "tenant_id setting missing from the msgraph config section"
-                    )
-                    exit(-1)
+                opts.graph_tenant_id = _require_graph_setting("tenant_id")
 
             if opts.graph_auth_method == AuthMethod.ClientSecret.name:
-                if "client_secret" in graph_config:
-                    opts.graph_client_secret = graph_config["client_secret"]
-                else:
-                    logger.critical(
-                        "client_secret setting missing from the msgraph config section"
-                    )
-                    exit(-1)
+                opts.graph_client_secret = _require_graph_setting("client_secret")
 
             if opts.graph_auth_method == AuthMethod.Certificate.name:
-                if "certificate_path" in graph_config:
-                    opts.graph_certificate_path = graph_config["certificate_path"]
-                else:
-                    logger.critical(
-                        "certificate_path setting missing from the msgraph config section"
-                    )
-                    exit(-1)
+                opts.graph_certificate_path = _require_graph_setting(
+                    "certificate_path"
+                )
                 if "certificate_password" in graph_config:
                     opts.graph_certificate_password = graph_config[
                         "certificate_password"
                     ]
 
-            if "client_id" in graph_config:
-                opts.graph_client_id = graph_config["client_id"]
-            else:
-                logger.critical(
-                    "client_id setting missing from the msgraph config section"
-                )
-                exit(-1)
+            opts.graph_client_id = _require_graph_setting("client_id")
 
             if "mailbox" in graph_config:
                 opts.graph_mailbox = graph_config["mailbox"]
             elif opts.graph_auth_method != AuthMethod.UsernamePassword.name:
-                logger.critical(
-                    "mailbox setting missing from the msgraph config section"
-                )
-                exit(-1)
+                _require_graph_setting("mailbox")
 
             if "graph_url" in graph_config:
                 opts.graph_url = graph_config["graph_url"]
