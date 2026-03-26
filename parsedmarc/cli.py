@@ -75,6 +75,11 @@ def _str_to_list(s):
     return list(map(lambda i: i.lstrip(), _list))
 
 
+def _expand_path(p: str) -> str:
+    """Expand ``~`` and ``$VAR`` references in a file path."""
+    return os.path.expanduser(os.path.expandvars(p))
+
+
 # All known INI config section names, used for env var resolution.
 _KNOWN_SECTIONS = frozenset(
     {
@@ -302,7 +307,7 @@ def _parse_config(config: ConfigParser, opts):
                 "normalize_timespan_threshold_hours"
             )
         if "index_prefix_domain_map" in general_config:
-            with open(general_config["index_prefix_domain_map"]) as f:
+            with open(_expand_path(general_config["index_prefix_domain_map"])) as f:
                 index_prefix_domain_map = yaml.safe_load(f)
         if "offline" in general_config:
             opts.offline = bool(general_config.getboolean("offline"))
@@ -311,7 +316,7 @@ def _parse_config(config: ConfigParser, opts):
                 general_config.getboolean("strip_attachment_payloads")
             )
         if "output" in general_config:
-            opts.output = general_config["output"]
+            opts.output = _expand_path(general_config["output"])
         if "aggregate_json_filename" in general_config:
             opts.aggregate_json_filename = general_config["aggregate_json_filename"]
         if "forensic_json_filename" in general_config:
@@ -367,11 +372,11 @@ def _parse_config(config: ConfigParser, opts):
                 general_config.getboolean("fail_on_output_error")
             )
         if "log_file" in general_config:
-            opts.log_file = general_config["log_file"]
+            opts.log_file = _expand_path(general_config["log_file"])
         if "n_procs" in general_config:
             opts.n_procs = general_config.getint("n_procs")
         if "ip_db_path" in general_config:
-            opts.ip_db_path = general_config["ip_db_path"]
+            opts.ip_db_path = _expand_path(general_config["ip_db_path"])
         else:
             opts.ip_db_path = None
         if "always_use_local_files" in general_config:
@@ -379,7 +384,9 @@ def _parse_config(config: ConfigParser, opts):
                 general_config.getboolean("always_use_local_files")
             )
         if "local_reverse_dns_map_path" in general_config:
-            opts.reverse_dns_map_path = general_config["local_reverse_dns_map_path"]
+            opts.reverse_dns_map_path = _expand_path(
+                general_config["local_reverse_dns_map_path"]
+            )
         if "reverse_dns_map_url" in general_config:
             opts.reverse_dns_map_url = general_config["reverse_dns_map_url"]
         if "prettify_json" in general_config:
@@ -494,7 +501,7 @@ def _parse_config(config: ConfigParser, opts):
 
     if "msgraph" in config.sections():
         graph_config = config["msgraph"]
-        opts.graph_token_file = graph_config.get("token_file", ".token")
+        opts.graph_token_file = _expand_path(graph_config.get("token_file", ".token"))
 
         if "auth_method" not in graph_config:
             logger.info(
@@ -548,7 +555,9 @@ def _parse_config(config: ConfigParser, opts):
 
         if opts.graph_auth_method == AuthMethod.Certificate.name:
             if "certificate_path" in graph_config:
-                opts.graph_certificate_path = graph_config["certificate_path"]
+                opts.graph_certificate_path = _expand_path(
+                    graph_config["certificate_path"]
+                )
             else:
                 raise ConfigurationError(
                     "certificate_path setting missing from the msgraph config section"
@@ -605,7 +614,9 @@ def _parse_config(config: ConfigParser, opts):
         if "ssl" in elasticsearch_config:
             opts.elasticsearch_ssl = bool(elasticsearch_config.getboolean("ssl"))
         if "cert_path" in elasticsearch_config:
-            opts.elasticsearch_ssl_cert_path = elasticsearch_config["cert_path"]
+            opts.elasticsearch_ssl_cert_path = _expand_path(
+                elasticsearch_config["cert_path"]
+            )
         if "skip_certificate_verification" in elasticsearch_config:
             opts.elasticsearch_skip_certificate_verification = bool(
                 elasticsearch_config.getboolean("skip_certificate_verification")
@@ -648,7 +659,7 @@ def _parse_config(config: ConfigParser, opts):
         if "ssl" in opensearch_config:
             opts.opensearch_ssl = bool(opensearch_config.getboolean("ssl"))
         if "cert_path" in opensearch_config:
-            opts.opensearch_ssl_cert_path = opensearch_config["cert_path"]
+            opts.opensearch_ssl_cert_path = _expand_path(opensearch_config["cert_path"])
         if "skip_certificate_verification" in opensearch_config:
             opts.opensearch_skip_certificate_verification = bool(
                 opensearch_config.getboolean("skip_certificate_verification")
@@ -775,7 +786,7 @@ def _parse_config(config: ConfigParser, opts):
         if "subject" in smtp_config:
             opts.smtp_subject = smtp_config["subject"]
         if "attachment" in smtp_config:
-            opts.smtp_attachment = smtp_config["attachment"]
+            opts.smtp_attachment = _expand_path(smtp_config["attachment"])
         if "message" in smtp_config:
             opts.smtp_message = smtp_config["message"]
 
@@ -822,11 +833,11 @@ def _parse_config(config: ConfigParser, opts):
         else:
             opts.syslog_protocol = "udp"
         if "cafile_path" in syslog_config:
-            opts.syslog_cafile_path = syslog_config["cafile_path"]
+            opts.syslog_cafile_path = _expand_path(syslog_config["cafile_path"])
         if "certfile_path" in syslog_config:
-            opts.syslog_certfile_path = syslog_config["certfile_path"]
+            opts.syslog_certfile_path = _expand_path(syslog_config["certfile_path"])
         if "keyfile_path" in syslog_config:
-            opts.syslog_keyfile_path = syslog_config["keyfile_path"]
+            opts.syslog_keyfile_path = _expand_path(syslog_config["keyfile_path"])
         if "timeout" in syslog_config:
             opts.syslog_timeout = float(syslog_config["timeout"])
         else:
@@ -842,8 +853,13 @@ def _parse_config(config: ConfigParser, opts):
 
     if "gmail_api" in config.sections():
         gmail_api_config = config["gmail_api"]
-        opts.gmail_api_credentials_file = gmail_api_config.get("credentials_file")
-        opts.gmail_api_token_file = gmail_api_config.get("token_file", ".token")
+        gmail_creds = gmail_api_config.get("credentials_file")
+        opts.gmail_api_credentials_file = (
+            _expand_path(gmail_creds) if gmail_creds else gmail_creds
+        )
+        opts.gmail_api_token_file = _expand_path(
+            gmail_api_config.get("token_file", ".token")
+        )
         opts.gmail_api_include_spam_trash = bool(
             gmail_api_config.getboolean("include_spam_trash", False)
         )
@@ -868,7 +884,8 @@ def _parse_config(config: ConfigParser, opts):
 
     if "maildir" in config.sections():
         maildir_api_config = config["maildir"]
-        opts.maildir_path = maildir_api_config.get("maildir_path")
+        maildir_p = maildir_api_config.get("maildir_path")
+        opts.maildir_path = _expand_path(maildir_p) if maildir_p else maildir_p
         opts.maildir_create = bool(
             maildir_api_config.getboolean("maildir_create", fallback=False)
         )

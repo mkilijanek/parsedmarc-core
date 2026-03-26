@@ -19,18 +19,29 @@ class MaildirConnection(MailboxConnection):
     ):
         self._maildir_path = maildir_path
         self._maildir_create = maildir_create
-        maildir_owner = os.stat(maildir_path).st_uid
-        if os.getuid() != maildir_owner:
-            if os.getuid() == 0:
-                logger.warning(
-                    "Switching uid to {} to access Maildir".format(maildir_owner)
-                )
-                os.setuid(maildir_owner)
+        try:
+            maildir_owner = os.stat(maildir_path).st_uid
+        except OSError:
+            maildir_owner = None
+        current_uid = os.getuid()
+        if maildir_owner is not None and current_uid != maildir_owner:
+            if current_uid == 0:
+                try:
+                    logger.warning(
+                        "Switching uid to {} to access Maildir".format(maildir_owner)
+                    )
+                    os.setuid(maildir_owner)
+                except OSError as e:
+                    logger.warning(
+                        "Failed to switch uid to {}: {}".format(maildir_owner, e)
+                    )
             else:
-                ex = "runtime uid {} differ from maildir {} owner {}".format(
-                    os.getuid(), maildir_path, maildir_owner
+                logger.warning(
+                    "Runtime uid {} differs from maildir {} owner {}. "
+                    "Access may fail if permissions are insufficient.".format(
+                        current_uid, maildir_path, maildir_owner
+                    )
                 )
-                raise Exception(ex)
         if maildir_create:
             for subdir in ("cur", "new", "tmp"):
                 os.makedirs(os.path.join(maildir_path, subdir), exist_ok=True)

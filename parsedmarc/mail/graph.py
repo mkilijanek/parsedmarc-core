@@ -56,6 +56,7 @@ def _load_token(token_path: Path) -> Optional[str]:
 
 def _cache_auth_record(record: AuthenticationRecord, token_path: Path):
     token = record.serialize()
+    token_path.parent.mkdir(parents=True, exist_ok=True)
     with token_path.open("w") as token_file:
         token_file.write(token)
 

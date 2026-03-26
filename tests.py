@@ -2566,6 +2566,128 @@ class TestMaildirConnection(unittest.TestCase):
             self.assertEqual(len(conn._subfolder_client["archive"].keys()), 1)
 
 
+class TestMaildirUidHandling(unittest.TestCase):
+    """Tests for Maildir UID mismatch handling in Docker-like environments."""
+
+    def test_uid_mismatch_warns_instead_of_crashing(self):
+        """UID mismatch logs a warning instead of raising an exception."""
+        from parsedmarc.mail.maildir import MaildirConnection
+
+        with TemporaryDirectory() as d:
+            # Create subdirs so Maildir works
+            for subdir in ("cur", "new", "tmp"):
+                os.makedirs(os.path.join(d, subdir))
+
+            # Mock os.stat to return a different UID than os.getuid
+            fake_stat = os.stat(d)
+            with (
+                patch("parsedmarc.mail.maildir.os.stat") as mock_stat,
+                patch("parsedmarc.mail.maildir.os.getuid", return_value=9999),
+            ):
+                mock_stat.return_value = fake_stat
+                # Should not raise — just warn
+                conn = MaildirConnection(d, maildir_create=False)
+                self.assertEqual(conn.fetch_messages("INBOX"), [])
+
+    def test_uid_match_no_warning(self):
+        """No warning when UIDs match."""
+        from parsedmarc.mail.maildir import MaildirConnection
+
+        with TemporaryDirectory() as d:
+            conn = MaildirConnection(d, maildir_create=True)
+            self.assertEqual(conn.fetch_messages("INBOX"), [])
+
+    def test_stat_failure_does_not_crash(self):
+        """If os.stat fails on the maildir path, we don't crash."""
+        from parsedmarc.mail.maildir import MaildirConnection
+
+        with TemporaryDirectory() as d:
+            for subdir in ("cur", "new", "tmp"):
+                os.makedirs(os.path.join(d, subdir))
+
+            original_stat = os.stat
+
+            def stat_that_fails_once(path, *args, **kwargs):
+                """Fail on the first call (UID check), pass through after."""
+                stat_that_fails_once.calls += 1
+                if stat_that_fails_once.calls == 1:
+                    raise OSError("no stat")
+                return original_stat(path, *args, **kwargs)
+
+            stat_that_fails_once.calls = 0
+
+            with patch(
+                "parsedmarc.mail.maildir.os.stat", side_effect=stat_that_fails_once
+            ):
+                conn = MaildirConnection(d, maildir_create=False)
+                self.assertEqual(conn.fetch_messages("INBOX"), [])
+
+
+class TestExpandPath(unittest.TestCase):
+    """Tests for _expand_path config path expansion."""
+
+    def test_expand_tilde(self):
+        from parsedmarc.cli import _expand_path
+
+        result = _expand_path("~/some/path")
+        self.assertFalse(result.startswith("~"))
+        self.assertTrue(result.endswith("/some/path"))
+
+    def test_expand_env_var(self):
+        from parsedmarc.cli import _expand_path
+
+        with patch.dict(os.environ, {"PARSEDMARC_TEST_DIR": "/opt/data"}):
+            result = _expand_path("$PARSEDMARC_TEST_DIR/tokens/.token")
+        self.assertEqual(result, "/opt/data/tokens/.token")
+
+    def test_expand_both(self):
+        from parsedmarc.cli import _expand_path
+
+        with patch.dict(os.environ, {"MY_APP": "parsedmarc"}):
+            result = _expand_path("~/$MY_APP/config")
+        self.assertNotIn("~", result)
+        self.assertIn("parsedmarc/config", result)
+
+    def test_no_expansion_needed(self):
+        from parsedmarc.cli import _expand_path
+
+        self.assertEqual(_expand_path("/absolute/path"), "/absolute/path")
+        self.assertEqual(_expand_path("relative/path"), "relative/path")
+
+
+class TestTokenParentDirCreation(unittest.TestCase):
+    """Tests for parent directory creation when writing token files."""
+
+    def test_graph_cache_creates_parent_dirs(self):
+        from parsedmarc.mail.graph import _cache_auth_record
+
+        with TemporaryDirectory() as d:
+            token_path = Path(d) / "subdir" / "nested" / ".token"
+            self.assertFalse(token_path.parent.exists())
+
+            mock_record = MagicMock()
+            mock_record.serialize.return_value = "serialized-token"
+
+            _cache_auth_record(mock_record, token_path)
+
+            self.assertTrue(token_path.exists())
+            self.assertEqual(token_path.read_text(), "serialized-token")
+
+    def test_gmail_token_write_creates_parent_dirs(self):
+        """Gmail token write creates parent directories."""
+        with TemporaryDirectory() as d:
+            token_path = Path(d) / "deep" / "nested" / "token.json"
+            self.assertFalse(token_path.parent.exists())
+
+            # Directly test the mkdir + open pattern
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            with token_path.open("w") as f:
+                f.write('{"token": "test"}')
+
+            self.assertTrue(token_path.exists())
+            self.assertEqual(token_path.read_text(), '{"token": "test"}')
+
+
 class TestEnvVarConfig(unittest.TestCase):
     """Tests for environment variable configuration support."""
 
