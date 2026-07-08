@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- **A system GeoIP file no longer silently overrides the bundled IPinfo database** ([#810](https://github.com/domainaware/parsedmarc/issues/810)). The IP database path resolution searched standard system paths (e.g. `/usr/share/GeoIP/GeoLite2-Country.mmdb`, plus CWD-relative names) *before* the database managed by parsedmarc, so on any host with a distro GeoIP package installed — often as a stale dependency of an unrelated package — every lookup used a country-only (and possibly years-old) database instead of the bundled IPinfo Lite database. That silently disabled ASN enrichment (`asn`, `as_name`, `as_domain` were `None` for every IP) and with it the ASN-fallback path into the reverse-DNS map. The precedence is now: explicit `ip_db_path` → the database selected by `load_ip_db()` (downloaded/cached/bundled) → the bundled copy → system paths as a true last resort. The selected database file is logged at debug level. **If you deliberately relied on the automatic system-path pickup to use MaxMind GeoLite2, set `ip_db_path` explicitly** — see the "Using MaxMind GeoLite2" section in the installation docs.
+
 ## 10.2.0
 
 ### Changes
