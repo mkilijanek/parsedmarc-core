@@ -8,6 +8,10 @@
 - Added an `INFO` log (`Connecting to Microsoft Graph mailbox %s`) immediately before the `MSGraphConnection` call, so a stalled/hung connection attempt is visible in verbose logs before the eventual success or failure line.
 - **Added `ClientAssertion` auth support for MS Graph.** `mailsuite.mailbox.graph.MSGraphConnection` already supported this app-only flow (signed JWT client assertion), but `cli.py` had no way to configure it. Added a `client_assertion` key to the `[msgraph]` config section, wired through the same required-field validation pattern used for `client_secret`/`certificate_path`, and documented it (including a caveat that a static assertion is only valid for the lifetime of the JWT — best suited to short one-shot runs, not long-running `watch` mode).
 
+### Bug fixes
+
+- **Failure-report timestamps are no longer skewed by the host's UTC offset in the Elasticsearch, OpenSearch, and Splunk HEC outputs** ([#811](https://github.com/domainaware/parsedmarc/issues/811), bug 1). `arrival_date_utc` is a UTC wall-clock string, but the three sinks parsed it into a naive `datetime` and called `.timestamp()`, which per the Python docs interprets naive values as *local* time — so on any non-UTC host, the epoch stored as the ES/OpenSearch `arrival_date` field, used in the failure-report dedup query, and sent as the Splunk HEC event `time` was off by the host's UTC offset (1–2 h for most of Europe). `human_timestamp_to_datetime()` / `human_timestamp_to_unix_timestamp()` gained an `assume_utc` keyword that attaches `timezone.utc` to naive parses, and the `arrival_date_utc` consumers now use it.
+
 ## 10.2.0
 
 ### Changes
