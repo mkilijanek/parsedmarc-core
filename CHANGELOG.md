@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **Microsoft Graph connections are now observable** ([#814](https://github.com/domainaware/parsedmarc/issues/814)). Previously `--debug` showed nothing about Graph connection activity: the mailbox layer logs under `mailsuite.mailbox.graph`, token acquisition under `azure.identity`, and HTTP traffic under `httpx`/`msgraph` — none of which parsedmarc configured, so everything below WARNING was silently dropped, and `_main()` logged nothing around the connection attempt itself. Now:
+  - A **redacted connection summary** is logged at INFO before connecting (auth method, tenant ID, client ID, mailbox, Graph URL), with a `--debug` detail line adding the certificate path, token-file path, and set/not-set flags for secrets. Secret values (passwords, client secrets, certificate passwords) are never logged, and a regression test asserts they don't appear in captured output.
+  - A timing line (`Microsoft Graph connection initialized in N seconds`) is logged after the connection object is created.
+  - parsedmarc's `--verbose`/`--debug` level now **propagates to the dependency loggers** (`mailsuite`, `azure`, `msgraph`, `httpx`, `httpcore`), so `--debug` surfaces azure-identity's token-endpoint activity — including the `AADSTS` error codes that distinguish a local config problem from an Exchange Online / Entra ID one — and the Graph SDK's HTTP requests. At the default level, dependency loggers sit at WARNING so their warnings keep surfacing (now formatted) without new noise. This also benefits the IMAP backend, which lives in mailsuite too.
+
 ## 10.2.0
 
 ### Changes
