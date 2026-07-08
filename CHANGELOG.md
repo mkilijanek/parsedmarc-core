@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **`[msgraph] auth_method` is now case-insensitive**, and an invalid value now fails config validation immediately with a clear `ConfigurationError` instead of a confusing `RuntimeError: Auth method <value> not found` raised later by `mailsuite` at connection time. Previously, a naturally-lowercased value (e.g. `auth_method = certificate`, matching the lowercase style of neighboring keys like `client_id`/`client_secret`) silently skipped the method-specific config validation (`certificate_path`/`certificate_password` were never parsed) and only surfaced as that cryptic runtime error.
+- Added an `INFO` log (`Connecting to Microsoft Graph mailbox %s`) immediately before the `MSGraphConnection` call, so a stalled/hung connection attempt is visible in verbose logs before the eventual success or failure line.
+- **Added `ClientAssertion` auth support for MS Graph.** `mailsuite.mailbox.graph.MSGraphConnection` already supported this app-only flow (signed JWT client assertion), but `cli.py` had no way to configure it. Added a `client_assertion` key to the `[msgraph]` config section, wired through the same required-field validation pattern used for `client_secret`/`certificate_path`, and documented it (including a caveat that a static assertion is only valid for the lifetime of the JWT — best suited to short one-shot runs, not long-running `watch` mode).
+
 ## 10.2.0
 
 ### Changes
