@@ -6,6 +6,7 @@ transformation logic — document construction, index naming, deduplication
 queries, error wrapping — without needing a running OpenSearch cluster.
 """
 
+import time
 import unittest
 from unittest.mock import MagicMock, call, patch
 
@@ -21,6 +22,7 @@ from parsedmarc.opensearch import (
     save_smtp_tls_report_to_opensearch,
     set_hosts,
 )
+from tests.tzutil import force_tz
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +579,32 @@ class TestSaveAggregateReport(unittest.TestCase):
         self.assertIn("cust_dmarc_aggregate_tenant_a*", search_index)
 
 
+class TestAggregateDocPassedDmarc(unittest.TestCase):
+    """The _AggregateReportDoc.save() override derives passed_dmarc — the
+    field dashboards filter on for DMARC pass/fail — from SPF/DKIM
+    alignment. The SDK parent (opensearchpy.Document.save) is mocked so
+    no cluster is needed."""
+
+    def test_passed_dmarc_derived_from_alignment(self):
+        cases = [
+            (True, False, True),
+            (False, True, True),
+            (True, True, True),
+            (False, False, False),
+        ]
+        for spf_aligned, dkim_aligned, expected in cases:
+            with self.subTest(spf=spf_aligned, dkim=dkim_aligned):
+                with patch.object(
+                    opensearch_module.Document, "save", return_value=None
+                ) as mock_super_save:
+                    doc = opensearch_module._AggregateReportDoc(
+                        spf_aligned=spf_aligned, dkim_aligned=dkim_aligned
+                    )
+                    doc.save()
+                mock_super_save.assert_called_once()
+                self.assertEqual(bool(doc.passed_dmarc), expected)
+
+
 # ---------------------------------------------------------------------------
 # save_failure_report_to_opensearch
 # ---------------------------------------------------------------------------
@@ -657,6 +685,25 @@ class TestSaveFailureReport(unittest.TestCase):
             save_failure_report_to_opensearch(_failure_report(), monthly_indexes=True)
             index_calls = [c.args[0] for c in mock_index_cls.call_args_list]
         self.assertIn("dmarc_failure-2024-01", index_calls)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX time.tzset()")
+    def test_arrival_date_epoch_is_utc_regardless_of_host_timezone(self):
+        """arrival_date_utc is a UTC wall-clock string; the epoch-ms
+        value stored in the document (and used in the dedup query) must
+        be its true UTC epoch on any host. Regression test for
+        https://github.com/domainaware/parsedmarc/issues/811 (bug 1):
+        the naive parse used to shift the stored epoch by the host's
+        UTC offset."""
+        force_tz(self)
+
+        with (
+            patch("parsedmarc.opensearch.Search", return_value=_empty_search()),
+            patch("parsedmarc.opensearch.Index"),
+            patch("parsedmarc.opensearch._FailureReportDoc") as mock_doc_cls,
+        ):
+            save_failure_report_to_opensearch(_failure_report())
+        # Fixture arrival_date_utc is 2024-01-01 00:00:00 UTC.
+        self.assertEqual(mock_doc_cls.call_args.kwargs["arrival_date"], 1704067200000)
 
     def test_failure_search_index_with_suffix_and_prefix(self):
         """When both suffix and prefix are set, the dedup search
