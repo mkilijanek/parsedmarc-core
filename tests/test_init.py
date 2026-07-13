@@ -3055,6 +3055,29 @@ This is not a DMARC report."""
             parsedmarc.parse_report_email(email_str, offline=True)
         self.assertIn("not-a-real-date", str(ctx.exception))
 
+    def testStrictKwargMessageReachesParserError(self):
+        """mail-parser's getaddresses(strict=True) TypeError on an
+        unpatched Python interpreter surfaces through parse_report_email's
+        own catch-all as a ParserError naming the required Python patch
+        releases, not a confusing generic error.
+
+        See fork #30, tracking upstream domainaware/parsedmarc#808.
+        """
+        with (
+            patch("email.utils.supports_strict_parsing", False),
+            patch(
+                "parsedmarc.utils.mailparser.parse_from_string",
+                side_effect=TypeError(
+                    "getaddresses() got an unexpected keyword argument 'strict'"
+                ),
+            ),
+        ):
+            with self.assertRaises(parsedmarc.ParserError) as ctx:
+                parsedmarc.parse_report_email(
+                    "From: a@b.c\nSubject: x\n\nbody", offline=True
+                )
+        self.assertIn("3.12.6", str(ctx.exception))
+
     def testFailureTextReportParses(self):
         """A valid legacy text/plain failure report parses to a failure
         report (the success path that builds the synthetic feedback report

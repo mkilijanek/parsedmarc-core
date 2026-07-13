@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased (fork: mkilijanek/parsedmarc-core)
+
+Fork-only changes carried on top of upstream.
+
+### Bug fixes
+
+- **An outdated Python patch release no longer masquerades as an invalid report** (fork [#30](https://github.com/mkilijanek/parsedmarc-core/issues/30), tracking upstream [domainaware/parsedmarc#808](https://github.com/domainaware/parsedmarc/issues/808)). The third-party `mail-parser` package unconditionally calls `email.utils.getaddresses([...], strict=True)`, a keyword only supported on Python patch releases `>=3.10.15`, `>=3.11.10`, `>=3.12.6` (the CVE-2023-27043 hardening). On an older patch release within an otherwise-supported minor version, `mailparser.parse_from_string()` raised `TypeError: getaddresses() got an unexpected keyword argument 'strict'`, which parsedmarc's existing broad exception handlers silently turned into a generic "invalid report" error — giving no indication that the report itself was fine and the real cause was an outdated Python patch release. The `TypeError` is now caught right at the `mailparser.parse_from_string()` call sites and re-raised as an `EmailParserError` naming the Python versions required to fix it, guarded on `email.utils.supports_strict_parsing` so unrelated `TypeError`s are untouched and still propagate as before. The real fix belongs upstream in `mail-parser`; this only makes the failure mode legible until that lands.
+
 ## 11.0.3
 
 ### Bug fixes
