@@ -26,6 +26,7 @@ import parsedmarc
 import parsedmarc.cli
 import parsedmarc.elastic
 import parsedmarc.opensearch as opensearch_module
+from parsedmarc.types import AggregateReport, ParsingResults
 
 
 class _BreakLoop(BaseException):
@@ -891,6 +892,164 @@ hosts = localhost
             set(cli_module._DIRECT_FILE_KEYS),
             "_DIRECT_FILE_KEYS is out of sync with *_file keys in _parse_config",
         )
+
+
+class TestMailboxSaveCallbackQuarantine(unittest.TestCase):
+    """Tests for the consecutive-failure counter wrapped around
+    mailbox_save_callback in cli.py: after MAX_FAILED_SAVE_ATTEMPTS
+    consecutive batch-save failures, the callback returns
+    SaveOutcome.QUARANTINE instead of False so
+    get_dmarc_reports_from_mailbox()/watch_inbox() stop retrying a batch
+    that a persistently failing sink will never accept
+    (domainaware/parsedmarc#823 review)."""
+
+    _CONFIG = """[general]
+save_aggregate = true
+silent = true
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+
+[elasticsearch]
+hosts = localhost
+"""
+
+    _PASSING_BATCH: ParsingResults = {
+        "aggregate_reports": [],
+        "failure_reports": [],
+        "smtp_tls_reports": [],
+    }
+    _FAILING_BATCH: ParsingResults = {
+        "aggregate_reports": [
+            cast(AggregateReport, {"policy_published": {"domain": "example.com"}})
+        ],
+        "failure_reports": [],
+        "smtp_tls_reports": [],
+    }
+
+    def _get_save_callback(self, mock_imap_connection, mock_get_reports):
+        """Drives _main() far enough (single-shot IMAP mailbox path) to
+        capture the real mailbox_save_callback closure passed as
+        save_callback to get_dmarc_reports_from_mailbox()."""
+        mock_imap_connection.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".ini", delete=False
+        ) as config_file:
+            config_file.write(self._CONFIG)
+            config_path = config_file.name
+        self.addCleanup(lambda: os.path.exists(config_path) and os.remove(config_path))
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            parsedmarc.cli._main()
+
+        save_callback = mock_get_reports.call_args.kwargs.get("save_callback")
+        self.assertTrue(callable(save_callback))
+        return save_callback
+
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def test_save_callback_quarantines_after_max_consecutive_failures(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        _mock_migrate_indexes,
+        mock_save_aggregate,
+    ):
+        """A sink that fails on every batch causes the first
+        MAX_FAILED_SAVE_ATTEMPTS - 1 calls to return False (ordinary
+        retry), and the MAX_FAILED_SAVE_ATTEMPTS-th consecutive failure
+        to return SaveOutcome.QUARANTINE."""
+        save_callback = self._get_save_callback(mock_imap_connection, mock_get_reports)
+        mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
+            "simulated output failure"
+        )
+
+        max_attempts = parsedmarc.cli.MAX_FAILED_SAVE_ATTEMPTS
+        for attempt in range(1, max_attempts):
+            self.assertFalse(
+                save_callback(self._FAILING_BATCH),
+                f"attempt {attempt} of {max_attempts - 1} should retry, not quarantine",
+            )
+
+        self.assertIs(
+            save_callback(self._FAILING_BATCH), parsedmarc.SaveOutcome.QUARANTINE
+        )
+
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def test_save_callback_success_resets_failure_streak(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        _mock_migrate_indexes,
+        mock_save_aggregate,
+    ):
+        """A successful save in between failures resets the consecutive
+        failure counter, so the streak has to restart from zero rather
+        than continuing on toward the quarantine threshold."""
+        save_callback = self._get_save_callback(mock_imap_connection, mock_get_reports)
+        mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
+            "simulated output failure"
+        )
+
+        max_attempts = parsedmarc.cli.MAX_FAILED_SAVE_ATTEMPTS
+        for _ in range(max_attempts - 1):
+            self.assertFalse(save_callback(self._FAILING_BATCH))
+
+        # A batch with no aggregate reports never calls the mocked sink,
+        # so it always "succeeds" regardless of the sink's side_effect --
+        # this is process_reports() reporting no output errors for it.
+        self.assertIsNot(save_callback(self._PASSING_BATCH), False)
+
+        # The streak must have been reset: this is consecutive failure #1,
+        # not #(max_attempts), so it must retry rather than quarantine.
+        self.assertFalse(save_callback(self._FAILING_BATCH))
+
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def test_save_callback_streak_restarts_after_quarantine(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        _mock_migrate_indexes,
+        mock_save_aggregate,
+    ):
+        """Once a batch is quarantined, the counter restarts at zero: the
+        next consecutive failure is attempt #1 again, not a continuation
+        past the threshold."""
+        save_callback = self._get_save_callback(mock_imap_connection, mock_get_reports)
+        mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
+            "simulated output failure"
+        )
+
+        max_attempts = parsedmarc.cli.MAX_FAILED_SAVE_ATTEMPTS
+        for _ in range(max_attempts - 1):
+            self.assertFalse(save_callback(self._FAILING_BATCH))
+        self.assertIs(
+            save_callback(self._FAILING_BATCH), parsedmarc.SaveOutcome.QUARANTINE
+        )
+
+        self.assertFalse(save_callback(self._FAILING_BATCH))
 
 
 class TestGmailAuthModes(unittest.TestCase):
@@ -2785,6 +2944,113 @@ watch = true
             refreshed,
             "Stale entry should have been cleared by reload",
         )
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGHUP"),
+        "SIGHUP not available on this platform",
+    )
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli._init_output_clients")
+    @patch("parsedmarc.cli._parse_config")
+    @patch("parsedmarc.cli._load_config")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.watch_inbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testSameSaveCallbackObjectAndFailureStreakSurviveReload(
+        self,
+        mock_imap,
+        mock_watch,
+        mock_get_reports,
+        mock_load_config,
+        mock_parse_config,
+        mock_init_clients,
+        _mock_set_hosts,
+        _mock_migrate_indexes,
+        mock_save_aggregate,
+    ):
+        """mailbox_save_callback is built once per _main() call, before
+        the watch loop starts, so the exact same closure -- and therefore
+        its failed_save_attempts counter -- must be passed to watch_inbox()
+        both before and after a SIGHUP config reload. This proves the
+        quarantine threshold is scoped to the whole long-running process,
+        not reset by every reload."""
+        import signal as signal_module
+
+        mock_imap.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        mock_load_config.return_value = ConfigParser()
+        mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
+            "simulated output failure"
+        )
+
+        def parse_side_effect(config, opts):
+            opts.imap_host = "imap.example.com"
+            opts.imap_user = "user"
+            opts.imap_password = "pass"
+            opts.mailbox_watch = True
+            opts.save_aggregate = True
+            opts.elasticsearch_hosts = ["localhost"]
+            return None
+
+        mock_parse_config.side_effect = parse_side_effect
+        mock_init_clients.return_value = {}
+
+        failing_batch: ParsingResults = {
+            "aggregate_reports": [
+                cast(AggregateReport, {"policy_published": {"domain": "example.com"}})
+            ],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+
+        max_attempts = parsedmarc.cli.MAX_FAILED_SAVE_ATTEMPTS
+        callbacks = []
+        call_count = [0]
+
+        def watch_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            callback = kwargs["callback"]
+            callbacks.append(callback)
+            if call_count[0] == 1:
+                # Drive the streak to one below the quarantine threshold
+                # before the reload happens.
+                for _ in range(max_attempts - 1):
+                    self.assertFalse(callback(failing_batch))
+                if hasattr(signal_module, "SIGHUP"):
+                    import os
+
+                    os.kill(os.getpid(), signal_module.SIGHUP)
+                return
+            else:
+                # If this were a fresh closure with a reset counter, this
+                # would be attempt #1 (returns False). Since it's the same
+                # closure, this is attempt #max_attempts and quarantines.
+                self.assertIs(
+                    callback(failing_batch), parsedmarc.SaveOutcome.QUARANTINE
+                )
+                raise FileExistsError("stop-watch-loop")
+
+        mock_watch.side_effect = watch_side_effect
+
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
+            cfg.write(self._BASE_CONFIG)
+            cfg_path = cfg.name
+        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path]):
+            with self.assertRaises(SystemExit) as cm:
+                parsedmarc.cli._main()
+
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(mock_watch.call_count, 2)
+        self.assertEqual(len(callbacks), 2)
+        self.assertIs(callbacks[0], callbacks[1])
 
 
 class TestSigtermShutdown(unittest.TestCase):

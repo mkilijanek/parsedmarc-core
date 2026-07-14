@@ -2935,6 +2935,161 @@ class TestGetDmarcReportsFromMailboxMaildir(unittest.TestCase):
         self.assertEqual(len(conn.fetch_messages("Archive/Invalid")), 1)
         self.assertEqual(len(conn.fetch_messages("INBOX")), 1)
 
+    def test_quarantine_outcome_moves_messages_to_quarantine_folder(self):
+        """A save_callback returning SaveOutcome.QUARANTINE moves the
+        batch's messages to Archive/Quarantine instead of leaving them in
+        the INBOX or filing them under the normal per-type archive
+        subfolders, while the parsed reports are still returned."""
+        self._deliver(self.AGGREGATE)
+        self._deliver(self.FAILURE)
+        self._deliver(self.SMTP_TLS)
+
+        conn, result = self._run(
+            save_callback=lambda batch: parsedmarc.SaveOutcome.QUARANTINE
+        )
+
+        self.assertEqual(len(result["aggregate_reports"]), 1)
+        self.assertEqual(len(result["failure_reports"]), 1)
+        self.assertEqual(len(result["smtp_tls_reports"]), 1)
+
+        self.assertEqual(conn.fetch_messages("INBOX"), [])
+        self.assertEqual(len(conn.fetch_messages("Archive/Quarantine")), 3)
+        self.assertEqual(conn.fetch_messages("Archive/Aggregate"), [])
+        self.assertEqual(conn.fetch_messages("Archive/Failure"), [])
+        self.assertEqual(conn.fetch_messages("Archive/SMTP-TLS"), [])
+
+    def test_quarantine_creates_folder_with_create_folders_false(self):
+        """watch_inbox() always calls get_dmarc_reports_from_mailbox() with
+        create_folders=False, so the Quarantine folder must be created on
+        demand at the moment of quarantine rather than assumed to
+        pre-exist. In production, watch mode is always preceded by the
+        single-shot startup fetch (default create_folders=True), which
+        creates the top-level Archive folder but -- per spec -- never
+        Quarantine; an empty first run reproduces that ordering here so
+        this test exercises the same on-demand-creation code path that
+        real watch mode does, rather than the unrepresentative case of
+        Archive itself not existing yet (a pre-existing MaildirConnection
+        limitation -- mailsuite's Maildir.add_folder cannot create a
+        nested dot-folder when its parent directory doesn't already
+        exist -- that is unrelated to the quarantine feature)."""
+        self._run(create_folders=True)  # Seeds Archive, as _main() does.
+
+        self._deliver(self.FAILURE)
+        conn, result = self._run(
+            create_folders=False,
+            save_callback=lambda batch: parsedmarc.SaveOutcome.QUARANTINE,
+        )
+
+        self.assertEqual(len(result["failure_reports"]), 1)
+        self.assertEqual(conn.fetch_messages("INBOX"), [])
+        self.assertEqual(len(conn.fetch_messages("Archive/Quarantine")), 1)
+
+    def test_quarantine_folder_creation_failure_leaves_messages_in_place(self):
+        """If Archive/Quarantine cannot be created -- e.g. the mailbox
+        backend rejects the create_folder call -- the fallback must not
+        attempt any message moves: it logs the error and falls through to
+        the ordinary "leaving N messages for retry" path, so the message
+        stays safely in the INBOX instead of being silently lost mid-move
+        or left in a half-quarantined state."""
+        self._deliver(self.FAILURE)
+
+        conn = MaildirConnection(self._maildir, maildir_create=True)
+        real_create_folder = conn.create_folder
+
+        def _raise_for_quarantine(folder_name):
+            if folder_name == "Archive/Quarantine":
+                raise OSError("permission denied")
+            return real_create_folder(folder_name)
+
+        with patch.object(conn, "create_folder", side_effect=_raise_for_quarantine):
+            result = parsedmarc.get_dmarc_reports_from_mailbox(
+                connection=conn,
+                offline=True,
+                save_callback=lambda batch: parsedmarc.SaveOutcome.QUARANTINE,
+            )
+
+        self.assertEqual(len(result["failure_reports"]), 1)
+        self.assertEqual(len(conn.fetch_messages("INBOX")), 1)
+        self.assertFalse(conn.folder_exists("Archive/Quarantine"))
+
+    def test_quarantine_does_not_poison_dedup_cache(self):
+        """A quarantined batch must not poison the aggregate-report dedup
+        cache: after the quarantined message is moved back into the INBOX
+        (simulated here by redelivering the same raw bytes), the same
+        report is parsed and handed to save_callback again rather than
+        being silently skipped as a duplicate."""
+        self._deliver(self.AGGREGATE)
+
+        conn, result = self._run(
+            save_callback=lambda batch: parsedmarc.SaveOutcome.QUARANTINE
+        )
+        self.assertEqual(len(result["aggregate_reports"]), 1)
+        self.assertEqual(len(conn.fetch_messages("Archive/Quarantine")), 1)
+
+        # Simulate moving the message back to the reports folder for
+        # reprocessing by redelivering the same raw bytes to the INBOX.
+        self._deliver(self.AGGREGATE)
+
+        received = []
+
+        def _record(batch):
+            received.append(batch)
+            return None
+
+        conn, result = self._run(save_callback=_record)
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(len(received[0]["aggregate_reports"]), 1)
+        self.assertEqual(len(result["aggregate_reports"]), 1)
+        self.assertEqual(conn.fetch_messages("INBOX"), [])
+        self.assertEqual(len(conn.fetch_messages("Archive/Aggregate")), 1)
+
+    def test_quarantine_in_test_mode_leaves_messages(self):
+        """test=True must never mutate the mailbox: a QUARANTINE outcome is
+        ignored, the message stays in the INBOX, and Archive/Quarantine is
+        never created."""
+        self._deliver(self.FAILURE)
+
+        conn, result = self._run(
+            test=True, save_callback=lambda batch: parsedmarc.SaveOutcome.QUARANTINE
+        )
+
+        self.assertEqual(len(result["failure_reports"]), 1)
+        self.assertEqual(len(conn.fetch_messages("INBOX")), 1)
+        self.assertFalse(conn.folder_exists("Archive/Quarantine"))
+
+    def test_quarantine_with_delete_mode_moves_instead_of_deleting(self):
+        """delete=True does not bypass the quarantine outcome: the
+        message is moved to Archive/Quarantine rather than deleted."""
+        self._deliver(self.FAILURE)
+
+        conn, result = self._run(
+            delete=True,
+            save_callback=lambda batch: parsedmarc.SaveOutcome.QUARANTINE,
+        )
+
+        self.assertEqual(len(result["failure_reports"]), 1)
+        self.assertEqual(conn.fetch_messages("INBOX"), [])
+        self.assertEqual(len(conn.fetch_messages("Archive/Quarantine")), 1)
+
+    def test_invalid_message_filed_to_invalid_not_quarantine(self):
+        """An unparseable message carries no report data, so it is filed to
+        Archive/Invalid regardless of save_callback's outcome -- Invalid
+        routing happens per-message during parsing, independent of the
+        QUARANTINE outcome, which only applies to the successfully-parsed
+        report's message."""
+        self._deliver(self.JUNK)
+        self._deliver(self.AGGREGATE)
+
+        conn, result = self._run(
+            save_callback=lambda batch: parsedmarc.SaveOutcome.QUARANTINE
+        )
+
+        self.assertEqual(len(result["aggregate_reports"]), 1)
+        self.assertEqual(len(conn.fetch_messages("Archive/Invalid")), 1)
+        self.assertEqual(len(conn.fetch_messages("Archive/Quarantine")), 1)
+        self.assertEqual(conn.fetch_messages("INBOX"), [])
+
 
 class TestEmailResultsErrorBranches(unittest.TestCase):
     """email_results requires mail_to to be a list — this is enforced

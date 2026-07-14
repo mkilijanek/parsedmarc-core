@@ -21,6 +21,7 @@ import zlib
 from base64 import b64decode
 from csv import DictWriter
 from datetime import date, datetime, timedelta, timezone, tzinfo
+from enum import Enum
 from io import BytesIO, StringIO
 from collections.abc import Callable, Sequence
 from typing import (
@@ -139,6 +140,17 @@ class InvalidFailureReport(InvalidDMARCReport):
 
 # Backward-compatible alias
 InvalidForensicReport = InvalidFailureReport
+
+
+class SaveOutcome(Enum):
+    """Explicit outcome a save_callback may return in addition to the
+    boolean protocol. QUARANTINE tells the mailbox loop to give up
+    retrying this batch: its messages are moved to
+    <archive_folder>/Quarantine (created on demand) instead of being
+    left in reports_folder, and the aggregate-report dedup cache is
+    left unmodified so the messages can be moved back and reprocessed."""
+
+    QUARANTINE = "quarantine"
 
 
 def _exc_origin(error: BaseException) -> str:
@@ -2210,7 +2222,7 @@ def get_dmarc_reports_from_mailbox(
     since: datetime | date | str | None = None,
     create_folders: bool = True,
     normalize_timespan_threshold_hours: float = 24,
-    save_callback: Callable[[ParsingResults], bool | None] | None = None,
+    save_callback: Callable[[ParsingResults], bool | SaveOutcome | None] | None = None,
 ) -> ParsingResults:
     """
     Fetches and parses DMARC reports from a mailbox
@@ -2248,15 +2260,21 @@ def get_dmarc_reports_from_mailbox(
             not update the aggregate-report dedup cache, so the batch is
             reprocessed rather than silently dropped); raising propagates
             and also leaves messages untouched; any other return value
-            (including ``None``) commits the batch as today. With
-            ``save_callback=None`` (the default), this preserves prior
-            behavior for any batch that completes without an unhandled
-            exception; a mid-batch crash now leaves the aggregate-report
-            dedup cache unmodified for that batch instead of partially
-            populated, which is a related, strictly safer change. Ignored
-            when ``test`` is ``True``, except that it is still invoked
-            (mailbox state is never mutated in test mode regardless of the
-            result).
+            (including ``None``) commits the batch as today. Returning
+            ``SaveOutcome.QUARANTINE`` tells the loop to stop retrying this
+            batch: its messages are moved to ``<archive_folder>/Quarantine``
+            (created on demand) instead of being left in ``reports_folder``,
+            and — like a ``False`` return — the aggregate-report dedup
+            cache is left unmodified, so the messages can be moved back to
+            ``reports_folder`` and reprocessed later once the underlying
+            issue is fixed. With ``save_callback=None`` (the default), this
+            preserves prior behavior for any batch that completes without an
+            unhandled exception; a mid-batch crash now leaves the
+            aggregate-report dedup cache unmodified for that batch instead
+            of partially populated, which is a related, strictly safer
+            change. Ignored when ``test`` is ``True``, except that it is
+            still invoked (mailbox state is never mutated in test mode
+            regardless of the result).
 
     Returns:
         dict: Lists of ``aggregate_reports``, ``failure_reports``, and ``smtp_tls_reports``
@@ -2284,6 +2302,7 @@ def get_dmarc_reports_from_mailbox(
     failure_reports_folder = "{0}/Failure".format(archive_folder)
     smtp_tls_reports_folder = "{0}/SMTP-TLS".format(archive_folder)
     invalid_reports_folder = "{0}/Invalid".format(archive_folder)
+    quarantine_reports_folder = "{0}/Quarantine".format(archive_folder)
 
     if results:
         aggregate_reports = results["aggregate_reports"].copy()
@@ -2435,8 +2454,11 @@ def get_dmarc_reports_from_mailbox(
         "smtp_tls_reports": batch_smtp_tls_reports,
     }
     persisted = True
+    quarantine = False
     if save_callback is not None:
-        persisted = save_callback(batch_results) is not False
+        outcome = save_callback(batch_results)
+        quarantine = outcome is SaveOutcome.QUARANTINE
+        persisted = outcome is not False and not quarantine
 
     if persisted:
         for key in batch_seen_aggregate_keys:
@@ -2529,16 +2551,49 @@ def get_dmarc_reports_from_mailbox(
                             e = "Error moving message UID {0}: {1}".format(msg_uid, e)
                             logger.error("Mailbox error: {0}".format(e))
     else:
-        batch_msg_count = (
-            len(aggregate_report_msg_uids)
-            + len(failure_report_msg_uids)
-            + len(smtp_tls_msg_uids)
+        held_msg_uids = (
+            aggregate_report_msg_uids + failure_report_msg_uids + smtp_tls_msg_uids
         )
-        logger.warning(
-            "Results were not confirmed saved; leaving %d messages in %s for retry",
-            batch_msg_count,
-            reports_folder,
-        )
+        batch_msg_count = len(held_msg_uids)
+        quarantined = False
+        if quarantine and not test:
+            try:
+                connection.create_folder(quarantine_reports_folder)
+            except Exception as e:
+                logger.error(
+                    "Mailbox error: Error creating folder {0}: {1}; leaving {2} "
+                    "messages in {3} for retry".format(
+                        quarantine_reports_folder, e, batch_msg_count, reports_folder
+                    )
+                )
+            else:
+                logger.error(
+                    "Results were not confirmed saved; moving %d messages from "
+                    "%s to %s",
+                    batch_msg_count,
+                    reports_folder,
+                    quarantine_reports_folder,
+                )
+                for i in range(batch_msg_count):
+                    msg_uid = held_msg_uids[i]
+                    logger.debug(
+                        "Moving message {0} of {1}: UID {2}".format(
+                            i + 1, batch_msg_count, msg_uid
+                        )
+                    )
+                    try:
+                        connection.move_message(msg_uid, quarantine_reports_folder)
+                    except Exception as e:
+                        message = "Error moving message UID"
+                        e = "{0} {1}: {2}".format(message, msg_uid, e)
+                        logger.error("Mailbox error: {0}".format(e))
+                quarantined = True
+        if not quarantined:
+            logger.warning(
+                "Results were not confirmed saved; leaving %d messages in %s for retry",
+                batch_msg_count,
+                reports_folder,
+            )
 
     aggregate_reports += batch_aggregate_reports
     failure_reports += batch_failure_reports
@@ -2623,7 +2678,12 @@ def watch_inbox(
             Returning ``False`` leaves the batch's messages in place and
             defers the dedup-cache update, so they are retried on the
             next check instead of being lost; raising also leaves the
-            messages untouched and propagates the exception.
+            messages untouched and propagates the exception. Returning
+            ``SaveOutcome.QUARANTINE`` also defers the dedup-cache update,
+            but additionally moves the batch's messages to
+            ``<archive_folder>/Quarantine`` (created on demand) instead of
+            leaving them in ``reports_folder``, so a persistently failing
+            callback stops being retried on every poll.
         reports_folder (str): The IMAP folder where reports can be found
         archive_folder (str): The folder to move processed mail to
         delete (bool): Delete  messages after processing them
