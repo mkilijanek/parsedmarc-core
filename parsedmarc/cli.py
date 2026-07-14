@@ -28,6 +28,7 @@ from parsedmarc import (
     SEEN_AGGREGATE_REPORT_IDS,
     InvalidDMARCReport,
     ParserError,
+    SaveOutcome,
     __version__,
     elastic,
     email_results,
@@ -1520,6 +1521,15 @@ def _close_output_clients(clients):
                 logger.warning("Error closing %s", name, exc_info=True)
 
 
+# After this many consecutive batches fail to save to the configured
+# outputs, the failing batch's messages are quarantined to
+# <archive_folder>/Quarantine instead of being retried forever (see
+# domainaware/parsedmarc#823 review). Process-local by design: a
+# long-running --watch process is where unbounded retry manifests;
+# single-shot cron runs get one attempt per process and never quarantine.
+MAX_FAILED_SAVE_ATTEMPTS = 10
+
+
 def _main():
     """Called when the module is executed"""
 
@@ -2651,13 +2661,35 @@ def _main():
             else 24.0
         )
 
-    def mailbox_save_callback(batch: ParsingResults) -> bool:
+    failed_save_attempts = 0
+
+    def mailbox_save_callback(batch: ParsingResults) -> bool | SaveOutcome:
         """Adapter passed as save_callback to get_dmarc_reports_from_mailbox()
         and as the callback to watch_inbox(): reports are considered
         persisted only when process_reports() recorded no output errors for
-        this batch, so a sink outage leaves the batch's messages in the
-        mailbox for retry instead of archiving/deleting them."""
-        return not process_reports(batch)
+        this batch. A sink outage leaves the batch's messages in the
+        mailbox for retry; after MAX_FAILED_SAVE_ATTEMPTS consecutive
+        failures, the batch is quarantined instead so a persistent outage
+        cannot resend an unbounded backlog to every configured output on
+        every watch poll."""
+        nonlocal failed_save_attempts
+        if not process_reports(batch):
+            failed_save_attempts = 0
+            return True
+        failed_save_attempts += 1
+        if failed_save_attempts >= MAX_FAILED_SAVE_ATTEMPTS:
+            failed_save_attempts = 0
+            logger.error(
+                "Batch save failed %d consecutive times; quarantining this batch",
+                MAX_FAILED_SAVE_ATTEMPTS,
+            )
+            return SaveOutcome.QUARANTINE
+        logger.warning(
+            "Batch save failed (attempt %d of %d); leaving batch for retry",
+            failed_save_attempts,
+            MAX_FAILED_SAVE_ATTEMPTS,
+        )
+        return False
 
     if mailbox_connection and not _shutdown_requested:
         try:

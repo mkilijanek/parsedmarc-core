@@ -211,6 +211,23 @@ The full set of configuration options are:
   - `since` - str: Search for messages since certain time. (Examples: `5m|3h|2d|1w`)
       Acceptable units - {"m":"minutes", "h":"hours", "d":"days", "w":"weeks"}.
       Defaults to `1d` if incorrect value is provided.
+
+    :::{note}
+    As described above (see `fail_on_output_error`), a batch whose
+    output destinations fail to save is left in place for retry. This
+    is most relevant in `watch` mode: a single-shot/cron run only gets
+    one attempt per process and is never quarantined, but a
+    long-running `--watch` process retries the same batch on every
+    poll. If a batch fails to save `MAX_FAILED_SAVE_ATTEMPTS` (10)
+    consecutive times, its messages are moved to
+    `<archive_folder>/Quarantine` (created automatically) instead of
+    being retried indefinitely, and an `ERROR`-level line is logged.
+    This avoids resending an unbounded backlog to every configured
+    output on every poll cycle during a persistent outage. To recover,
+    move the messages from the `Quarantine` folder back to the reports
+    folder to reprocess them once the underlying output issue is
+    fixed.
+    :::
 - `imap`
   - `host` - str: The IMAP server hostname or IP address
   - `port` - int: The IMAP server port (Default: `993`)
