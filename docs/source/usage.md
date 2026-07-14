@@ -197,6 +197,11 @@ The full set of configuration options are:
       messages as they arrive or poll MS Graph for new messages
   - `delete` - bool: Delete messages after processing them,
       instead of archiving them
+
+    :::{note}
+    For the Gmail API backend, `delete` requires the broader
+    `https://mail.google.com/` scope — see `[gmail_api] scopes` below.
+    :::
   - `test` - bool: Do not move or delete messages
   - `batch_size` - int: Number of messages to read and process
       before saving. Default `10`. Use `0` for no limit.
@@ -692,7 +697,10 @@ The full set of configuration options are:
       accepted as `delegated_user` for backward compatibility.
 
     :::{note}
-    credentials_file and token_file can be got with [quickstart](https://developers.google.com/gmail/api/quickstart/python).Please change the scope to `https://www.googleapis.com/auth/gmail.modify`.
+    `credentials_file` and `token_file` can be obtained with the
+    [Gmail API Python quickstart](https://developers.google.com/gmail/api/quickstart/python).
+    Change the scope in that guide to `https://www.googleapis.com/auth/gmail.modify`,
+    or see "Setting up Gmail API access" below for the full walkthrough.
     :::
     :::{note}
     When `auth_mode = service_account`, `credentials_file` must point to a
@@ -707,6 +715,104 @@ The full set of configuration options are:
       listen on for the OAuth2 response (Default: `8080`)
   - `paginate_messages` - bool: When `True`, fetch all applicable Gmail messages.
       When `False`, only fetch up to 100 new messages per run (Default: `True`)
+
+    **Setting up Gmail API access.** No separate `pip` extra is
+    needed — `mailsuite[gmail]` is already a base dependency of
+    parsedmarc, so a normal `pip install parsedmarc` includes
+    everything the Gmail backend needs.
+
+    1. In the [Google Cloud Console](https://console.cloud.google.com/),
+       create or select a project, then enable the **Gmail API** for it
+       (**APIs & Services → Library → Gmail API → Enable**).
+    2. Configure the OAuth consent screen (**APIs & Services → OAuth
+       consent screen**, called **Google Auth platform** in newer
+       Console UIs):
+
+       :::{note}
+       Choose **Internal** if the mailbox is on a Google Workspace
+       domain you administer — no Google verification review is
+       needed, and only accounts on that domain can authorize the app.
+       Choose **External** for a personal `@gmail.com` account or a
+       mailbox outside your organization; while the app is
+       unpublished/in testing, add the mailbox's address as a **test
+       user** (up to 100), and expect an "unverified app" warning
+       during consent that you'll need to click through (**Advanced →
+       Go to \<app name\> (unsafe)**).
+       :::
+    3. Create credentials for the interactive flow: **APIs & Services →
+       Credentials → Create Credentials → OAuth client ID**, application
+       type **Desktop app**. Download the result and save it as
+       `credentials.json` — this is `[gmail_api] credentials_file`.
+
+       :::{warning}
+       The client ID **must** be a **Desktop app** type, not **Web
+       application**. A Web application credentials JSON will still
+       load, but authorization will fail with a `redirect_uri_mismatch`
+       error — `run_local_server()` redirects to `http://localhost:<port>/`,
+       an address only a Desktop app client has registered.
+       :::
+    4. Set `scopes = https://www.googleapis.com/auth/gmail.modify` (the
+       default if omitted) unless you also need `[mailbox] delete =
+       True`, which requires the broader
+       `https://mail.google.com/` scope instead — Gmail only allows
+       permanent message deletion under that scope, not under
+       `gmail.modify`. If you change `scopes` after a `token_file`
+       already exists, delete `token_file` first so the next run
+       re-authorizes with the new scope.
+    5. Run parsedmarc. On this **first run**, since no `token_file`
+       exists yet, parsedmarc starts a local HTTP listener and logs an
+       authorization URL — it does **not** open a browser
+       automatically. Open that URL in any browser that can reach the
+       machine on the listener's port (the same host, or via an SSH
+       tunnel/port-forward for a headless server), sign in, and
+       approve the requested scope. parsedmarc then writes the
+       resulting token to `token_file`.
+
+       :::{warning}
+       As of `mailsuite` 2.2.2 (the version this project currently
+       requires), `[gmail_api] oauth2_port` does not actually change
+       the listener's port — a bug passes it under the wrong keyword
+       to the underlying OAuth library, so the listener always binds
+       the library's own default, `8080`, no matter what's configured.
+       Fixed upstream in
+       [seanthegeek/mailsuite#53](https://github.com/seanthegeek/mailsuite/pull/53);
+       until a `mailsuite` release with that fix is available, plan
+       for port `8080` regardless of the `oauth2_port` value.
+       :::
+    6. On **subsequent runs**, parsedmarc reads `token_file` directly;
+       an expired-but-refreshable token is refreshed silently with no
+       browser interaction. Re-authorization (repeating step 5) is only
+       needed if `token_file` is deleted, invalidated, or the requested
+       `scopes` change.
+
+       :::{note}
+       If your OAuth consent screen is **External** and still in
+       **Testing** status (unpublished), Google expires the refresh
+       token after 7 days — expect to repeat step 5 weekly until you
+       publish the app (which, for a personal single-user script, is
+       usually simpler than the verification requirements needed to
+       leave testing).
+       :::
+
+    **Service accounts (`auth_mode = service_account`).** For headless
+    deployments where the interactive flow in steps 5–6 isn't
+    possible, use a Google Workspace service account with [domain-wide
+    delegation](https://developers.google.com/workspace/guides/create-credentials#optional_set_up_domain-wide_delegation_for_a_service_account)
+    instead:
+
+    1. Create a service account and key in the Google Cloud Console
+       (**IAM & Admin → Service Accounts**), download the key as JSON,
+       and set `credentials_file` to its path — this is a *different*
+       file shape than the OAuth client JSON from step 3 above; do not
+       reuse one for the other.
+    2. In the Workspace Admin Console (**Security → Access and data
+       control → API controls → Domain-wide delegation**), add the
+       service account's **Client ID** with the scope(s) from `scopes`
+       pre-authorized.
+    3. Set `auth_mode = service_account` and `service_account_user` to
+       the mailbox address to impersonate (e.g.
+       `dmarc-reports@example.com`). `token_file` is not used in this
+       mode — there is no interactive consent step, ever.
 - `log_analytics`
   - `client_id` - str: The app registration's client ID
   - `client_secret` - str: The app registration's client secret
