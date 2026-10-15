@@ -359,7 +359,7 @@ class Test(unittest.TestCase):
             "  Sender IP Address: 203.0.113.68\r\n"
             "  Received date: Mon, 07 Apr 2025 23:16:09 +0200\r\n"
             "  SPF Alignment: no\r\n"
-            "  X-Ignored-1: not a plain field name\r\n\r\n"
+            "\r\n"
             "------ This is a copy of the headers that were received before "
             "the error was detected.\r\n\r\n"
             "From: user@example.com\r\n"
@@ -371,6 +371,28 @@ class Test(unittest.TestCase):
         report = cast(FailureReport, result["report"])
         self.assertEqual(report["source"]["ip_address"], "203.0.113.68")
         self.assertEqual(report["arrival_date"], "Mon, 07 Apr 2025 23:16:09 +0200")
+
+    def testParseTextReportFieldsLineRules(self):
+        """``_parse_text_report_fields`` keeps only ``Letters Only: value`` lines.
+
+        Names with non-letter characters, a colon without a following
+        whitespace character and value, and a value on the next line are
+        all skipped; names are lowercased and hyphenated."""
+        fields = parsedmarc._parse_text_report_fields(
+            "  Sender IP Address: 203.0.113.68\n"
+            "X-Header-1: digits and hyphens\n"
+            "Time:12:00\n"
+            "Empty:\n"
+            "Next Line:\n  value\n"
+            "Received date: Mon, 07 Apr 2025\r\n"
+        )
+        self.assertEqual(
+            fields,
+            {
+                "sender-ip-address": "203.0.113.68",
+                "received-date": "Mon, 07 Apr 2025",
+            },
+        )
 
     def testPlainTextFailureReportWhitespaceNoBacktracking(self):
         """A ``text/plain`` failure report padded with whitespace and no
