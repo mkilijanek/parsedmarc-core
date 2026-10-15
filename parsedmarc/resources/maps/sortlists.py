@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import csv
 import re
+import sys
 from pathlib import Path
 from collections.abc import Mapping, Iterable, Collection
 
@@ -114,8 +115,10 @@ def sort_csv(
 
     - filepath: Path to the CSV to sort.
     - field: The field name to sort by.
+    - sort_field_value_must_be_unique: Require each row's sort-field value to
+      be unique across the file.
     - fields_to_lowercase: Permanently lowercases these field(s) in the data.
-    - strip_whitespace: Remove all whitespace at the beginning and of field values.
+    - strip_whitespace: Remove whitespace at the beginning and end of field values.
     - case_insensitive_sort: Ignore case when sorting without changing values.
     - required_fields: A list of fields that must have data in all rows.
     - allowed_values: A mapping of allowed values for fields.
@@ -205,9 +208,11 @@ def sort_list_file(
     """Read a list from a file, sort it, optionally strip and deduplicate the values,
     then write that list back to the file.
 
-    - Filepath: The path to the file.
+    - filepath: The path to the file.
     - lowercase: Lowercase all values prior to sorting.
-    - remove_blank_lines: Remove any plank lines.
+    - strip: Strip leading and trailing whitespace from each value.
+    - deduplicate: Remove duplicate values.
+    - remove_blank_lines: Remove any blank lines.
     - ending_newline: End the file with a newline, even if remove_blank_lines is true.
     - newline: The newline character to use.
     """
@@ -239,23 +244,23 @@ def _main():
 
     if not os.path.exists(readme_file):
         print(f"Error: {readme_file} does not exist")
-        exit(1)
+        sys.exit(1)
     try:
         types = normalize_types_in_readme(readme_file)
     except ValueError as e:
         print(f"Error: {e}")
-        exit(1)
+        sys.exit(1)
 
     map_allowed_values = {"type": types}
 
     for list_file in list_files:
         if not os.path.exists(list_file):
             print(f"Error: {list_file} does not exist")
-            exit(1)
+            sys.exit(1)
         sort_list_file(list_file)
     if not os.path.exists(map_file):
         print(f"Error: {map_file} does not exist")
-        exit(1)
+        sys.exit(1)
     try:
         sort_csv(
             map_file,

@@ -1,5 +1,16 @@
 #!/usr/bin/env python
+"""Regenerate unknown_base_reverse_dns.csv from an input file of source names.
 
+The input file may be either:
+
+- A CSV with a ``source_name`` header (and optionally ``message_count``),
+  such as a Kibana/Splunk export of ``base_reverse_dns.csv``.
+- A plain-text file with one source name per line — e.g. a dashboard export
+  of uncategorized sources — containing a mix of raw MMDB ``as_name``
+  strings and base reverse-DNS domains.
+"""
+
+import argparse
 import os
 import csv
 import re
@@ -80,13 +91,72 @@ def _load_as_name_index(mmdb_path: str) -> dict[str, str]:
     return {k: v[0] for k, v in best.items()}
 
 
+def _read_input_rows(path: str):
+    """Yield ``{"source_name": ..., "message_count": ...}`` dicts from `path`.
+
+    Accepts two input formats:
+
+    - A CSV whose first field is ``source_name`` (and optionally
+      ``message_count``), parsed with csv.DictReader exactly as before.
+    - Plain text with one source name per line. Each line is taken
+      verbatim as a ``source_name`` — never comma-split, since MMDB
+      ``as_name`` values can contain commas. Lines are deduped
+      case-insensitively; the first occurrence wins.
+    """
+    with open(path) as f:
+        first_line = f.readline()
+        first_row = next(csv.reader([first_line]), [])
+        first_field = first_row[0].strip().lower() if first_row else ""
+        f.seek(0)
+        if first_field == "source_name":
+            yield from csv.DictReader(f)
+            return
+        seen = set()
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            yield {"source_name": line, "message_count": ""}
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Regenerate unknown_base_reverse_dns.csv from an input file of "
+            "source names. The input may be a CSV with a source_name header "
+            "(and optionally message_count), such as a Kibana/Splunk export "
+            "of base_reverse_dns.csv, or a plain-text file with one source "
+            "name per line (e.g. a dashboard export of uncategorized "
+            "sources) containing a mix of raw MMDB as_name strings and base "
+            "reverse-DNS domains."
+        )
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        default="base_reverse_dns.csv",
+        help="Path to the input file (CSV or plain text, default: %(default)s)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="unknown_base_reverse_dns.csv",
+        help="Path to write the output CSV to (default: %(default)s)",
+    )
+    return parser.parse_args()
+
+
 def _main():
-    input_csv_file_path = "base_reverse_dns.csv"
+    args = _parse_args()
+
     base_reverse_dns_map_file_path = "base_reverse_dns_map.csv"
     known_unknown_list_file_path = "known_unknown_base_reverse_dns.txt"
     psl_overrides_file_path = "psl_overrides.txt"
     mmdb_file_path = "../ipinfo/ipinfo_lite.mmdb"
-    output_csv_file_path = "unknown_base_reverse_dns.csv"
 
     csv_headers = ["source_name", "message_count"]
 
@@ -98,13 +168,14 @@ def _main():
     def load_list(file_path, list_var):
         if not os.path.exists(file_path):
             print(f"Error: {file_path} does not exist")
+            sys.exit(1)
         print(f"Loading {file_path}")
         with open(file_path) as f:
             for line in f.readlines():
                 domain = line.lower().strip()
                 if domain in list_var:
                     print(f"Error: {domain} is in {file_path} multiple times")
-                    exit(1)
+                    sys.exit(1)
                 elif domain != "":
                     list_var.append(domain)
 
@@ -112,12 +183,13 @@ def _main():
     load_list(psl_overrides_file_path, psl_overrides)
     if not os.path.exists(mmdb_file_path):
         print(f"Error: {mmdb_file_path} does not exist")
-        exit(1)
+        sys.exit(1)
     print(f"Loading {mmdb_file_path}")
     as_name_index = _load_as_name_index(mmdb_file_path)
     print(f"Indexed {len(as_name_index)} as_names from the MMDB")
     if not os.path.exists(base_reverse_dns_map_file_path):
         print(f"Error: {base_reverse_dns_map_file_path} does not exist")
+        sys.exit(1)
     print(f"Loading {base_reverse_dns_map_file_path}")
     with open(base_reverse_dns_map_file_path) as f:
         for row in csv.DictReader(f):
@@ -126,54 +198,53 @@ def _main():
                 print(
                     f"Error: {domain} is in {base_reverse_dns_map_file_path} multiple times"
                 )
-                exit()
+                sys.exit(1)
             else:
                 known_domains.append(domain)
             if domain in known_unknown_domains and known_domains:
                 print(
-                    f"Error:{domain} is in {known_unknown_list_file_path} and \
-                        {base_reverse_dns_map_file_path}"
+                    f"Error: {domain} is in {known_unknown_list_file_path} "
+                    f"and {base_reverse_dns_map_file_path}"
                 )
-                exit(1)
-    if not os.path.exists(input_csv_file_path):
-        print(f"Error: {base_reverse_dns_map_file_path} does not exist")
-        exit(1)
-    with open(input_csv_file_path) as f:
-        for row in csv.DictReader(f):
-            domain = row["source_name"].lower().strip()
-            if domain == "":
+                sys.exit(1)
+    if not os.path.exists(args.input):
+        print(f"Error: {args.input} does not exist")
+        sys.exit(1)
+    for row in _read_input_rows(args.input):
+        domain = row["source_name"].lower().strip()
+        if domain == "":
+            continue
+        # If source_name is not domain-shaped, parsedmarc's ASN-fallback
+        # path (utils.py:get_ip_address_info) surfaced the raw MMDB
+        # ``as_name`` because the IP had no PTR and the as_domain wasn't
+        # in the map. Translate to the corresponding as_domain so the
+        # row enters the pipeline as a researchable domain. If the
+        # as_domain is already in the map, the row drops out below as a
+        # known domain — exactly what we want.
+        if not _looks_like_domain(domain):
+            translated = as_name_index.get(_normalize_as_name(domain))
+            if translated is None:
+                print(
+                    f"Skipping AS-name source with no MMDB match: "
+                    f"{row['source_name']!r}"
+                )
                 continue
-            # If source_name is not domain-shaped, parsedmarc's ASN-fallback
-            # path (utils.py:get_ip_address_info) surfaced the raw MMDB
-            # ``as_name`` because the IP had no PTR and the as_domain wasn't
-            # in the map. Translate to the corresponding as_domain so the
-            # row enters the pipeline as a researchable domain. If the
-            # as_domain is already in the map, the row drops out below as a
-            # known domain — exactly what we want.
-            if not _looks_like_domain(domain):
-                translated = as_name_index.get(_normalize_as_name(domain))
-                if translated is None:
-                    print(
-                        f"Skipping AS-name source with no MMDB match: "
-                        f"{row['source_name']!r}"
-                    )
-                    continue
-                print(f"Translating AS-name {row['source_name']!r} -> {translated}")
-                row["source_name"] = translated
-                domain = translated
-            for psl_domain in psl_overrides:
-                if domain.endswith(psl_domain):
-                    domain = psl_domain.strip(".").strip("-")
-                    break
-            # Privacy: never emit an entry containing a full IPv4 address.
-            # If no psl_override folded it away, drop it entirely.
-            if _has_full_ip(domain):
-                continue
-            if domain not in known_domains and domain not in known_unknown_domains:
-                print(f"New unknown domain found: {domain}")
-                output_rows.append(row)
-    print(f"Writing {output_csv_file_path}")
-    with open(output_csv_file_path, "w") as f:
+            print(f"Translating AS-name {row['source_name']!r} -> {translated}")
+            row["source_name"] = translated
+            domain = translated
+        for psl_domain in psl_overrides:
+            if domain.endswith(psl_domain):
+                domain = psl_domain.strip(".").strip("-")
+                break
+        # Privacy: never emit an entry containing a full IPv4 address.
+        # If no psl_override folded it away, drop it entirely.
+        if _has_full_ip(domain):
+            continue
+        if domain not in known_domains and domain not in known_unknown_domains:
+            print(f"New unknown domain found: {domain}")
+            output_rows.append(row)
+    print(f"Writing {args.output}")
+    with open(args.output, "w") as f:
         writer = csv.DictWriter(f, fieldnames=csv_headers)
         writer.writeheader()
         writer.writerows(output_rows)

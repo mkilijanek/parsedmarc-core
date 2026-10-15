@@ -1,53 +1,117 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""A CLI for parsing DMARC reports"""
+"""A CLI for parsing DMARC and SMTP TLS reports"""
 
 import atexit
+import functools
 import http.client
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import time
 from argparse import ArgumentParser, Namespace
 from configparser import ConfigParser
-from glob import glob
-from multiprocessing import Pipe, Process
+from glob import escape as glob_escape, glob
 from ssl import CERT_NONE, create_default_context
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import yaml
-from azure.core.exceptions import ClientAuthenticationError
-from kiota_abstractions.api_error import APIError
 from tqdm import tqdm
 
 from parsedmarc import (
+    IP_ADDRESS_CACHE,
     REVERSE_DNS_MAP,
     SEEN_AGGREGATE_REPORT_IDS,
     InvalidDMARCReport,
+    ParserConfig,
     ParserError,
     __version__,
-    elastic,
     email_results,
     email_results_via_msgraph,
-    gelf,
     get_dmarc_reports_from_mailbox,
     get_dmarc_reports_from_mbox,
-    kafkaclient,
-    loganalytics,
-    opensearch,
-    parse_report_file,
     postgres,
-    s3,
     save_output,
     splunk,
     syslog,
     watch_inbox,
     webhook,
 )
+
+# Output integrations that need an optional extra (issue #883). Each one
+# imports a third-party SDK at module level -- elastic.py and
+# opensearch.py define DSL Document classes there, so they cannot guard
+# the import internally the way postgres.py does -- and so the guard
+# lives here, at the import site. A missing module becomes ``None``; the
+# config sections that would use it fail fast in _init_output_clients()
+# with a pip-install hint. splunk, syslog, webhook, and postgres are
+# imported eagerly above: they need only httpx, the standard library, or
+# their own internal guard.
+if TYPE_CHECKING:
+    from parsedmarc import elastic, gelf, kafkaclient, loganalytics, opensearch, s3
+else:
+    try:
+        from parsedmarc import elastic
+    except ModuleNotFoundError:
+        elastic = None
+
+    try:
+        from parsedmarc import gelf
+    except ModuleNotFoundError:
+        gelf = None
+
+    try:
+        from parsedmarc import kafkaclient
+    except ModuleNotFoundError:
+        kafkaclient = None
+
+    try:
+        from parsedmarc import loganalytics
+    except ModuleNotFoundError:
+        loganalytics = None
+
+    try:
+        from parsedmarc import opensearch
+    except ModuleNotFoundError:
+        opensearch = None
+
+    try:
+        from parsedmarc import s3
+    except ModuleNotFoundError:
+        s3 = None
+
+# Microsoft Graph error types, used only in ``except`` clauses and one
+# ``isinstance`` check around Graph mailbox calls. Without the msgraph
+# extra a Graph connection cannot be constructed at all (its
+# parsedmarc.mail placeholder raises the extra's ImportError), so those
+# handlers are unreachable and the placeholders below are never matched.
+if TYPE_CHECKING:
+    from azure.core.exceptions import ClientAuthenticationError
+    from kiota_abstractions.api_error import APIError
+else:
+    try:
+        from azure.core.exceptions import ClientAuthenticationError
+    except ModuleNotFoundError:
+
+        class ClientAuthenticationError(Exception):
+            """Never-raised placeholder for the absent msgraph extra."""
+
+    try:
+        from kiota_abstractions.api_error import APIError
+    except ModuleNotFoundError:
+
+        class APIError(Exception):
+            """Never-raised placeholder for the absent msgraph extra."""
+
+
+from parsedmarc.constants import DEFAULT_DNS_MAX_RETRIES, DEFAULT_DNS_TIMEOUT
 from parsedmarc.log import logger
+import parsedmarc.mail
 from parsedmarc.mail import (
     AuthMethod,
     GmailConnection,
@@ -55,12 +119,16 @@ from parsedmarc.mail import (
     MaildirConnection,
     MSGraphConnection,
 )
-from parsedmarc.types import ParsingResults
+from parsedmarc.parallel import _parse_report_file_job, parallel_map
+from parsedmarc.types import ParsedReport, ParsingResults
+import parsedmarc.utils
 from parsedmarc.utils import (
     InvalidIPinfoAPIKey,
+    ReverseDNSMap,
     configure_ipinfo_api,
     get_base_domain,
     get_reverse_dns,
+    human_timestamp_to_datetime,
     is_mbox,
     load_ip_db,
     load_psl_overrides,
@@ -86,6 +154,24 @@ class ConfigurationError(Exception):
     pass
 
 
+def _missing_extra_hint(section: str, extra: str) -> str:
+    """Return the error message for a config section whose extra is missing.
+
+    Args:
+        section (str): The INI section name, without brackets.
+        extra (str): The name of the extra that provides the section's
+            integration.
+
+    Returns:
+        str: A message naming the section, the extra, and the exact pip
+        command that installs it.
+    """
+    return (
+        f"The [{section}] configuration section requires the {extra} extra: "
+        f"pip install parsedmarc[{extra}]"
+    )
+
+
 def _normalize_graph_auth_method(value: str) -> str:
     """Return the canonical :class:`AuthMethod` member name for *value*.
 
@@ -100,14 +186,14 @@ def _normalize_graph_auth_method(value: str) -> str:
         if method.name.lower() == value_lower:
             return method.name
     raise ConfigurationError(
-        "Invalid msgraph auth_method: {0!r}. Valid values are: {1}".format(
+        "Invalid msgraph auth_method: {!r}. Valid values are: {}".format(
             value, ", ".join(m.name for m in AuthMethod)
         )
     )
 
 
 def _str_to_list(s):
-    """Converts a comma separated string to a list"""
+    """Converts a comma-separated string to a list"""
     _list = s.split(",")
     return list(map(lambda i: i.lstrip(), _list))
 
@@ -125,12 +211,12 @@ def _msgraph_request_id_suffix(error: Exception) -> str:
             request_id = headers.get("request-id")
         parts = []
         if request_id:
-            parts.append("request-id={0}".format(request_id))
+            parts.append(f"request-id={request_id}")
         if client_request_id:
-            parts.append("client-request-id={0}".format(client_request_id))
+            parts.append(f"client-request-id={client_request_id}")
         if not parts:
             return ""
-        return " ({0})".format(", ".join(parts))
+        return " ({})".format(", ".join(parts))
     except Exception:
         return ""
 
@@ -147,15 +233,15 @@ def _log_msgraph_failure(
     fetch, send, or watch failure, identifying the mailbox/tenant/auth
     method and the Graph request-id/client-request-id when available.
     The full traceback is preserved at --debug via a follow-up DEBUG
-    record. Never calls exit() - the call site keeps its own exit(1)."""
+    record. Never calls sys.exit() - the call site keeps its own sys.exit(1)."""
     if isinstance(error, APIError):
         detail = getattr(error, "primary_message", None) or error.message or str(error)
         detail = " ".join(str(detail).split())
-        summary = "{0} status={1}: {2}".format(
-            type(error).__name__, error.response_status_code, detail
+        summary = (
+            f"{type(error).__name__} status={error.response_status_code}: {detail}"
         )
     else:
-        summary = "{0}: {1}".format(type(error).__name__, " ".join(str(error).split()))
+        summary = "{}: {}".format(type(error).__name__, " ".join(str(error).split()))
 
     logger.error(
         "Microsoft Graph %s failed (mailbox=%s, tenant_id=%s, auth_method=%s): %s%s",
@@ -174,10 +260,11 @@ def _expand_path(p: str) -> str:
     return os.path.expanduser(os.path.expandvars(p))
 
 
-def _expand_file_path_args(paths: list[str]) -> list[str]:
+def _expand_file_path_args(paths: list[str], recursive: bool = False) -> list[str]:
     """Expand CLI file-path arguments into a flat list of file paths.
 
-    A path that already exists on disk is taken literally; only a
+    A path to an existing file is taken literally, a path to an existing
+    directory is expanded to the files inside it (see below), and only a
     non-existent path is treated as a glob pattern. This preserves
     shell-style wildcard expansion (e.g. a quoted ``samples/*.xml``) while
     ensuring that literal filenames containing glob metacharacters
@@ -186,14 +273,235 @@ def _expand_file_path_args(paths: list[str]) -> list[str]:
     ``[Provider DMARC Failure Report] Subject.eml``; ``glob()`` treats the
     brackets as a character class, matches nothing, and drops the file
     (see <https://docs.python.org/3/library/glob.html>).
+
+    A directory is expanded to the files directly inside it, using the
+    same shell-glob semantics as ``<dir>/*`` (or ``<dir>/**`` when
+    ``recursive`` is ``True``): dotfile entries are excluded, and
+    non-file entries (subdirectories) are filtered out. With
+    ``recursive=False`` a subdirectory found this way is skipped with a
+    debug log rather than descended into. The directory component is
+    passed through ``glob.escape`` before being combined with the
+    wildcard so that directory names containing glob metacharacters
+    (``[``, ``]``, ``*``, ``?``) still expand correctly instead of being
+    treated as a character class or wildcard themselves.
+
+    ``recursive`` also enables ``**`` to match any number of directories
+    (including none) in glob patterns supplied directly as arguments, per
+    the same stdlib glob semantics.
+
+    A ``path`` argument that matches nothing (a plain path that does
+    not exist and is not a glob match, or a directory/glob pattern
+    with no matches) is logged as a WARNING naming that argument,
+    so a typo'd path in a cron job doesn't silently "succeed" while
+    processing nothing forever. An empty ``paths`` list (e.g. a
+    mailbox-only run with no file arguments) logs nothing.
     """
     expanded: list[str] = []
     for path in paths:
-        if os.path.exists(path):
+        before = len(expanded)
+        if os.path.isdir(path):
+            pattern = os.path.join(glob_escape(path), "**" if recursive else "*")
+            for match in sorted(glob(pattern, recursive=recursive)):
+                if os.path.isfile(match):
+                    expanded.append(match)
+                elif not recursive and os.path.isdir(match):
+                    logger.debug(
+                        "Skipping subdirectory %s (pass --recursive to descend)",
+                        match,
+                    )
+        elif os.path.exists(path):
             expanded.append(path)
         else:
-            expanded += glob(path)
+            expanded += glob(path, recursive=recursive)
+        if len(expanded) == before:
+            logger.warning("No files matched %s", path)
     return expanded
+
+
+def _exclude_archived_paths(file_paths: list[str], archive_directory: str) -> list[str]:
+    """Filter *file_paths* down to paths that are not already inside
+    *archive_directory*.
+
+    The archive directory may live inside an input directory (e.g.
+    ``<input>/archive``), so without this filter a file already moved
+    into the archive on a previous run would be picked up again by a
+    later ``file_path`` directory expansion, re-parsed, and re-archived
+    (colliding with itself and accumulating numeric suffixes forever).
+
+    Paths are resolved with ``os.path.realpath`` (not just
+    ``os.path.abspath``) so a symlinked spelling of either the archive
+    directory or an input path still matches: e.g. ``archive_directory``
+    configured via a ``/data`` symlink while the input directory is
+    passed as the real ``/mnt/...`` path would otherwise never compare
+    equal, and every run would re-archive the same files with a new
+    numeric suffix forever.
+    """
+    archive_root = os.path.normcase(os.path.realpath(archive_directory))
+    kept: list[str] = []
+    for path in file_paths:
+        abs_path = os.path.normcase(os.path.realpath(path))
+        try:
+            inside_archive = (
+                os.path.commonpath([archive_root, abs_path]) == archive_root
+            )
+        except ValueError:
+            # Paths are on different drives (Windows) or otherwise not
+            # comparable, so the path can't be inside the archive.
+            inside_archive = False
+        if inside_archive:
+            logger.debug(f"Excluding already-archived file {path}")
+            continue
+        kept.append(path)
+    return kept
+
+
+def _archive_subdir_for_result(result: ParsedReport) -> str | None:
+    """Return the ``<year>/<month>/<type folder>`` subdirectory a parsed
+    report's source file should be archived under, or ``None`` when the
+    report type is unrecognized or its date can't be determined.
+
+    The date comes from the parsed report itself, not the source
+    filename or file mtime: aggregate reports use
+    ``report_metadata.begin_date``, failure reports use
+    ``arrival_date_utc``, and SMTP TLS reports use ``begin_date``.
+    """
+    report_type = result["report_type"]
+    # Only the wall-clock year/month fields are read from the parsed
+    # datetime, so no timezone conversion ever happens here — but tag
+    # the strings whose zone is known, per human_timestamp_to_datetime's
+    # contract. Aggregate begin_date is a local-time string
+    # (timestamp_to_human uses datetime.fromtimestamp) and must stay
+    # naive; arrival_date_utc is UTC wall-clock; SMTP TLS begin_date is
+    # RFC 3339 with an offset, so assume_utc would be a no-op anyway.
+    assume_utc = False
+    try:
+        if result["report_type"] == "aggregate":
+            type_folder = "Aggregate"
+            date_string = result["report"]["report_metadata"]["begin_date"]
+        elif result["report_type"] == "failure":
+            type_folder = "Failure"
+            date_string = result["report"]["arrival_date_utc"]
+            assume_utc = True
+        elif result["report_type"] == "smtp_tls":
+            type_folder = "SMTP-TLS"
+            date_string = result["report"]["begin_date"]
+        else:
+            logger.warning(f"Cannot archive unknown report type: {report_type}")
+            return None
+        dt = human_timestamp_to_datetime(date_string, assume_utc=assume_utc)
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
+        logger.warning(f"Cannot determine archive date for {report_type} report: {e}")
+        return None
+
+    return os.path.join(f"{dt.year:04d}", f"{dt.month:02d}", type_folder)
+
+
+def _move_file_to_archive(file_path: str, dest_dir: str) -> str:
+    """Move *file_path* into *dest_dir*, creating it if needed, and return
+    the final destination path.
+
+    An existing file at the destination is never overwritten: a numeric
+    suffix is appended before the extension (``name-1.xml``,
+    ``name-2.xml``, ...) until a free name is found. For multi-suffix
+    names like ``report.xml.gz`` the numeric suffix lands before the
+    last suffix only (``report.xml-1.gz``); this is acceptable.
+
+    The free-name claim is atomic (``os.open`` with
+    ``O_CREAT | O_EXCL``) rather than an exists-check-then-move: a plain
+    ``os.path.exists()`` check followed by ``shutil.move()`` is a
+    TOCTOU race between concurrent ``parsedmarc`` invocations sharing an
+    archive directory, and ``shutil.move()`` silently overwrites an
+    existing destination on POSIX, which would violate the
+    never-overwrite guarantee. Instead, each candidate name is staked
+    out with a zero-byte placeholder file before the real move happens;
+    ``shutil.move()`` then replaces that placeholder with the real file
+    — atomically via ``os.rename`` when source and destination are on
+    the same POSIX filesystem, otherwise (Windows, or a cross-device
+    move) via a ``copy2``-and-overwrite that is not atomic but still
+    cannot collide with a concurrent invocation, since the placeholder
+    already claimed the name.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    base, ext = os.path.splitext(os.path.basename(file_path))
+    candidate = os.path.basename(file_path)
+    n = 1
+    while True:
+        dest_path = os.path.join(dest_dir, candidate)
+        try:
+            # 0o600 (not os.open's 0o777 default) so a placeholder that
+            # outlives a failed move+cleanup is never executable or
+            # group/other-accessible. The mode never reaches the real
+            # archived file: os.rename replaces the placeholder's inode
+            # outright, and the copy2 fallback's copystat overwrites the
+            # mode with the source file's.
+            fd = os.open(dest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            candidate = f"{base}-{n}{ext}"
+            n += 1
+            continue
+        os.close(fd)
+        break
+
+    try:
+        shutil.move(file_path, dest_path)
+    except Exception:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            # Best-effort cleanup of the just-created placeholder; the
+            # move failure re-raised below is the error that matters.
+            pass
+        raise
+    return dest_path
+
+
+def _archive_processed_file(
+    file_path: str, archive_directory: str, result: ParsedReport | Exception
+) -> None:
+    """Move *file_path* into *archive_directory* after processing.
+
+    Files that failed to parse as a report (*result* is a
+    ``ParserError`` — every parse-failure exception, including
+    ``InvalidSMTPTLSReport``, subclasses it) go to
+    ``<archive_directory>/Invalid/``. Files that failed for some other
+    reason (a transient ``OSError``/``PermissionError`` from the parse
+    job's broad catch, or an unexpected parser bug) are left in place so
+    a later run can retry them — renaming a valid-but-currently-unreadable
+    report into ``Invalid/`` would permanently sideline it, since moving
+    a file needs no read permission on its contents, and
+    ``_exclude_archived_paths`` would then hide it from every future run
+    too. The parse loop already logged the error either way.
+
+    Successfully parsed files go to the dated ``<year>/<month>/<type>``
+    subdirectory returned by ``_archive_subdir_for_result``; if that
+    returns ``None`` (unknown report type or unparseable date), the file
+    is left in place — a warning was already logged by that helper.
+
+    A move failure is logged and never allowed to abort the run: the
+    file has already been successfully parsed (or definitively failed
+    to parse), so a filesystem error while archiving it should not
+    cause the caller to lose that work.
+    """
+    if isinstance(result, ParserError):
+        subdir = "Invalid"
+    elif isinstance(result, Exception):
+        logger.debug(
+            f"Leaving {file_path} in place: {result.__class__.__name__} is not "
+            "a report-parsing failure, so it may be retryable"
+        )
+        return
+    else:
+        subdir = _archive_subdir_for_result(result)
+        if subdir is None:
+            return
+
+    dest_dir = os.path.join(archive_directory, subdir)
+    try:
+        dest_path = _move_file_to_archive(file_path, dest_dir)
+    except Exception as e:
+        logger.error(f"Error moving {file_path} to the archive: {e}")
+        return
+    logger.debug(f"Archived {file_path} to {dest_path}")
 
 
 # All known INI config section names, used for env var resolution.
@@ -276,9 +584,7 @@ def _read_secret_file(env_key: str, raw_path: str) -> str:
             return f.read().rstrip("\r\n")
     except (OSError, UnicodeDecodeError) as exc:
         raise ConfigurationError(
-            "Cannot read secret file for {0}: {1} ({2})".format(
-                env_key, path, exc.__class__.__name__
-            )
+            f"Cannot read secret file for {env_key}: {path} ({exc.__class__.__name__})"
         ) from exc
 
 
@@ -345,37 +651,9 @@ def _configure_logging(log_level, log_file=None):
         log_level: The logging level (e.g., logging.DEBUG, logging.WARNING)
         log_file: Optional path to log file
     """
-    # Get the logger
-    from parsedmarc.log import logger
+    from parsedmarc.log import configure_logging
 
-    # Set the log level
-    logger.setLevel(log_level)
-
-    # Add StreamHandler with formatter if not already present
-    # Check if we already have a StreamHandler to avoid duplicates
-    # Use exact type check to distinguish from FileHandler subclass
-    has_stream_handler = any(type(h) is logging.StreamHandler for h in logger.handlers)
-
-    if not has_stream_handler:
-        formatter = logging.Formatter(
-            fmt="%(levelname)8s:%(filename)s:%(lineno)d:%(message)s",
-            datefmt="%Y-%m-%d:%H:%M:%S",
-        )
-        handler = logging.StreamHandler()
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    # Add FileHandler if log_file is specified
-    if log_file:
-        try:
-            fh = logging.FileHandler(log_file, "a")
-            formatter = logging.Formatter(
-                "%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
-            )
-            fh.setFormatter(formatter)
-            logger.addHandler(fh)
-        except (IOError, OSError, PermissionError) as error:
-            logger.warning("Unable to write to log file: {}".format(error))
+    configure_logging(log_level, log_file)
 
 
 # Loggers of the libraries that implement the mailbox and Microsoft Graph
@@ -423,64 +701,6 @@ def _configure_dependency_logging(level: int) -> None:
                 dep_logger.addHandler(wanted)
 
 
-def cli_parse(
-    file_path,
-    sa,
-    nameservers,
-    dns_timeout,
-    dns_retries,
-    ip_db_path,
-    offline,
-    always_use_local_files,
-    reverse_dns_map_path,
-    reverse_dns_map_url,
-    normalize_timespan_threshold_hours,
-    conn,
-    log_level=logging.ERROR,
-    log_file=None,
-):
-    """Separated this function for multiprocessing
-
-    Args:
-        file_path: Path to the report file
-        sa: Strip attachment payloads flag
-        nameservers: List of nameservers
-        dns_timeout: DNS timeout
-        dns_retries: Number of DNS retries on transient errors
-        ip_db_path: Path to IP database
-        offline: Offline mode flag
-        always_use_local_files: Always use local files flag
-        reverse_dns_map_path: Path to reverse DNS map
-        reverse_dns_map_url: URL to reverse DNS map
-        normalize_timespan_threshold_hours: Timespan threshold
-        conn: Pipe connection for IPC
-        log_level: Logging level for this process
-        log_file: Optional path to log file
-    """
-    # Configure logging in this child process
-    _configure_logging(log_level, log_file)
-
-    try:
-        file_results = parse_report_file(
-            file_path,
-            ip_db_path=ip_db_path,
-            offline=offline,
-            always_use_local_files=always_use_local_files,
-            reverse_dns_map_path=reverse_dns_map_path,
-            reverse_dns_map_url=reverse_dns_map_url,
-            nameservers=nameservers,
-            dns_timeout=dns_timeout,
-            dns_retries=dns_retries,
-            strip_attachment_payloads=sa,
-            normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
-        )
-        conn.send([file_results, file_path])
-    except ParserError as error:
-        conn.send([error, file_path])
-    finally:
-        conn.close()
-
-
 def _load_config(config_file: str | None = None) -> ConfigParser:
     """Load configuration from an INI file and/or environment variables.
 
@@ -492,16 +712,18 @@ def _load_config(config_file: str | None = None) -> ConfigParser:
         ``PARSEDMARC_*`` environment variables.
 
     Raises:
-        ConfigurationError: If *config_file* is given but does not exist.
+        ConfigurationError: If *config_file* is given but does not exist or
+            is not readable, or if a ``PARSEDMARC_..._FILE`` secret file
+            cannot be read.
     """
     config = ConfigParser(interpolation=None)
     if config_file is not None:
         abs_path = os.path.abspath(config_file)
         if not os.path.exists(abs_path):
-            raise ConfigurationError("A file does not exist at {0}".format(abs_path))
+            raise ConfigurationError(f"A file does not exist at {abs_path}")
         if not os.access(abs_path, os.R_OK):
             raise ConfigurationError(
-                "Unable to read {0} — check file permissions".format(abs_path)
+                f"Unable to read {abs_path} — check file permissions"
             )
         config.read(config_file)
     _apply_env_overrides(config)
@@ -534,6 +756,27 @@ def _parse_config(config: ConfigParser, opts):
         if "index_prefix_domain_map" in general_config:
             with open(_expand_path(general_config["index_prefix_domain_map"])) as f:
                 index_prefix_domain_map = yaml.safe_load(f)
+            # An empty file loads as None, which means "unset". Anything else
+            # must be a mapping of tenant name to a list of domain names, all
+            # strings: the save path iterates the keys as index name prefixes
+            # and tests `get_base_domain(...).lower() in <value>`. Every other
+            # shape fails silently rather than loudly -- a scalar value makes
+            # that an `in` on a str, which is a substring test, so it matches
+            # the wrong domains ("example.co" in "example.com" is True), and a
+            # non-string list item simply never compares equal to any domain.
+            if index_prefix_domain_map is not None and (
+                not isinstance(index_prefix_domain_map, dict)
+                or not all(
+                    isinstance(key, str)
+                    and isinstance(value, list)
+                    and all(isinstance(domain, str) for domain in value)
+                    for key, value in index_prefix_domain_map.items()
+                )
+            ):
+                raise ConfigurationError(
+                    "index_prefix_domain_map must be a YAML mapping of tenant "
+                    "name to a list of domain names, all strings"
+                )
         if "offline" in general_config:
             opts.offline = bool(general_config.getboolean("offline"))
         if "strip_attachment_payloads" in general_config:
@@ -542,6 +785,8 @@ def _parse_config(config: ConfigParser, opts):
             )
         if "output" in general_config:
             opts.output = _expand_path(general_config["output"])
+        if "archive_directory" in general_config:
+            opts.archive_directory = _expand_path(general_config["archive_directory"])
         if "aggregate_json_filename" in general_config:
             opts.aggregate_json_filename = general_config["aggregate_json_filename"]
         if "failure_json_filename" in general_config:
@@ -580,13 +825,11 @@ def _parse_config(config: ConfigParser, opts):
                 )
             except Exception as ns_error:
                 raise ConfigurationError(
-                    "DNS pre-flight check failed: {}".format(ns_error)
+                    f"DNS pre-flight check failed: {ns_error}"
                 ) from ns_error
             if not dummy_hostname:
                 raise ConfigurationError(
-                    "DNS pre-flight check failed: no PTR record for {} from {}".format(
-                        opts.dns_test_address, opts.nameservers
-                    )
+                    f"DNS pre-flight check failed: no PTR record for {opts.dns_test_address} from {opts.nameservers}"
                 )
         if "save_aggregate" in general_config:
             opts.save_aggregate = bool(general_config.getboolean("save_aggregate"))
@@ -654,12 +897,32 @@ def _parse_config(config: ConfigParser, opts):
             opts.mailbox_watch = bool(mailbox_config.getboolean("watch"))
         if "delete" in mailbox_config:
             opts.mailbox_delete = bool(mailbox_config.getboolean("delete"))
+        if "delete_aggregate" in mailbox_config:
+            opts.mailbox_delete_aggregate = bool(
+                mailbox_config.getboolean("delete_aggregate")
+            )
+        if "delete_failure" in mailbox_config:
+            opts.mailbox_delete_failure = bool(
+                mailbox_config.getboolean("delete_failure")
+            )
+        if "delete_smtp_tls" in mailbox_config:
+            opts.mailbox_delete_smtp_tls = bool(
+                mailbox_config.getboolean("delete_smtp_tls")
+            )
+        if "delete_invalid" in mailbox_config:
+            opts.mailbox_delete_invalid = bool(
+                mailbox_config.getboolean("delete_invalid")
+            )
         if "test" in mailbox_config:
             opts.mailbox_test = bool(mailbox_config.getboolean("test"))
         if "batch_size" in mailbox_config:
             opts.mailbox_batch_size = mailbox_config.getint("batch_size")
         if "check_timeout" in mailbox_config:
             opts.mailbox_check_timeout = mailbox_config.getint("check_timeout")
+        if "max_unsaved_retries" in mailbox_config:
+            opts.mailbox_max_unsaved_retries = mailbox_config.getint(
+                "max_unsaved_retries"
+            )
         if "since" in mailbox_config:
             opts.mailbox_since = mailbox_config["since"]
 
@@ -750,6 +1013,17 @@ def _parse_config(config: ConfigParser, opts):
             )
 
     if "msgraph" in config.sections():
+        # Without the msgraph extra, parsedmarc.mail binds a placeholder
+        # class (outside the MailboxConnection hierarchy) whose
+        # construction raises mailsuite's ImportError — fail fast here
+        # with parsedmarc's own install hint instead. Checked on the
+        # parsedmarc.mail module, the authoritative source of the
+        # placeholder state, not this module's rebound name (which tests
+        # replace with mocks).
+        if not issubclass(
+            parsedmarc.mail.MSGraphConnection, parsedmarc.mail.MailboxConnection
+        ):
+            raise ConfigurationError(_missing_extra_hint("msgraph", "msgraph"))
         graph_config = config["msgraph"]
         opts.graph_token_file = _expand_path(graph_config.get("token_file", ".token"))
 
@@ -863,9 +1137,9 @@ def _parse_config(config: ConfigParser, opts):
         if "number_of_shards" in elasticsearch_config:
             number_of_shards = elasticsearch_config.getint("number_of_shards")
             opts.elasticsearch_number_of_shards = number_of_shards
-            if "number_of_replicas" in elasticsearch_config:
-                number_of_replicas = elasticsearch_config.getint("number_of_replicas")
-                opts.elasticsearch_number_of_replicas = number_of_replicas
+        if "number_of_replicas" in elasticsearch_config:
+            number_of_replicas = elasticsearch_config.getint("number_of_replicas")
+            opts.elasticsearch_number_of_replicas = number_of_replicas
         if "index_suffix" in elasticsearch_config:
             opts.elasticsearch_index_suffix = elasticsearch_config["index_suffix"]
         if "index_prefix" in elasticsearch_config:
@@ -912,9 +1186,9 @@ def _parse_config(config: ConfigParser, opts):
         if "number_of_shards" in opensearch_config:
             number_of_shards = opensearch_config.getint("number_of_shards")
             opts.opensearch_number_of_shards = number_of_shards
-            if "number_of_replicas" in opensearch_config:
-                number_of_replicas = opensearch_config.getint("number_of_replicas")
-                opts.opensearch_number_of_replicas = number_of_replicas
+        if "number_of_replicas" in opensearch_config:
+            number_of_replicas = opensearch_config.getint("number_of_replicas")
+            opts.opensearch_number_of_replicas = number_of_replicas
         if "index_suffix" in opensearch_config:
             opts.opensearch_index_suffix = opensearch_config["index_suffix"]
         if "index_prefix" in opensearch_config:
@@ -1145,6 +1419,11 @@ def _parse_config(config: ConfigParser, opts):
             opts.syslog_retry_delay = 5
 
     if "gmail_api" in config.sections():
+        # Same placeholder detection as the msgraph section above.
+        if not issubclass(
+            parsedmarc.mail.GmailConnection, parsedmarc.mail.MailboxConnection
+        ):
+            raise ConfigurationError(_missing_extra_hint("gmail_api", "gmail"))
         gmail_api_config = config["gmail_api"]
         gmail_creds = gmail_api_config.get("credentials_file")
         opts.gmail_api_credentials_file = (
@@ -1239,47 +1518,391 @@ def _parse_config(config: ConfigParser, opts):
 
 
 class _ElasticsearchHandle:
-    """Sentinel so Elasticsearch participates in _close_output_clients."""
+    """Owns the Elasticsearch client so it participates in _close_output_clients.
+
+    Holds the client that ``elastic.set_hosts()`` registered under the
+    ``default`` connection alias, rather than re-resolving that alias when
+    it is closed. _close_output_clients is not only a shutdown path: the
+    SIGHUP reload in _main deliberately builds the replacement clients
+    *before* closing the old ones, and building them re-registers the
+    ``default`` alias, so by close time the alias names the new client.
+
+    Args:
+        connection: The client returned by ``elastic.set_hosts()``.
+    """
+
+    def __init__(self, connection: Any):
+        self._connection = connection
 
     def close(self):
         try:
-            conn = elastic.connections.get_connection()
-            if not isinstance(conn, str):
-                conn.close()
+            self._connection.close()
         except Exception:
+            # Best-effort, and deliberately silent: this is the first of
+            # two independent teardown steps, and swallowing here is what
+            # lets the second one still run. Nothing reports this error --
+            # _close_output_clients logs a warning only if close() itself
+            # raises, which it cannot while this handler swallows.
             pass
         try:
-            elastic.connections.remove_connection("default")
+            # Give up the alias only while it still names our own client.
+            # elasticsearch.dsl's Connections.remove_connection() deletes
+            # the alias outright, so removing it after a reload had pointed
+            # it at a new client would leave that client unreachable, with
+            # every later save raising KeyError.
+            if elastic.connections.get_connection("default") is self._connection:
+                elastic.connections.remove_connection("default")
         except Exception:
+            # Best-effort and silent for the same reason as above: a
+            # failure to give up the alias is not actionable during
+            # teardown, and it is not reported anywhere either.
             pass
 
 
 class _OpenSearchHandle:
-    """Sentinel so OpenSearch participates in _close_output_clients."""
+    """Owns the OpenSearch client so it participates in _close_output_clients.
+
+    Holds the client that ``opensearch.set_hosts()`` registered under the
+    ``default`` connection alias; see _ElasticsearchHandle for why the
+    alias is not re-resolved at close time.
+
+    Args:
+        connection: The client returned by ``opensearch.set_hosts()``.
+    """
+
+    def __init__(self, connection: Any):
+        self._connection = connection
 
     def close(self):
         try:
-            conn = opensearch.connections.get_connection()
-            if not isinstance(conn, str):
-                conn.close()
+            self._connection.close()
         except Exception:
+            # Best-effort, and deliberately silent: this is the first of
+            # two independent teardown steps, and swallowing here is what
+            # lets the second one still run. Nothing reports this error --
+            # _close_output_clients logs a warning only if close() itself
+            # raises, which it cannot while this handler swallows.
             pass
         try:
-            opensearch.connections.remove_connection("default")
+            # Only while the alias still names our own client; see
+            # _ElasticsearchHandle.close().
+            if opensearch.connections.get_connection("default") is self._connection:
+                opensearch.connections.remove_connection("default")
         except Exception:
+            # Best-effort and silent for the same reason as above: a
+            # failure to give up the alias is not actionable during
+            # teardown, and it is not reported anywhere either.
             pass
 
 
-def _init_output_clients(opts):
-    """Create output clients based on current opts.
+def _normalize_index_prefix(prefix):
+    """Normalize an ``index_prefix_domain_map`` key into an index name prefix.
+
+    Lowercases, strips surrounding whitespace and then surrounding
+    underscores, replaces the remaining spaces and hyphens with
+    underscores, and appends a trailing ``_``.
+
+    Shared by the save path (``get_index_prefix()`` in :func:`_main`) and the
+    migration path (:func:`_migration_index_names`) so that the indexes
+    parsedmarc migrates cannot drift from the ones it writes to.
+
+    A key that normalizes to the empty string (``"_"``, ``"  "``) yields the
+    literal ``"_"``. That is deliberate: it is exactly the prefix the save
+    path produces for such a key, so it is the prefix its documents live
+    under.
+
+    The ``[elasticsearch]``/``[opensearch]`` ``index_prefix`` option is never
+    passed through this function -- the save path uses that option verbatim,
+    so the migration path must too.
+
+    Args:
+        prefix (str): A key from ``index_prefix_domain_map``.
 
     Returns:
-        dict of client instances keyed by name.
+        str: The index name prefix, including its trailing underscore.
+    """
+    prefix = prefix.lower().strip().strip("_").replace(" ", "_").replace("-", "_")
+    return f"{prefix}_"
+
+
+def _migration_index_names(
+    base_name, index_suffix, configured_prefix, index_prefix_domain_map
+):
+    """Resolve every index name an index migration should target.
+
+    Mirrors the way save time builds index names, which is
+    ``{prefix}{base_name}_{index_suffix}-{date}``, and widens each of the
+    two configurable axes so that a migration cannot silently skip indexes
+    the deployment holds data in (issue #868).
+
+    **Suffix axis.** When ``index_suffix`` is set, the suffixed name (what
+    this deployment writes today) and the bare ``base_name`` are both
+    returned, suffixed first. The bare name covers
+    documents indexed before the suffix was configured, or under a previous
+    one; without it, ``dmarc_aggregate_prod*`` matches none of the
+    operator's own ``dmarc_aggregate-*`` indexes. Because callers turn each
+    name into an ``f"{name}*"`` pattern, the bare name's pattern is a strict
+    superset of the suffixed one: on a shared cluster it also matches other
+    deployments' suffixes, and on the first run after an upgrade both
+    patterns can submit an overlapping ``update_by_query``. That is safe --
+    the backfill scripts only set a field that is missing, and submissions
+    use ``conflicts="proceed"`` -- but it is a deliberate trade of
+    narrowness for coverage of the operator's own history.
+
+    **Prefix axis.** A configured ``index_prefix`` wins outright and
+    suppresses the ``index_prefix_domain_map`` fan-out, because such a
+    deployment writes only under that prefix and must not touch index
+    patterns it does not own. Truthiness decides, matching the save path's
+    ``opts.*_index_prefix or get_index_prefix(report)``. Otherwise the
+    unprefixed name comes first, followed by one name per map key --
+    normalized by :func:`_normalize_index_prefix`, in map order. The
+    unprefixed name has to stay: aggregate and failure reports for a domain
+    that is absent from the map are still saved without a prefix, and
+    indexes predating the map exist for every report type.
+
+    ``configured_prefix`` is used verbatim, never normalized, for parity
+    with the save path.
+
+    Args:
+        base_name (str): The unprefixed, unsuffixed index name, e.g.
+            ``"dmarc_aggregate"``.
+        index_suffix (str | None): The configured ``index_suffix``, or
+            ``None``/``""`` when none is configured.
+        configured_prefix (str | None): The configured ``index_prefix``, or
+            ``None``/``""`` when none is configured.
+        index_prefix_domain_map (dict | None): The parsed
+            ``general.index_prefix_domain_map``, or ``None`` when
+            multi-tenant prefixing is not configured.
+
+    Returns:
+        list: Index names, deduplicated, in first-seen order. With nothing
+        configured this is just ``[base_name]``.
+    """
+    bases = [base_name]
+    if index_suffix:
+        bases.insert(0, f"{base_name}_{index_suffix}")
+
+    if configured_prefix:
+        prefixes = [configured_prefix]
+    else:
+        prefixes = [""]
+        for key in index_prefix_domain_map or {}:
+            prefix = _normalize_index_prefix(key)
+            if prefix not in prefixes:
+                prefixes.append(prefix)
+
+    names = []
+    for prefix in prefixes:
+        for base in bases:
+            name = f"{prefix}{base}"
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def _search_alias_snapshot() -> list[tuple[Any, Any, Any]]:
+    """Record the module-level state each search backend's set_hosts() writes.
+
+    ``elastic.set_hosts()`` and ``opensearch.set_hosts()`` register the client
+    they build under their SDK's process-wide ``default`` connection alias,
+    and the save path resolves that alias on every write.
+    :func:`_init_output_clients` takes this snapshot before it touches either
+    registry, so that a failure part-way through can put back exactly what it
+    found.
+
+    Returns:
+        list: One ``(module, client, serverless)`` triple per backend.
+        ``client`` is what that backend's ``default`` alias names, or ``None``
+        when the alias is unset. ``serverless`` is ``elastic._SERVERLESS`` for
+        the Elasticsearch backend and ``None`` for OpenSearch, which has no
+        equivalent. Carrying the module itself, rather than a name to look it
+        up by, is what lets :func:`_restore_search_aliases` put each client
+        back into the registry it came from without a second lookup to
+        disagree with. A backend whose module is ``None`` -- its optional
+        extra is not installed, see the guarded imports at the top of this
+        module -- has no state to snapshot and is left out of the list
+        entirely.
+    """
+    snapshot: list[tuple[Any, Any, Any]] = []
+    for module in (elastic, opensearch):
+        if module is None:
+            continue
+        try:
+            # get_connection() does not only look the alias up: it also
+            # *constructs* a client from kwargs stashed by an earlier
+            # connections.configure() call. parsedmarc never calls
+            # configure() -- both set_hosts() implementations register their
+            # client with create_connection() -- so each registry's
+            # ``_kwargs`` stays empty and this can only return an
+            # already-registered client or raise KeyError. Taking the
+            # snapshot can never itself open a connection.
+            connection = module.connections.get_connection("default")
+        except KeyError:
+            connection = None
+        # The alias is not the only module-level state set_hosts() writes:
+        # elastic.set_hosts() also assigns elastic._SERVERLESS, which
+        # elastic.create_indexes() consults to decide whether to strip the
+        # shard settings Serverless rejects. Reaching into a sibling module's
+        # private is the same liberty this function already takes with
+        # ``connections``; without it, a failed reload that flipped
+        # ``[elasticsearch] serverless`` would pair the restored old client
+        # with the new config's flag. opensearch.py declares no module
+        # globals at all (no ``global`` statement in the file), so there is
+        # nothing to pair with it.
+        serverless = elastic._SERVERLESS if module is elastic else None
+        snapshot.append((module, connection, serverless))
+    return snapshot
+
+
+def _restore_search_aliases(snapshot: list[tuple[Any, Any, Any]]) -> None:
+    """Put the state in *snapshot* back the way it was when it was taken.
+
+    ``elastic._SERVERLESS`` is put back first and unconditionally; the alias
+    then has three cases per backend. The alias still names the client it
+    named before, so there is nothing to do. A different client has taken it
+    over -- that client is
+    closed, and the previous client is registered again, or the alias is
+    removed outright when there was no previous client. Or the alias is unset
+    because a fully built handle released it during the teardown that runs
+    first -- nothing left to close, and the previous client is simply
+    registered again; this is the ordinary path when the failure came after a
+    search backend was fully built.
+
+    Closing is best-effort and silent: the client being closed here is the
+    half-built one for the configuration that just failed, it is being
+    discarded either way, and a teardown error is not actionable -- while
+    handing the alias back is what keeps the still-running configuration
+    writing where it thinks it is, so it must happen either way. Closing the
+    same client twice is safe -- ``_close_output_clients`` may already have
+    closed it through its handle -- because both SDKs' ``close()`` are
+    idempotent: ``Elasticsearch.close()`` closes each node's urllib3 pool,
+    whose ``close()`` is a no-op once cleared, and ``OpenSearch.close()``
+    guards on ``if self.pool``.
+
+    Args:
+        snapshot (list): The return value of :func:`_search_alias_snapshot`.
+    """
+    for module, previous, previous_serverless in snapshot:
+        if elastic is not None and module is elastic:
+            # Unconditionally, and before the alias: set_hosts() assigns
+            # _SERVERLESS before it constructs the client, so it can be stale
+            # even on a failure that never reached the registry.
+            elastic._SERVERLESS = previous_serverless
+        try:
+            current = module.connections.get_connection("default")
+        except KeyError:
+            current = None
+        if current is previous:
+            # Nothing took the alias over, including the common case of
+            # both being None. Leave it alone.
+            continue
+        if current is not None:
+            try:
+                current.close()
+            except BaseException:
+                # Best-effort; see the docstring. BaseException, not
+                # Exception, for the same reason the caller's teardown is
+                # wrapped in try/finally: a Ctrl-C landing in close() must
+                # not cost the alias its hand-back, and the exception the
+                # caller re-raises afterwards still reports the failure.
+                pass
+        if previous is None:
+            # Cannot raise KeyError: the alias was just resolved out of this
+            # registry's own ``_conns``, and closing a client does not touch
+            # the registry, so it is still there.
+            module.connections.remove_connection("default")
+        else:
+            module.connections.add_connection("default", previous)
+
+
+def _utils_globals_snapshot() -> dict[str, Any]:
+    """Record the ``parsedmarc.utils`` module-level state the config loaders
+    write, so a failed SIGHUP reload can put it back.
+
+    Three globals, enumerated from the loaders' bodies rather than from
+    their docstrings:
+
+    * ``psl_overrides`` -- ``load_psl_overrides()`` clears the list and
+      repopulates it in place. It declares no ``global``: the list object
+      itself is the shared state, which is why this is snapshotted by value.
+      ``load_reverse_dns_map()`` calls that loader before it reads anything
+      of its own, so staging the map into a fresh dict does *not* keep the
+      overrides list out of the reload's blast radius.
+      ``get_base_domain()`` reads it on every lookup.
+    * ``_IP_DB_PATH`` -- the only global ``load_ip_db()`` assigns.
+      ``_get_ip_database_path()`` falls back to it whenever the caller's
+      own ``ip_db_path`` is unset or names a file that is not there, which
+      is every MMDB lookup in the common case of no ``ip_db_path``.
+    * ``_IPINFO_API_TOKEN`` -- the only global ``configure_ipinfo_api()``
+      assigns, and it is assigned *before* the token probe that can fail,
+      so a rejected probe leaves the new token behind.
+
+    ``_LAST_LOGGED_IP_DB_PATH`` is deliberately not covered: it is assigned
+    by ``_get_ip_database_path()``, which none of the loaders the reload
+    calls reach, and it only decides whether the selected database path is
+    logged again.
+
+    Returns:
+        dict: The values, to be handed to :func:`_restore_utils_globals`.
+    """
+    return {
+        "psl_overrides": list(parsedmarc.utils.psl_overrides),
+        "_IP_DB_PATH": parsedmarc.utils._IP_DB_PATH,
+        "_IPINFO_API_TOKEN": parsedmarc.utils._IPINFO_API_TOKEN,
+    }
+
+
+def _restore_utils_globals(snapshot: dict[str, Any]) -> None:
+    """Put the state in *snapshot* back the way it was when it was taken.
+
+    ``psl_overrides`` is restored in place, not rebound, for the same reason
+    it is snapshotted by value: ``load_psl_overrides()`` mutates that one
+    list object, and rebinding ``parsedmarc.utils.psl_overrides`` would
+    leave any already-bound reference to the old object holding the failed
+    reload's contents.
+
+    Args:
+        snapshot (dict): The return value of :func:`_utils_globals_snapshot`.
+    """
+    parsedmarc.utils.psl_overrides[:] = snapshot["psl_overrides"]
+    parsedmarc.utils._IP_DB_PATH = snapshot["_IP_DB_PATH"]
+    parsedmarc.utils._IPINFO_API_TOKEN = snapshot["_IPINFO_API_TOKEN"]
+
+
+def _build_output_clients(opts, clients, index_prefix_domain_map=None):
+    """Create output clients based on current opts, into *clients*.
+
+    Deliberately not transactional: it fills *clients* as it goes and, when a
+    step fails, leaves behind both the clients it had already built and any
+    change ``elastic.set_hosts()``/``opensearch.set_hosts()`` made to their
+    SDKs' module-level state. Undoing that is :func:`_init_output_clients`'s
+    job, which is why *clients* is a parameter -- the caller owns the dict on
+    the failure path too, and can close what is in it. Call
+    :func:`_init_output_clients`, not this.
+
+    Args:
+        opts: Namespace of parsed configuration values.
+        clients (dict): The dict to fill, keyed by client name. Filled in
+            place, and also returned.
+        index_prefix_domain_map (dict | None): The parsed
+            ``general.index_prefix_domain_map``. ``None`` -- the default --
+            means multi-tenant prefixing is not configured, so Elasticsearch
+            and OpenSearch index migrations target only the names derived
+            from ``index_prefix``/``index_suffix``.
+
+    Returns:
+        dict: *clients*, filled.
 
     Raises:
         ConfigurationError: If a required output client cannot be created.
+        RuntimeError: If constructing an output client fails, chained to the
+            error the SDK raised.
     """
-    clients = {}
+    # Each check below is deliberately outside the try/except that wraps
+    # its constructor: those handlers re-raise everything as RuntimeError,
+    # which would bury the install hint.
+    if opts.s3_bucket and s3 is None:
+        raise ConfigurationError(_missing_extra_hint("s3", "s3"))
 
     try:
         if opts.s3_bucket:
@@ -1294,6 +1917,15 @@ def _init_output_clients(opts):
             )
     except Exception as e:
         raise RuntimeError(f"S3: {e}") from e
+
+    # postgres.py guards its own psycopg import, so the module is always
+    # importable; check the SDK here so a missing extra is a fail-fast
+    # ConfigurationError rather than a PostgreSQLError that the startup
+    # retry loop would retry for over a minute before exiting.
+    if (
+        opts.postgresql_host or opts.postgresql_connection_string
+    ) and postgres.psycopg is None:
+        raise ConfigurationError(_missing_extra_hint("postgresql", "postgresql"))
 
     try:
         if opts.postgresql_host or opts.postgresql_connection_string:
@@ -1352,6 +1984,9 @@ def _init_output_clients(opts):
         except Exception as e:
             raise RuntimeError(f"Splunk HEC: {e}") from e
 
+    if opts.kafka_hosts and kafkaclient is None:
+        raise ConfigurationError(_missing_extra_hint("kafka", "kafka"))
+
     try:
         if opts.kafka_hosts:
             logger.debug("Initializing Kafka client: hosts=%s", opts.kafka_hosts)
@@ -1369,6 +2004,9 @@ def _init_output_clients(opts):
             )
     except Exception as e:
         raise RuntimeError(f"Kafka: {e}") from e
+
+    if opts.gelf_host and gelf is None:
+        raise ConfigurationError(_missing_extra_hint("gelf", "gelf"))
 
     try:
         if opts.gelf_host:
@@ -1401,12 +2039,28 @@ def _init_output_clients(opts):
     except Exception as e:
         raise RuntimeError(f"Webhook: {e}") from e
 
-    # Elasticsearch and OpenSearch mutate module-level global state via
-    # connections.create_connection(), which cannot be rolled back if a later
-    # step fails.  Initialise them last so that all other clients are created
-    # successfully first; this minimizes the window for partial-init problems
-    # during config reload.
+    # The Log Analytics client is built per batch in process_reports(),
+    # under the same opts.la_dce guard. Checking it here means a missing
+    # extra is reported at startup -- and again on a SIGHUP reload --
+    # rather than once reports are already in hand.
+    if opts.la_dce and loganalytics is None:
+        raise ConfigurationError(_missing_extra_hint("log_analytics", "loganalytics"))
+
+    # Elasticsearch and OpenSearch mutate module-level global state, in two
+    # places rather than one: connections.create_connection() registers the
+    # new client under the ``default`` alias, and elastic.set_hosts() also
+    # assigns elastic._SERVERLESS. _init_output_clients() rolls both back if
+    # a later step fails. They are still initialized last, so that a failure
+    # in any other output happens before either registry has been touched.
     if opts.save_aggregate or opts.save_failure or opts.save_smtp_tls:
+        # Scoped to the same condition as the constructors below, which is
+        # also the condition under which process_reports() dereferences
+        # these modules to save reports.
+        if opts.elasticsearch_hosts and elastic is None:
+            raise ConfigurationError(_missing_extra_hint("elasticsearch", "elastic"))
+        if opts.opensearch_hosts and opensearch is None:
+            raise ConfigurationError(_missing_extra_hint("opensearch", "opensearch"))
+
         try:
             if opts.elasticsearch_hosts:
                 logger.debug(
@@ -1414,25 +2068,40 @@ def _init_output_clients(opts):
                     opts.elasticsearch_hosts,
                     opts.elasticsearch_ssl,
                 )
-                es_aggregate_index = "dmarc_aggregate"
-                es_failure_index = "dmarc_failure"
-                es_smtp_tls_index = "smtp_tls"
-                if opts.elasticsearch_index_suffix:
-                    suffix = opts.elasticsearch_index_suffix
-                    es_aggregate_index = "{0}_{1}".format(es_aggregate_index, suffix)
-                    es_failure_index = "{0}_{1}".format(es_failure_index, suffix)
-                    es_smtp_tls_index = "{0}_{1}".format(es_smtp_tls_index, suffix)
-                if opts.elasticsearch_index_prefix:
-                    prefix = opts.elasticsearch_index_prefix
-                    es_aggregate_index = "{0}{1}".format(prefix, es_aggregate_index)
-                    es_failure_index = "{0}{1}".format(prefix, es_failure_index)
-                    es_smtp_tls_index = "{0}{1}".format(prefix, es_smtp_tls_index)
+                es_aggregate_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                es_failure_indexes = _migration_index_names(
+                    "dmarc_failure",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                es_smtp_tls_indexes = _migration_index_names(
+                    "smtp_tls",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                # The legacy published_policy.fo migration gets the same
+                # names minus the tenant fan-out: index_prefix_domain_map
+                # arrived in 8.19.0, long after 5.0.0 fixed the mapping, so
+                # no index it names can carry the old one.
+                es_legacy_fo_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.elasticsearch_index_suffix,
+                    opts.elasticsearch_index_prefix,
+                    None,
+                )
                 elastic_timeout_value = (
                     float(opts.elasticsearch_timeout)
                     if opts.elasticsearch_timeout is not None
                     else 60.0
                 )
-                elastic.set_hosts(
+                elasticsearch_connection = elastic.set_hosts(
                     opts.elasticsearch_hosts,
                     use_ssl=opts.elasticsearch_ssl,
                     ssl_cert_path=opts.elasticsearch_ssl_cert_path,
@@ -1443,11 +2112,23 @@ def _init_output_clients(opts):
                     timeout=elastic_timeout_value,
                     serverless=opts.elasticsearch_serverless,
                 )
-                elastic.migrate_indexes(
-                    aggregate_indexes=[es_aggregate_index],
-                    failure_indexes=[es_failure_index],
+                logger.debug(
+                    "Elasticsearch index migration targets: aggregate=%s, "
+                    "failure=%s, smtp_tls=%s, legacy_fo=%s",
+                    es_aggregate_indexes,
+                    es_failure_indexes,
+                    es_smtp_tls_indexes,
+                    es_legacy_fo_indexes,
                 )
-                clients["elasticsearch"] = _ElasticsearchHandle()
+                elastic.migrate_indexes(
+                    aggregate_indexes=es_aggregate_indexes,
+                    failure_indexes=es_failure_indexes,
+                    smtp_tls_indexes=es_smtp_tls_indexes,
+                    legacy_fo_indexes=es_legacy_fo_indexes,
+                )
+                clients["elasticsearch"] = _ElasticsearchHandle(
+                    elasticsearch_connection
+                )
         except Exception as e:
             raise RuntimeError(f"Elasticsearch: {e}") from e
 
@@ -1458,25 +2139,40 @@ def _init_output_clients(opts):
                     opts.opensearch_hosts,
                     opts.opensearch_ssl,
                 )
-                os_aggregate_index = "dmarc_aggregate"
-                os_failure_index = "dmarc_failure"
-                os_smtp_tls_index = "smtp_tls"
-                if opts.opensearch_index_suffix:
-                    suffix = opts.opensearch_index_suffix
-                    os_aggregate_index = "{0}_{1}".format(os_aggregate_index, suffix)
-                    os_failure_index = "{0}_{1}".format(os_failure_index, suffix)
-                    os_smtp_tls_index = "{0}_{1}".format(os_smtp_tls_index, suffix)
-                if opts.opensearch_index_prefix:
-                    prefix = opts.opensearch_index_prefix
-                    os_aggregate_index = "{0}{1}".format(prefix, os_aggregate_index)
-                    os_failure_index = "{0}{1}".format(prefix, os_failure_index)
-                    os_smtp_tls_index = "{0}{1}".format(prefix, os_smtp_tls_index)
+                os_aggregate_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                os_failure_indexes = _migration_index_names(
+                    "dmarc_failure",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                os_smtp_tls_indexes = _migration_index_names(
+                    "smtp_tls",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    index_prefix_domain_map,
+                )
+                # The legacy published_policy.fo migration gets the same
+                # names minus the tenant fan-out: index_prefix_domain_map
+                # arrived in 8.19.0, long after 5.0.0 fixed the mapping, so
+                # no index it names can carry the old one.
+                os_legacy_fo_indexes = _migration_index_names(
+                    "dmarc_aggregate",
+                    opts.opensearch_index_suffix,
+                    opts.opensearch_index_prefix,
+                    None,
+                )
                 opensearch_timeout_value = (
                     float(opts.opensearch_timeout)
                     if opts.opensearch_timeout is not None
                     else 60.0
                 )
-                opensearch.set_hosts(
+                opensearch_connection = opensearch.set_hosts(
                     opts.opensearch_hosts,
                     use_ssl=opts.opensearch_ssl,
                     ssl_cert_path=opts.opensearch_ssl_cert_path,
@@ -1489,15 +2185,106 @@ def _init_output_clients(opts):
                     aws_region=opts.opensearch_aws_region,
                     aws_service=opts.opensearch_aws_service,
                 )
-                opensearch.migrate_indexes(
-                    aggregate_indexes=[os_aggregate_index],
-                    failure_indexes=[os_failure_index],
+                logger.debug(
+                    "OpenSearch index migration targets: aggregate=%s, "
+                    "failure=%s, smtp_tls=%s, legacy_fo=%s",
+                    os_aggregate_indexes,
+                    os_failure_indexes,
+                    os_smtp_tls_indexes,
+                    os_legacy_fo_indexes,
                 )
-                clients["opensearch"] = _OpenSearchHandle()
+                opensearch.migrate_indexes(
+                    aggregate_indexes=os_aggregate_indexes,
+                    failure_indexes=os_failure_indexes,
+                    smtp_tls_indexes=os_smtp_tls_indexes,
+                    legacy_fo_indexes=os_legacy_fo_indexes,
+                )
+                clients["opensearch"] = _OpenSearchHandle(opensearch_connection)
         except Exception as e:
             raise RuntimeError(f"OpenSearch: {e}") from e
 
     return clients
+
+
+def _init_output_clients(opts, index_prefix_domain_map=None):
+    """Create output clients based on current opts, all-or-nothing.
+
+    Either every configured client is built and returned, or the clients built
+    so far are closed and the module-level state that
+    ``elastic.set_hosts()``/``opensearch.set_hosts()`` mutate -- each
+    backend's ``default`` connection alias, and ``elastic._SERVERLESS`` -- is
+    left exactly as it was on entry.
+
+    That guarantee is what the SIGHUP reload in :func:`_main` needs. It builds
+    the replacement clients before closing the old ones and keeps running with
+    the old ``opts`` if the build fails. But ``set_hosts()`` registers its
+    client under the ``default`` alias as soon as it is constructed, well
+    before the rest of the initialization can fail -- on an output configured
+    later failing to build, or on a Ctrl-C landing in the index migration.
+    Without the rollback, such a reload left every subsequent save resolving
+    that alias to the *new* cluster while ``opts`` stayed old, and leaked the
+    half-built client.
+
+    Args:
+        opts: Namespace of parsed configuration values.
+        index_prefix_domain_map (dict | None): The parsed
+            ``general.index_prefix_domain_map``; see
+            :func:`_build_output_clients`.
+
+    Returns:
+        dict of client instances keyed by name.
+
+    Raises:
+        ConfigurationError: If a required output client cannot be created.
+        RuntimeError: If constructing an output client fails, chained to the
+            error the SDK raised.
+    """
+    previous_search_state = _search_alias_snapshot()
+    clients: dict[str, Any] = {}
+
+    try:
+        return _build_output_clients(
+            opts, clients, index_prefix_domain_map=index_prefix_domain_map
+        )
+    except BaseException:
+        # Teardown first, then restore. The order is deliberate, and the two
+        # steps are not interchangeable. Tracing the two points at which a
+        # failure can leave a ``default`` alias pointing at a new client:
+        #
+        # (1) Inside the Elasticsearch block after set_hosts(), before the
+        #     handle exists. Teardown closes the outputs built earlier and
+        #     leaves the alias alone -- nothing in ``clients`` owns it -- and
+        #     the restore then closes the new client and re-registers the old
+        #     one. Either order reaches that state.
+        #
+        # (2) In a later step, with _ElasticsearchHandle already in
+        #     ``clients`` owning the new client that holds the alias.
+        #     Teardown first: the handle closes its client and, seeing the
+        #     alias still name that client, releases the alias; the restore
+        #     then finds the alias unset and re-registers the old client,
+        #     which was never closed. Restoring first would instead put the
+        #     old client back and only then close the handle -- leaving the
+        #     whole rollback resting on the handle declining to touch an
+        #     alias that no longer names its own client. It does decline
+        #     today, but that is a property of _ElasticsearchHandle.close(),
+        #     not of this function: before #902 the handle re-resolved the
+        #     alias at close time and would have deleted the registration
+        #     restored a moment earlier, leaving every later save raising
+        #     KeyError. Tearing down first keeps this guarantee local.
+        #
+        # BaseException, not Exception: elastic.migrate_indexes() catches
+        # Exception around every cluster call and logs a warning, so the
+        # failure that escapes the Elasticsearch block after set_hosts() is,
+        # in practice, a KeyboardInterrupt landing in one of them. And try/finally,
+        # because a second Ctrl-C arriving during the teardown propagates
+        # straight through _close_output_clients, which swallows only
+        # Exception; a plain statement sequence would then skip the restore
+        # and leave behind exactly the state this function exists to prevent.
+        try:
+            _close_output_clients(clients)
+        finally:
+            _restore_search_aliases(previous_search_state)
+        raise
 
 
 def _close_output_clients(clients):
@@ -1520,6 +2307,41 @@ def _close_output_clients(clients):
                 logger.warning("Error closing %s", name, exc_info=True)
 
 
+def _build_parser_config(opts: Namespace) -> ParserConfig:
+    """Builds the single ParserConfig for this run from parsed opts, bound to
+    the process-wide default caches (the parsedmarc module globals).
+    """
+    return ParserConfig(
+        offline=opts.offline,
+        ip_db_path=opts.ip_db_path,
+        always_use_local_files=opts.always_use_local_files,
+        reverse_dns_map_path=opts.reverse_dns_map_path,
+        reverse_dns_map_url=opts.reverse_dns_map_url,
+        psl_overrides_path=opts.psl_overrides_path,
+        psl_overrides_url=opts.psl_overrides_url,
+        nameservers=opts.nameservers,
+        dns_timeout=(
+            float(opts.dns_timeout)
+            if opts.dns_timeout is not None
+            else DEFAULT_DNS_TIMEOUT
+        ),
+        dns_retries=(
+            int(opts.dns_retries)
+            if opts.dns_retries is not None
+            else DEFAULT_DNS_MAX_RETRIES
+        ),
+        strip_attachment_payloads=opts.strip_attachment_payloads,
+        normalize_timespan_threshold_hours=(
+            float(opts.normalize_timespan_threshold_hours)
+            if opts.normalize_timespan_threshold_hours is not None
+            else 24.0
+        ),
+        ip_address_cache=IP_ADDRESS_CACHE,
+        seen_aggregate_report_ids=SEEN_AGGREGATE_REPORT_IDS,
+        reverse_dns_map=REVERSE_DNS_MAP,
+    )
+
+
 def _main():
     """Called when the module is executed"""
 
@@ -1531,31 +2353,35 @@ def _main():
             domain = report["policy_published"]["domain"]
         elif "reported_domain" in report:
             domain = report["reported_domain"]
-        elif "policies" in report:
+        elif report.get("policies"):
+            # Guarded with .get() truthiness: parse_smtp_tls_report_json()
+            # accepts a report whose policies list is empty, which would
+            # make [0] raise IndexError here. Such a report has no domain
+            # to map, so it falls through to return None like any other
+            # unmappable report.
             domain = report["policies"][0]["policy_domain"]
         if domain:
             domain = get_base_domain(domain)
             if domain:
                 domain = domain.lower()
-                for prefix in index_prefix_domain_map:
-                    if domain in index_prefix_domain_map[prefix]:
-                        prefix = (
-                            prefix.lower()
-                            .strip()
-                            .strip("_")
-                            .replace(" ", "_")
-                            .replace("-", "_")
-                        )
-                        prefix = f"{prefix}_"
-                        return prefix
+                for key in index_prefix_domain_map:
+                    if domain in index_prefix_domain_map[key]:
+                        return _normalize_index_prefix(key)
         return None
 
     def filter_smtp_tls_reports_for_index_prefix(tls_reports):
-        """Drop SMTP TLS reports for domains not covered by
-        index_prefix_domain_map. Shared by process_reports() (for the
-        batches that actually get saved) and by the parsing_results copy
-        built later for email_results(), so the emailed summary matches
-        what was saved regardless of index_prefix_domain_map."""
+        """Drop SMTP TLS reports whose domain isn't covered by
+        ``index_prefix_domain_map``.
+
+        Shared by ``process_reports()`` (which filters each batch it saves)
+        and by the combined ``parsing_results`` that feeds
+        ``email_results()``. Mailbox batches are saved inside
+        ``get_dmarc_reports_from_mailbox()``, so the dicts
+        ``process_reports()`` filters in place are no longer the same
+        objects as the combined results assembled afterward -- without this,
+        the emailed summary would list SMTP TLS reports that were
+        deliberately excluded from every output destination.
+        """
         if index_prefix_domain_map is None:
             return tls_reports
         filtered_tls = []
@@ -1574,6 +2400,14 @@ def _main():
         return filtered_tls
 
     def process_reports(reports_):
+        """Write ``reports_`` to every configured output destination.
+
+        Returns the list of human-readable output-error messages recorded
+        along the way -- empty when every destination accepted the reports.
+        Callers use that as the "was this batch saved?" signal; see
+        ``mailbox_save_callback()``. With ``fail_on_output_error`` enabled,
+        a non-empty list is raised as ``ParserError`` instead of returned.
+        """
         output_errors = []
 
         def log_output_error(destination, error):
@@ -1587,8 +2421,8 @@ def _main():
             )
 
         indent_value = 2 if opts.prettify_json else None
-        output_str = "{0}\n".format(
-            json.dumps(reports_, ensure_ascii=False, indent=indent_value)
+        output_str = (
+            f"{json.dumps(reports_, ensure_ascii=False, indent=indent_value)}\n"
         )
 
         if not opts.silent:
@@ -1605,8 +2439,13 @@ def _main():
                     failure_csv_filename=opts.failure_csv_filename,
                     smtp_tls_csv_filename=opts.smtp_tls_csv_filename,
                 )
-            except (OSError, ValueError) as e:
-                log_output_error("File output", str(e))
+            except (OSError, ValueError) as error_:
+                # The only output destination that was not already caught:
+                # a full disk or an unwritable directory used to crash the
+                # run outright, and now that a failed save holds mailbox
+                # messages back it also has to be recorded like any other
+                # destination's failure rather than escaping.
+                log_output_error("File output", str(error_))
 
         kafka_client = clients.get("kafka_client")
         s3_client = clients.get("s3_client")
@@ -1924,14 +2763,14 @@ def _main():
 
         if opts.fail_on_output_error and output_errors:
             raise ParserError(
-                "Output destination failures detected: {0}".format(
+                "Output destination failures detected: {}".format(
                     " | ".join(output_errors)
                 )
             )
 
         return output_errors
 
-    arg_parser = ArgumentParser(description="Parses DMARC reports")
+    arg_parser = ArgumentParser(description="Parses DMARC and SMTP TLS reports")
     arg_parser.add_argument(
         "-c",
         "--config-file",
@@ -1940,8 +2779,15 @@ def _main():
     arg_parser.add_argument(
         "file_path",
         nargs="*",
-        help="one or more paths to aggregate or failure "
-        "report files, emails, or mbox files'",
+        help="one or more paths to aggregate, failure, or SMTP TLS report "
+        "files, emails, mbox files, or directories containing them",
+    )
+    arg_parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="search directories given as file_path recursively, and "
+        "enable '**' recursion in glob patterns",
     )
     strip_attachment_help = "remove attachment payloads from failure report output"
     arg_parser.add_argument(
@@ -1981,11 +2827,16 @@ def _main():
         default="smtp_tls.csv",
     )
     arg_parser.add_argument(
-        "-n", "--nameservers", nargs="+", help="nameservers to query"
+        "-n",
+        "--nameservers",
+        nargs="+",
+        help="nameservers to query: IP addresses, https:// URLs (DNS over "
+        "HTTPS), and/or tls://ip[:port][#hostname] (DNS over TLS)",
     )
     arg_parser.add_argument(
         "-t",
         "--dns_timeout",
+        "--dns-timeout",
         help="number of seconds to wait for an answer from DNS (default: 2.0)",
         type=float,
         default=2.0,
@@ -2001,7 +2852,7 @@ def _main():
     arg_parser.add_argument(
         "--offline",
         action="store_true",
-        help="do not make online queries for geolocation  or  DNS",
+        help="do not make online queries for geolocation or DNS",
     )
     arg_parser.add_argument(
         "-s", "--silent", action="store_true", help="only print errors"
@@ -2061,9 +2912,17 @@ def _main():
         mailbox_archive_folder="Archive",
         mailbox_watch=False,
         mailbox_delete=False,
+        # None means "unset": each per-report-type flag inherits mailbox_delete
+        # in get_dmarc_reports_from_mailbox, so an explicit False (opting one
+        # type out of a global delete = true) stays distinct from being unset.
+        mailbox_delete_aggregate=None,
+        mailbox_delete_failure=None,
+        mailbox_delete_smtp_tls=None,
+        mailbox_delete_invalid=None,
         mailbox_test=False,
         mailbox_batch_size=10,
         mailbox_check_timeout=30,
+        mailbox_max_unsaved_retries=2,
         mailbox_since=None,
         imap_host=None,
         imap_skip_certificate_verification=False,
@@ -2136,6 +2995,7 @@ def _main():
         smtp_from=None,
         smtp_to=[],
         smtp_subject="parsedmarc report",
+        smtp_attachment=None,
         smtp_message="Please see the attached DMARC results.",
         s3_bucket=None,
         s3_path=None,
@@ -2164,6 +3024,7 @@ def _main():
         maildir_create=False,
         log_file=args.log_file,
         n_procs=1,
+        archive_directory=None,
         ip_db_path=None,
         ipinfo_url=None,
         ipinfo_api_token=None,
@@ -2216,7 +3077,7 @@ def _main():
             index_prefix_domain_map = _parse_config(config, opts)
         except ConfigurationError as e:
             logger.critical(str(e))
-            exit(-1)
+            sys.exit(-1)
 
     logger.setLevel(logging.ERROR)
 
@@ -2226,6 +3087,12 @@ def _main():
         logger.setLevel(logging.INFO)
     if opts.debug:
         logger.setLevel(logging.DEBUG)
+    # The log file currently being written -- what a SIGHUP reload compares
+    # the new config's log_file against. None when no file is attached,
+    # including when the configured one could not be opened, so that a
+    # reload naming the same path tries again once the operator has fixed
+    # it.
+    opts.active_log_file = None
     if opts.log_file:
         try:
             fh = logging.FileHandler(opts.log_file, "a")
@@ -2234,10 +3101,9 @@ def _main():
             )
             fh.setFormatter(formatter)
             logger.addHandler(fh)
+            opts.active_log_file = opts.log_file
         except Exception as error:
-            logger.warning("Unable to write to log file: {}".format(error))
-
-    opts.active_log_file = opts.log_file
+            logger.warning(f"Unable to write to log file: {error}")
     _configure_dependency_logging(logger.level)
 
     if (
@@ -2248,7 +3114,7 @@ def _main():
         and len(opts.file_path) == 0
     ):
         logger.error("You must supply input files or a mailbox connection")
-        exit(1)
+        sys.exit(1)
 
     logger.info("Starting parsedmarc")
 
@@ -2264,7 +3130,7 @@ def _main():
             configure_ipinfo_api(opts.ipinfo_api_token)
         except InvalidIPinfoAPIKey as e:
             logger.critical(str(e))
-            exit(1)
+            sys.exit(1)
 
     load_psl_overrides(
         always_use_local_file=opts.always_use_local_files,
@@ -2279,11 +3145,13 @@ def _main():
     retry_delay = 5
     for attempt in range(max_retries + 1):
         try:
-            clients = _init_output_clients(opts)
+            clients = _init_output_clients(
+                opts, index_prefix_domain_map=index_prefix_domain_map
+            )
             break
         except ConfigurationError as e:
             logger.critical(str(e))
-            exit(1)
+            sys.exit(1)
         except Exception as error_:
             if attempt < max_retries:
                 logger.warning(
@@ -2296,11 +3164,11 @@ def _main():
                 time.sleep(retry_delay)
                 retry_delay *= 2
             else:
-                logger.error("Output client error: {0}".format(error_))
-                exit(1)
+                logger.error(f"Output client error: {error_}")
+                sys.exit(1)
 
     # Always close output clients on the way out (normal return,
-    # exit(N), uncaught exception, or SystemExit from a signal-driven
+    # sys.exit(N), uncaught exception, or SystemExit from a signal-driven
     # shutdown). atexit does NOT fire on os._exit(130) — that's
     # intentional for the SIGINT double-tap. The lambda closes whatever
     # `clients` currently points at, so a SIGHUP reload that swaps the
@@ -2339,7 +3207,9 @@ def _main():
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    file_paths = _expand_file_path_args(args.file_path)
+    file_paths = _expand_file_path_args(args.file_path, recursive=args.recursive)
+    if opts.archive_directory:
+        file_paths = _exclude_archived_paths(file_paths, opts.archive_directory)
     mbox_paths = []
 
     for file_path in file_paths:
@@ -2352,133 +3222,74 @@ def _main():
     for mbox_path in mbox_paths:
         file_paths.remove(mbox_path)
 
-    counter = 0
-
-    results = []
-
     pbar = None
-    if sys.stdout.isatty():
+    if sys.stderr.isatty() and len(file_paths) > 0:
         pbar = tqdm(total=len(file_paths))
 
     n_procs = int(opts.n_procs or 1)
     if n_procs < 1:
         n_procs = 1
 
-    # Capture the current log level to pass to child processes
-    current_log_level = logger.level
-    current_log_file = opts.log_file
+    parser_config = _build_parser_config(opts)
 
-    for batch_index in range((len(file_paths) + n_procs - 1) // n_procs):
-        # Honor a shutdown request between batches before spawning the
-        # next pool. Anything already parsed is still in `results` and
-        # will go through process_reports() in the cleanup path so we
-        # don't lose work the operator already paid for.
-        if _shutdown_requested:
-            logger.info(
-                "Shutdown requested, stopping file processing after %d batch(es)",
-                batch_index,
-            )
-            break
-
-        processes = []
-        connections = []
-
-        for proc_index in range(n_procs * batch_index, n_procs * (batch_index + 1)):
-            if proc_index >= len(file_paths):
-                break
-
-            parent_conn, child_conn = Pipe()
-            connections.append(parent_conn)
-
-            process = Process(
-                target=cli_parse,
-                args=(
-                    file_paths[proc_index],
-                    opts.strip_attachment_payloads,
-                    opts.nameservers,
-                    opts.dns_timeout,
-                    opts.dns_retries,
-                    opts.ip_db_path,
-                    opts.offline,
-                    opts.always_use_local_files,
-                    opts.reverse_dns_map_path,
-                    opts.reverse_dns_map_url,
-                    opts.normalize_timespan_threshold_hours,
-                    child_conn,
-                    current_log_level,
-                    current_log_file,
-                ),
-            )
-            processes.append(process)
-
-        for proc in processes:
-            proc.start()
-
-        for conn in connections:
-            results.append(conn.recv())
-
-        for proc in processes:
-            proc.join()
-            if pbar is not None:
-                counter += 1
-                pbar.update(1)
-
-    if pbar is not None:
-        pbar.close()
-
-    for result in results:
-        if isinstance(result[0], ParserError) or result[0] is None:
-            logger.error("Failed to parse {0} - {1}".format(result[1], result[0]))
+    func = functools.partial(_parse_report_file_job, config=parser_config)
+    for file_path, result in parallel_map(
+        func, file_paths, n_procs, should_stop=lambda: _shutdown_requested
+    ):
+        if pbar is not None:
+            pbar.update(1)
+        if isinstance(result, Exception):
+            logger.error(f"Failed to parse {file_path} - {result}")
         else:
-            if result[0]["report_type"] == "aggregate":
-                report_org = result[0]["report"]["report_metadata"]["org_name"]
-                report_id = result[0]["report"]["report_metadata"]["report_id"]
+            if result["report_type"] == "aggregate":
+                report_org = result["report"]["report_metadata"]["org_name"]
+                report_id = result["report"]["report_metadata"]["report_id"]
                 report_key = f"{report_org}_{report_id}"
                 if report_key not in SEEN_AGGREGATE_REPORT_IDS:
                     SEEN_AGGREGATE_REPORT_IDS[report_key] = True
-                    aggregate_reports.append(result[0]["report"])
+                    aggregate_reports.append(result["report"])
                 else:
                     logger.debug(
                         "Skipping duplicate aggregate report "
                         f"from {report_org} with ID: {report_id}"
                     )
-            elif result[0]["report_type"] == "failure":
-                failure_reports.append(result[0]["report"])
-            elif result[0]["report_type"] == "smtp_tls":
-                smtp_tls_reports.append(result[0]["report"])
+            elif result["report_type"] == "failure":
+                failure_reports.append(result["report"])
+            elif result["report_type"] == "smtp_tls":
+                smtp_tls_reports.append(result["report"])
+        if opts.archive_directory:
+            _archive_processed_file(file_path, opts.archive_directory, result)
+
+    if pbar is not None:
+        pbar.close()
+
+    if _shutdown_requested:
+        # Anything already parsed is still in aggregate_reports /
+        # failure_reports / smtp_tls_reports and will go through
+        # process_reports() in the cleanup path so we don't lose work
+        # the operator already paid for.
+        logger.info("Shutdown requested, stopping file processing early")
 
     for mbox_path in mbox_paths:
         if _shutdown_requested:
             logger.info("Shutdown requested, skipping remaining mbox files")
             break
-        normalize_timespan_threshold_hours_value = (
-            float(opts.normalize_timespan_threshold_hours)
-            if opts.normalize_timespan_threshold_hours is not None
-            else 24.0
-        )
-        strip = opts.strip_attachment_payloads
         reports = get_dmarc_reports_from_mbox(
             mbox_path,
-            nameservers=opts.nameservers,
-            dns_timeout=opts.dns_timeout,
-            dns_retries=opts.dns_retries,
-            strip_attachment_payloads=strip,
-            ip_db_path=opts.ip_db_path,
-            always_use_local_files=opts.always_use_local_files,
-            reverse_dns_map_path=opts.reverse_dns_map_path,
-            reverse_dns_map_url=opts.reverse_dns_map_url,
-            offline=opts.offline,
-            normalize_timespan_threshold_hours=normalize_timespan_threshold_hours_value,
+            config=parser_config,
+            n_procs=n_procs,
         )
         aggregate_reports += reports["aggregate_reports"]
         failure_reports += reports["failure_reports"]
         smtp_tls_reports += reports["smtp_tls_reports"]
 
-    # Snapshot of the file/mbox-derived reports only, before the mailbox
+    # Snapshot of the file/mbox-derived reports, taken before the mailbox
     # block below appends anything fetched from a live mailbox connection.
-    # Mailbox-derived reports are saved via mailbox_save_callback before
-    # get_dmarc_reports_from_mailbox() even returns, so re-saving them here
-    # via the final process_reports() call would duplicate that save.
+    # Mailbox batches are handed to process_reports() by
+    # mailbox_save_callback() before get_dmarc_reports_from_mailbox() even
+    # returns -- that is what lets it decide whether archiving is safe -- so
+    # the final process_reports() call runs on this snapshot only, or the
+    # mailbox-derived reports would be saved twice.
     file_parsing_results: ParsingResults = {
         "aggregate_reports": list(aggregate_reports),
         "failure_reports": list(failure_reports),
@@ -2489,7 +3300,7 @@ def _main():
     msgraph_connection: MSGraphConnection | None = None
     mailbox_batch_size_value = 10
     mailbox_check_timeout_value = 30
-    normalize_timespan_threshold_hours_value = 24.0
+    mailbox_max_unsaved_retries_value = 2
 
     if opts.imap_host:
         try:
@@ -2497,7 +3308,7 @@ def _main():
                 logger.error(
                     "IMAP user and password must be specified if host is specified"
                 )
-                exit(1)
+                sys.exit(1)
 
             ssl = True
             verify = True
@@ -2527,7 +3338,7 @@ def _main():
 
         except Exception:
             logger.exception("IMAP Error")
-            exit(1)
+            sys.exit(1)
 
     if opts.graph_client_id:
         try:
@@ -2593,13 +3404,27 @@ def _main():
                 tenant_id=opts.graph_tenant_id,
                 auth_method=opts.graph_auth_method,
             )
-            exit(1)
+            sys.exit(1)
         except Exception:
             logger.exception("MS Graph Error")
-            exit(1)
+            sys.exit(1)
 
     if opts.gmail_api_credentials_file:
-        if opts.mailbox_delete:
+        # Any effective delete flag needs the deletion scope: the per-report-type
+        # flags inherit mailbox_delete when unset (None), so this reduces to
+        # mailbox_delete alone when none of them is set. The scope is a
+        # mailbox-wide capability grant rather than a per-type one, so when it
+        # is missing every flag is turned off explicitly.
+        per_type_delete_opts = (
+            "mailbox_delete_aggregate",
+            "mailbox_delete_failure",
+            "mailbox_delete_smtp_tls",
+            "mailbox_delete_invalid",
+        )
+        if any(
+            opts.mailbox_delete if getattr(opts, name) is None else getattr(opts, name)
+            for name in per_type_delete_opts
+        ):
             if "https://mail.google.com/" not in opts.gmail_api_scopes:
                 logger.error(
                     "Message deletion requires scope"
@@ -2608,6 +3433,8 @@ def _main():
                     "to acquire proper access."
                 )
                 opts.mailbox_delete = False
+                for name in per_type_delete_opts:
+                    setattr(opts, name, False)
 
         try:
             mailbox_connection = GmailConnection(
@@ -2624,7 +3451,7 @@ def _main():
 
         except Exception:
             logger.exception("Gmail API Error")
-            exit(1)
+            sys.exit(1)
 
     if opts.maildir_path:
         try:
@@ -2634,7 +3461,7 @@ def _main():
             )
         except Exception:
             logger.exception("Maildir Error")
-            exit(1)
+            sys.exit(1)
 
     if mailbox_connection:
         mailbox_batch_size_value = (
@@ -2645,18 +3472,25 @@ def _main():
             if opts.mailbox_check_timeout is not None
             else 30
         )
-        normalize_timespan_threshold_hours_value = (
-            float(opts.normalize_timespan_threshold_hours)
-            if opts.normalize_timespan_threshold_hours is not None
-            else 24.0
+        mailbox_max_unsaved_retries_value = (
+            int(opts.mailbox_max_unsaved_retries)
+            if opts.mailbox_max_unsaved_retries is not None
+            else 2
         )
 
     def mailbox_save_callback(batch: ParsingResults) -> bool:
-        """Adapter passed as save_callback to get_dmarc_reports_from_mailbox()
-        and as the callback to watch_inbox(): reports are considered
-        persisted only when process_reports() recorded no output errors for
-        this batch, so a sink outage leaves the batch's messages in the
-        mailbox for retry instead of archiving/deleting them."""
+        """Save one mailbox batch and report whether it actually landed.
+
+        Passed to ``get_dmarc_reports_from_mailbox()`` as ``save_callback``
+        and to ``watch_inbox()`` as its ``callback``. Returning ``False``
+        when any output destination failed keeps that batch's messages in
+        the mailbox to be retried, instead of archiving or deleting reports
+        that were never persisted anywhere (#242). With
+        ``fail_on_output_error`` enabled it never returns ``False``:
+        ``process_reports()`` raises ``ParserError`` instead, which the
+        library treats as "unsaved" too (same retention and retry-cap
+        bookkeeping) before the exception propagates back out here.
+        """
         return not process_reports(batch)
 
     if mailbox_connection and not _shutdown_requested:
@@ -2664,21 +3498,19 @@ def _main():
             reports = get_dmarc_reports_from_mailbox(
                 connection=mailbox_connection,
                 delete=opts.mailbox_delete,
+                delete_aggregate=opts.mailbox_delete_aggregate,
+                delete_failure=opts.mailbox_delete_failure,
+                delete_smtp_tls=opts.mailbox_delete_smtp_tls,
+                delete_invalid=opts.mailbox_delete_invalid,
                 batch_size=mailbox_batch_size_value,
                 reports_folder=opts.mailbox_reports_folder,
                 archive_folder=opts.mailbox_archive_folder,
-                ip_db_path=opts.ip_db_path,
-                always_use_local_files=opts.always_use_local_files,
-                reverse_dns_map_path=opts.reverse_dns_map_path,
-                reverse_dns_map_url=opts.reverse_dns_map_url,
-                offline=opts.offline,
-                nameservers=opts.nameservers,
                 test=opts.mailbox_test,
-                strip_attachment_payloads=opts.strip_attachment_payloads,
                 since=opts.mailbox_since,
-                dns_retries=opts.dns_retries,
-                normalize_timespan_threshold_hours=normalize_timespan_threshold_hours_value,
+                config=parser_config,
+                n_procs=n_procs,
                 save_callback=mailbox_save_callback,
+                max_unsaved_retries=mailbox_max_unsaved_retries_value,
             )
 
             aggregate_reports += reports["aggregate_reports"]
@@ -2686,26 +3518,32 @@ def _main():
             smtp_tls_reports += reports["smtp_tls_reports"]
 
         except ParserError as error:
+            # fail_on_output_error turns a failed batch save into a
+            # ParserError inside mailbox_save_callback; it reaches here
+            # through get_dmarc_reports_from_mailbox, which leaves the
+            # batch's messages in the mailbox on its way out.
             logger.error(error.__str__())
-            exit(1)
+            sys.exit(1)
         except (ClientAuthenticationError, APIError, httpx.HTTPError) as error:
-            _log_msgraph_failure(
-                error,
-                stage="mailbox fetch",
-                mailbox=opts.graph_mailbox or opts.graph_user,
-                tenant_id=opts.graph_tenant_id,
-                auth_method=opts.graph_auth_method,
-            )
-            exit(1)
+            if msgraph_connection is None:
+                logger.exception("Mailbox Error")
+            else:
+                _log_msgraph_failure(
+                    error,
+                    stage="mailbox fetch",
+                    mailbox=opts.graph_mailbox or opts.graph_user,
+                    tenant_id=opts.graph_tenant_id,
+                    auth_method=opts.graph_auth_method,
+                )
+            sys.exit(1)
         except Exception:
             logger.exception("Mailbox Error")
-            exit(1)
+            sys.exit(1)
 
-    # Filtered independently of the process_reports() calls above: those
-    # mutate copies of smtp_tls_reports (file_parsing_results / mailbox
-    # batches), so parsing_results - which shares the original list objects
-    # and feeds only email_results() below - would otherwise still include
-    # SMTP TLS reports that index_prefix_domain_map excluded from output.
+    # Filtered here rather than relying on process_reports()'s in-place
+    # filtering: the dicts it filters are the file snapshot and the mailbox
+    # batches, not this combined dict, which exists only to feed
+    # email_results() / email_results_via_msgraph() below.
     parsing_results: ParsingResults = {
         "aggregate_reports": aggregate_reports,
         "failure_reports": failure_reports,
@@ -2717,23 +3555,32 @@ def _main():
         or file_parsing_results["failure_reports"]
         or file_parsing_results["smtp_tls_reports"]
     )
-    # Mailbox-derived reports were already saved via mailbox_save_callback
-    # above; only file/mbox-derived reports still need saving here. Skip
-    # the call entirely when there are none and a mailbox connection was
-    # used, to avoid printing a second, empty JSON blob in that case.
+    # Mailbox-derived reports were already saved by mailbox_save_callback;
+    # only file/mbox-derived reports are left to save here. With a mailbox
+    # connection and nothing from files, skip the call entirely so the run
+    # doesn't print a second, empty JSON blob.
     if file_results_nonempty or not mailbox_connection:
         try:
             process_reports(file_parsing_results)
         except ParserError as error:
             logger.error(error.__str__())
-            exit(1)
+            sys.exit(1)
 
     smtp_to_value = (
         list(opts.smtp_to)
         if isinstance(opts.smtp_to, list)
         else _str_to_list(str(opts.smtp_to))
     )
-    if opts.smtp_host:
+    has_reports = bool(
+        parsing_results["aggregate_reports"]
+        or parsing_results["failure_reports"]
+        or parsing_results["smtp_tls_reports"]
+    )
+    if not has_reports and (
+        opts.smtp_host or (msgraph_connection is not None and smtp_to_value)
+    ):
+        logger.info("No reports were parsed; skipping the results email")
+    elif opts.smtp_host:
         try:
             verify = True
             if opts.smtp_skip_certificate_verification:
@@ -2750,10 +3597,12 @@ def _main():
                 password=opts.smtp_password,
                 subject=opts.smtp_subject,
                 require_encryption=opts.smtp_ssl,
+                attachment_filename=opts.smtp_attachment,
+                message=opts.smtp_message,
             )
         except Exception:
             logger.exception("Failed to email results")
-            exit(1)
+            sys.exit(1)
     elif msgraph_connection is not None and smtp_to_value:
         try:
             email_results_via_msgraph(
@@ -2761,6 +3610,8 @@ def _main():
                 msgraph_connection,
                 smtp_to_value,
                 subject=opts.smtp_subject,
+                attachment_filename=opts.smtp_attachment,
+                message=opts.smtp_message,
             )
         except (ClientAuthenticationError, APIError, httpx.HTTPError) as error:
             _log_msgraph_failure(
@@ -2770,10 +3621,10 @@ def _main():
                 tenant_id=opts.graph_tenant_id,
                 auth_method=opts.graph_auth_method,
             )
-            exit(1)
+            sys.exit(1)
         except Exception:
             logger.exception("Failed to email results via Microsoft Graph")
-            exit(1)
+            sys.exit(1)
 
     if mailbox_connection and opts.mailbox_watch:
         logger.info("Watching for email - Ctrl-C once to quit, twice to force")
@@ -2796,37 +3647,37 @@ def _main():
                     reports_folder=opts.mailbox_reports_folder,
                     archive_folder=opts.mailbox_archive_folder,
                     delete=opts.mailbox_delete,
+                    delete_aggregate=opts.mailbox_delete_aggregate,
+                    delete_failure=opts.mailbox_delete_failure,
+                    delete_smtp_tls=opts.mailbox_delete_smtp_tls,
+                    delete_invalid=opts.mailbox_delete_invalid,
                     test=opts.mailbox_test,
                     check_timeout=mailbox_check_timeout_value,
-                    nameservers=opts.nameservers,
-                    dns_timeout=opts.dns_timeout,
-                    dns_retries=opts.dns_retries,
-                    strip_attachment_payloads=opts.strip_attachment_payloads,
                     batch_size=mailbox_batch_size_value,
                     since=opts.mailbox_since,
-                    ip_db_path=opts.ip_db_path,
-                    always_use_local_files=opts.always_use_local_files,
-                    reverse_dns_map_path=opts.reverse_dns_map_path,
-                    reverse_dns_map_url=opts.reverse_dns_map_url,
-                    offline=opts.offline,
-                    normalize_timespan_threshold_hours=normalize_timespan_threshold_hours_value,
+                    config=parser_config,
                     config_reloading=lambda: _reload_requested or _shutdown_requested,
+                    n_procs=n_procs,
+                    max_unsaved_retries=mailbox_max_unsaved_retries_value,
                 )
             except FileExistsError as error:
-                logger.error("{0}".format(error.__str__()))
-                exit(1)
+                logger.error(f"{error.__str__()}")
+                sys.exit(1)
             except ParserError as error:
                 logger.error(error.__str__())
-                exit(1)
+                sys.exit(1)
             except (ClientAuthenticationError, APIError, httpx.HTTPError) as error:
-                _log_msgraph_failure(
-                    error,
-                    stage="mailbox watch",
-                    mailbox=opts.graph_mailbox or opts.graph_user,
-                    tenant_id=opts.graph_tenant_id,
-                    auth_method=opts.graph_auth_method,
-                )
-                exit(1)
+                if msgraph_connection is None:
+                    logger.exception("Mailbox Error")
+                else:
+                    _log_msgraph_failure(
+                        error,
+                        stage="mailbox watch",
+                        mailbox=opts.graph_mailbox or opts.graph_user,
+                        tenant_id=opts.graph_tenant_id,
+                        auth_method=opts.graph_auth_method,
+                    )
+                sys.exit(1)
 
             # Prioritize shutdown over reload if both flags are set (e.g.
             # SIGHUP followed by SIGTERM). atexit closes output clients.
@@ -2844,25 +3695,107 @@ def _main():
             logger.info("SIGHUP received, config will reload after current batch")
             _reload_requested = False
             logger.info("Reloading configuration...")
+            # Both snapshots are taken before the try, because the rollback
+            # in the handler needs them and neither can fail: taking the
+            # search snapshot only resolves an alias (KeyError caught) and
+            # reads elastic._SERVERLESS, and taking the utils snapshot only
+            # copies three module attributes.
+            previous_search_state = _search_alias_snapshot()
+            previous_utils_state = _utils_globals_snapshot()
+            # Also bound before the try: the rollback closes whatever was
+            # built, and an empty dict makes that a no-op when the failure
+            # came before (or from inside) _init_output_clients().
+            new_clients: dict[str, Any] = {}
+            # Bound before the try for the same reason: the rollback closes
+            # the replacement log file handler if phase 1 opened one, and
+            # ``None`` means there is nothing to close.
+            staged_log_handler: logging.FileHandler | None = None
             try:
+                # Phase 1 -- stage every fallible step off to the side.
+                # Nothing the running configuration reads is written here,
+                # so any failure below is recoverable by the handler.
+                #
                 # Build a fresh opts starting from CLI-only defaults so that
                 # sections removed from the config file actually take effect.
                 new_opts = Namespace(**vars(opts_from_cli))
                 new_config = _load_config(config_file)
                 new_index_prefix_domain_map = _parse_config(new_config, new_opts)
-                new_clients = _init_output_clients(new_opts)
+                new_clients = _init_output_clients(
+                    new_opts, index_prefix_domain_map=new_index_prefix_domain_map
+                )
 
-                # All steps succeeded — commit the changes atomically.
-                _close_output_clients(clients)
-                clients = new_clients
-                index_prefix_domain_map = new_index_prefix_domain_map
+                # Derived values first, because they are the cheapest steps
+                # to fail and the only ones that write nothing at all: they
+                # read new_opts and nothing else. int() raises on a
+                # non-numeric value, and running that before the loaders
+                # keeps such a failure from reaching load_ip_db(), whose
+                # download is the one part of phase 1 with a side effect
+                # outside this process (see the rollback comment).
+                new_parser_config = _build_parser_config(new_opts)
+                new_batch_size = (
+                    int(new_opts.mailbox_batch_size)
+                    if new_opts.mailbox_batch_size is not None
+                    else 10
+                )
+                new_check_timeout = (
+                    int(new_opts.mailbox_check_timeout)
+                    if new_opts.mailbox_check_timeout is not None
+                    else 30
+                )
+                new_max_unsaved_retries = (
+                    int(new_opts.mailbox_max_unsaved_retries)
+                    if new_opts.mailbox_max_unsaved_retries is not None
+                    else 2
+                )
+
+                # Open the replacement log file, if the config names a
+                # different one. Opening it is the one thing in the logging
+                # refresh that can fail on a bad path, and constructing the
+                # handler opens the file immediately (FileHandler's default
+                # ``delay=False``), so opening it here is what leaves phase
+                # 2 with nothing fallible to do but the close. Nothing in
+                # the running configuration is touched: the handler is not
+                # attached to the logger until the commit. It sits before
+                # the loaders because its only side effect outside this
+                # process is opening the new log file for append, which is
+                # smaller than load_ip_db()'s download.
+                #
+                # ``opts`` is still the pre-reload namespace here -- phase 2
+                # is what copies new_opts onto it -- which is deliberate:
+                # the comparison is between the file being written now and
+                # the one the new config names.
+                #
+                # Note the asymmetry with startup, where an unwritable log
+                # file is only a warning: there is no previous configuration
+                # to keep there. Here there is, so it is a reload failure --
+                # and the traceback lands in the old log file, which is
+                # still attached.
+                old_log_file = getattr(opts, "active_log_file", None)
+                new_log_file = new_opts.log_file
+                if old_log_file != new_log_file and new_log_file:
+                    staged_log_handler = logging.FileHandler(new_log_file, "a")
+                    staged_log_handler.setFormatter(
+                        logging.Formatter(
+                            "%(asctime)s - %(levelname)s"
+                            " - [%(filename)s:%(lineno)d] - %(message)s"
+                        )
+                    )
 
                 # Reload the reverse DNS map so changes to the
                 # map path/URL in the config take effect. PSL overrides
                 # are reloaded alongside it so map entries that depend on
                 # a folded base domain keep working.
+                #
+                # Into a fresh dict, not REVERSE_DNS_MAP: load_reverse_dns_map()
+                # clears the dict it is handed before it has read anything, so
+                # loading straight into the live map would empty it and leave
+                # it empty if the read then failed. The overrides list has no
+                # such seam -- load_psl_overrides() clears and repopulates one
+                # module-level list in place -- which is what the utils
+                # snapshot above is for.
+                staged_reverse_dns_map: ReverseDNSMap = {}
                 load_reverse_dns_map(
-                    REVERSE_DNS_MAP,
+                    staged_reverse_dns_map,
                     always_use_local_file=new_opts.always_use_local_files,
                     local_file_path=new_opts.reverse_dns_map_path,
                     url=new_opts.reverse_dns_map_url,
@@ -2872,7 +3805,11 @@ def _main():
                 )
 
                 # Reload the IP database so changes to the
-                # db path/URL in the config take effect.
+                # db path/URL in the config take effect. Assigns
+                # parsedmarc.utils._IP_DB_PATH, which the utils snapshot
+                # covers, and -- when the download succeeds -- rewrites the
+                # shared cache file, which nothing can cover. Last but one
+                # for that reason.
                 load_ip_db(
                     always_use_local_file=new_opts.always_use_local_files,
                     local_file_path=new_opts.ip_db_path,
@@ -2880,36 +3817,160 @@ def _main():
                     offline=new_opts.offline,
                 )
 
-                # Re-apply IPinfo API settings. Passing a falsy token disables
-                # the API; a rotated token picks up here too. An invalid token
-                # is fatal even on reload — the operator asked for it.
+                # Re-apply IPinfo API settings, last, because an invalid
+                # token is fatal even on reload -- the operator asked for it
+                # -- and nothing should have to be unwound behind it.
+                # Passing a falsy token disables the API; a rotated token
+                # picks up here too. The exit is a SystemExit, not an
+                # Exception: it deliberately skips the rollback below,
+                # because the process is leaving.
                 try:
                     configure_ipinfo_api(
                         new_opts.ipinfo_api_token if not new_opts.offline else None,
                     )
                 except InvalidIPinfoAPIKey as e:
                     logger.critical(str(e))
-                    exit(1)
+                    sys.exit(1)
+            except Exception:
+                # Rollback. Everything phase 1 wrote in this process is
+                # covered by the two snapshots -- the search backends'
+                # ``default`` alias and ``elastic._SERVERLESS`` (both
+                # through _init_output_clients), and the three
+                # parsedmarc.utils globals the loaders assign -- and all of
+                # it is put back here, in that order.
+                #
+                # One side effect is outside them and cannot be undone: a
+                # load_ip_db() whose download succeeds rewrites the shared
+                # cache file at <tmp>/parsedmarc/ipinfo_lite.mmdb before it
+                # assigns _IP_DB_PATH. Phase 1 runs that step last but one
+                # so that as little as possible can fail behind it, and the
+                # file it leaves is the same refresh startup performs on
+                # every launch -- the configured URL's current database --
+                # so the cost of not undoing it is bounded to that.
+                #
+                # ``Exception``, where _init_output_clients catches
+                # ``BaseException`` (#906): that function also runs at
+                # startup, before the signal handlers exist, so a Ctrl-C can
+                # land inside it. Here it cannot -- watch mode has replaced
+                # SIGINT with a handler that sets a flag and, on a second
+                # press, calls os._exit(130) -- and the one BaseException
+                # that does reach this point, the SystemExit from an invalid
+                # IPinfo token, must not be rolled back.
+                #
+                # The staged log file handler, if one was opened, is closed
+                # here too, best-effort: it was never attached to the
+                # logger, so no record ever reached it and there is
+                # nothing buffered to lose, but the close itself can still
+                # raise (a full disk, a stale network mount), and that
+                # error is logged and swallowed so it cannot skip the two
+                # restores below it.
+                #
+                # Close the new clients *before* restoring the alias, never
+                # after: a fully built _ElasticsearchHandle owns the new
+                # client and releases the alias as it closes, so closing
+                # first leaves the alias unset for the restore to re-register
+                # the old client into. Restoring first would hand the alias
+                # back and then close the handle, which would be safe only
+                # because of how _ElasticsearchHandle.close() happens to
+                # behave today (see _init_output_clients, and #902).
+                #
+                # Per-step end state, reading down phase 1 -- in every case
+                # `clients` is still the old dict with every old client open,
+                # REVERSE_DNS_MAP still holds the pre-reload entries (it was
+                # never handed to the loader), and opts, parser_config and
+                # the three watch parameters are untouched, because all of
+                # those are written in phase 2:
+                #
+                # _load_config / _parse_config: no state written yet.
+                #   new_clients is still {}, so the close is a no-op; the
+                #   alias and the utils globals still hold what the snapshots
+                #   recorded, so both restores are no-ops too.
+                # _init_output_clients: rolled itself back before re-raising
+                #   (#906), and never assigned new_clients, so this is the
+                #   same no-op pair -- restoring an unchanged snapshot twice
+                #   is harmless.
+                # _build_parser_config / the int() conversions: the new
+                #   clients hold the alias, so they are closed and the old
+                #   client is registered again. The utils globals were not
+                #   reached, so their restore is still a no-op.
+                # The log file open: as above, and the handler was never
+                #   attached to the logger, so it has nothing buffered to
+                #   lose -- the logger still holds the old FileHandler,
+                #   which phase 2 never got to remove. The close itself is
+                #   best-effort (logged and swallowed), so a close that
+                #   fails cannot skip the two restores below it.
+                # load_reverse_dns_map: as above, plus psl_overrides, which
+                #   load_psl_overrides() cleared and may have refilled from
+                #   the new config; restoring it by value is load-bearing
+                #   here, and the staged map dict is simply dropped.
+                # load_ip_db: as above. Each of its four assignments to
+                #   _IP_DB_PATH is the last thing on its path -- three are
+                #   followed by a return and the fourth, the bundled
+                #   fallback, by a log line and the end of the function --
+                #   so a raise from this loader leaves it unchanged.
+                # configure_ipinfo_api: the last step, so a _IP_DB_PATH or
+                #   _IPINFO_API_TOKEN that differs from the snapshot can
+                #   only be rolled back from here. In practice this may be
+                #   unreachable: the documented failure is
+                #   InvalidIPinfoAPIKey, which exits above without rolling
+                #   back, and _ipinfo_api_lookup() swallows every network
+                #   and decoding error. Those two restores are therefore
+                #   defensive -- a rollback's job is to leave state as it
+                #   found it, and whatever step is added after this one
+                #   makes them load-bearing again. _utils_globals_snapshot's
+                #   own tests are what guard them.
+                _close_output_clients(new_clients)
+                if staged_log_handler is not None:
+                    try:
+                        staged_log_handler.close()
+                    except Exception as close_error:
+                        logger.warning(
+                            "Unable to close the log file opened for the "
+                            f"reload: {close_error}"
+                        )
+                _restore_search_aliases(previous_search_state)
+                _restore_utils_globals(previous_utils_state)
+                logger.exception(
+                    "Config reload failed, continuing with previous config"
+                )
+            else:
+                # Phase 2 -- all steps succeeded; commit the changes
+                # atomically. Nothing from here to the end of this block may
+                # raise, since there is no going back once the first
+                # statement lands: the commit itself is assignments only, and
+                # the logging refresh that follows it guards the one call
+                # that can fail, closing the replaced log file -- the
+                # replacement was opened back in phase 1. That is also why
+                # this is an ``else`` and not the tail of the ``try`` -- a
+                # rollback running over committed state would close the
+                # clients that are now live.
+                # In place, never rebound. Rebinding would only move this
+                # module's own name -- cli.py imports REVERSE_DNS_MAP from
+                # parsedmarc, so `REVERSE_DNS_MAP = staged` here would
+                # desync it from parsedmarc.REVERSE_DNS_MAP and from
+                # config.REVERSE_DNS_MAP, which is the object
+                # ParserConfig.__setstate__ rebinds to when a worker
+                # unpickles a config. The configs that name this dict are
+                # built elsewhere and keep whichever object they were given:
+                # _build_parser_config() and parsedmarc._resolve_config()
+                # pass it explicitly (the dataclass field's own default is a
+                # fresh dict, via default_factory), and new_parser_config
+                # was built back in phase 1 holding the pre-reload object.
+                REVERSE_DNS_MAP.clear()
+                REVERSE_DNS_MAP.update(staged_reverse_dns_map)
 
                 for k, v in vars(new_opts).items():
                     setattr(opts, k, v)
 
+                old_clients = clients
+                clients = new_clients
+                index_prefix_domain_map = new_index_prefix_domain_map
+                parser_config = new_parser_config
+
                 # Update watch parameters from reloaded config
-                mailbox_batch_size_value = (
-                    int(opts.mailbox_batch_size)
-                    if opts.mailbox_batch_size is not None
-                    else 10
-                )
-                mailbox_check_timeout_value = (
-                    int(opts.mailbox_check_timeout)
-                    if opts.mailbox_check_timeout is not None
-                    else 30
-                )
-                normalize_timespan_threshold_hours_value = (
-                    float(opts.normalize_timespan_threshold_hours)
-                    if opts.normalize_timespan_threshold_hours is not None
-                    else 24.0
-                )
+                mailbox_batch_size_value = new_batch_size
+                mailbox_check_timeout_value = new_check_timeout
+                mailbox_max_unsaved_retries_value = new_max_unsaved_retries
 
                 # Update log level
                 logger.setLevel(logging.ERROR)
@@ -2920,42 +3981,52 @@ def _main():
                 if opts.debug:
                     logger.setLevel(logging.DEBUG)
 
-                # Refresh FileHandler if log_file changed
-                old_log_file = getattr(opts, "active_log_file", None)
-                new_log_file = opts.log_file
+                # Refresh FileHandler if log_file changed. Both names were
+                # computed in phase 1, against the configuration that was
+                # running then.
                 if old_log_file != new_log_file:
                     # Remove old FileHandlers
                     for h in list(logger.handlers):
                         if isinstance(h, logging.FileHandler):
-                            h.close()
+                            close_error = None
+                            try:
+                                h.close()
+                            except Exception as error_:
+                                # Flushing the replaced log file can fail --
+                                # a full disk, a stale network mount. The
+                                # reloaded configuration is already live by
+                                # this point, so raising would kill the
+                                # watcher over a log file, and rolling back
+                                # to report a failed reload would be a lie.
+                                close_error = error_
+                            # Detach first, then report: the handler that
+                            # just failed to close is no place to send the
+                            # record describing that failure.
                             logger.removeHandler(h)
-                    # Add new FileHandler if configured
-                    if new_log_file:
-                        try:
-                            fh = logging.FileHandler(new_log_file, "a")
-                            file_formatter = logging.Formatter(
-                                "%(asctime)s - %(levelname)s"
-                                " - [%(filename)s:%(lineno)d] - %(message)s"
-                            )
-                            fh.setFormatter(file_formatter)
-                            logger.addHandler(fh)
-                        except Exception as log_error:
-                            logger.warning(
-                                "Unable to write to log file: {}".format(log_error)
-                            )
+                            if close_error is not None:
+                                logger.warning(
+                                    f"Unable to close the log file: {close_error}"
+                                )
+                    # Attach the handler phase 1 opened, if the new
+                    # configuration names a log file at all.
+                    if staged_log_handler is not None:
+                        logger.addHandler(staged_log_handler)
                     opts.active_log_file = new_log_file
 
                 _configure_dependency_logging(logger.level)
 
+                # Phase 3 -- the new configuration is live and correct, so
+                # the clients it replaced can go. Last, and best effort:
+                # _close_output_clients() logs close errors and swallows
+                # them, so a dying connection on the way out cannot undo
+                # the commit above.
+                _close_output_clients(old_clients)
+
                 logger.info("Configuration reloaded successfully")
-            except Exception:
-                logger.exception(
-                    "Config reload failed, continuing with previous config"
-                )
 
     # Close output clients on the success path (one-shot or graceful
     # watch-loop exit). atexit-registered above is the safety net for
-    # exit(1) / uncaught-exception paths.
+    # sys.exit(1) / uncaught-exception paths.
     _close_output_clients(clients)
 
 

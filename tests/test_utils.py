@@ -8,11 +8,17 @@ import unittest
 from datetime import datetime, timezone
 from importlib.resources import files
 from tempfile import NamedTemporaryFile
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import dns.exception
+import dns.message
+import dns.nameserver
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
 import dns.resolver
-import requests
+import httpx
 from expiringdict import ExpiringDict
 
 import parsedmarc
@@ -72,9 +78,9 @@ class Test(unittest.TestCase):
         """When neither PTR nor an ASN-map entry resolves, the raw AS name
         is used as source_name with type left null — better than leaving
         the row unattributed."""
-        # 204.79.197.100 is in an ASN whose as_domain is not in the map at
-        # the time of this test (msn.com); this exercises the as_name
-        # fallback branch without depending on a specific map state.
+        # A mocked DB record whose as_domain is not in the reverse-DNS map
+        # exercises the as_name fallback branch without depending on a
+        # specific map state.
         from unittest.mock import patch
 
         with patch(
@@ -159,7 +165,7 @@ class Test(unittest.TestCase):
         def _mock_response(status_code, json_body=None):
             resp = MagicMock()
             resp.status_code = status_code
-            resp.ok = 200 <= status_code < 300
+            resp.is_success = 200 <= status_code < 300
             resp.json.return_value = json_body or {}
             return resp
 
@@ -173,7 +179,7 @@ class Test(unittest.TestCase):
                 "country_code": "US",
             }
             with patch(
-                "parsedmarc.utils.requests.get",
+                "parsedmarc.utils.httpx.get",
                 return_value=_mock_response(200, api_json),
             ) as mock_get:
                 configure_ipinfo_api("fake-token", probe=False)
@@ -188,7 +194,7 @@ class Test(unittest.TestCase):
 
             # Invalid key: 401 raises a fatal exception even on a random lookup.
             with patch(
-                "parsedmarc.utils.requests.get",
+                "parsedmarc.utils.httpx.get",
                 return_value=_mock_response(401),
             ):
                 configure_ipinfo_api("bad-token", probe=False)
@@ -198,7 +204,7 @@ class Test(unittest.TestCase):
             # Any other non-2xx (e.g. 500, 503) falls back to the MMDB silently.
             configure_ipinfo_api("fake-token", probe=False)
             with patch(
-                "parsedmarc.utils.requests.get",
+                "parsedmarc.utils.httpx.get",
                 return_value=_mock_response(500),
             ):
                 record = get_ip_address_db_record("8.8.8.8")
@@ -342,8 +348,56 @@ class Test(unittest.TestCase):
 
     def testGetFilenameSafeStringNone(self):
         """get_filename_safe_string with None returns 'None'"""
-        result = parsedmarc.utils.get_filename_safe_string(None)  # type: ignore[arg-type]
+        result = parsedmarc.utils.get_filename_safe_string(None)
         self.assertEqual(result, "None")
+
+    def testGetFilenameSafeStringTraversalSequencesCollapseToEmpty(self):
+        """A subject made only of path separators and dots sanitizes to the
+        empty string, so a caller's `or "sample"` fallback takes over rather
+        than a relative path reaching os.path.join()
+
+        Regression test for GHSA-c284-w5m6-jhjm: `../../../` and `/` are the
+        reporter's proof-of-concept subjects."""
+        for traversal in ("../../../", "/", "..", ".", "..\\..\\", "./../"):
+            with self.subTest(traversal=traversal):
+                self.assertEqual(
+                    parsedmarc.utils.get_filename_safe_string(traversal), ""
+                )
+
+    def testGetFilenameSafeStringStripsNullByte(self):
+        """A NUL byte is stripped, so the result cannot make open() raise
+        ValueError: embedded null byte"""
+        result = parsedmarc.utils.get_filename_safe_string("re\x00port")
+        self.assertEqual(result, "report")
+
+    def testGetFilenameSafeStringHasNoPathSeparators(self):
+        """No os.sep or os.altsep survives a mixed-separator subject"""
+        result = parsedmarc.utils.get_filename_safe_string("a/b\\c:d..\\..\\e/../f")
+        self.assertEqual(result, "abcd....e..f")
+        self.assertNotIn(os.sep, result)
+        if os.altsep is not None:
+            self.assertNotIn(os.altsep, result)
+
+    def testGetFilenameSafeStringTruncatedNameHasNoTrailingDot(self):
+        """Truncation happens before trailing dots are stripped, so a name
+        cut off just after a dot does not end in one
+
+        A trailing dot is silently dropped by Windows when the file is
+        created, which would make two distinct subjects collide on one
+        filename."""
+        subject = f"{'a' * 99}.{'b' * 50}"
+        result = parsedmarc.utils.get_filename_safe_string(subject)
+        self.assertEqual(result, "a" * 99)
+        self.assertFalse(result.endswith("."))
+
+    def testGetFilenameSafeStringStripsTrailingSpaces(self):
+        """Trailing spaces are stripped like trailing dots, and mixed runs of
+        both, because Windows drops them when creating the file"""
+        for subject, expected in (("report ", "report"), ("report . .", "report")):
+            with self.subTest(subject=subject):
+                self.assertEqual(
+                    parsedmarc.utils.get_filename_safe_string(subject), expected
+                )
 
     def testGetFilenameSafeStringLong(self):
         """get_filename_safe_string truncates to 100 chars"""
@@ -419,7 +473,7 @@ class TestLoadPSLOverrides(unittest.TestCase):
         mock_response.text = fake_body
         mock_response.raise_for_status = MagicMock()
         with patch(
-            "parsedmarc.utils.requests.get", return_value=mock_response
+            "parsedmarc.utils.httpx.get", return_value=mock_response
         ) as mock_get:
             result = parsedmarc.utils.load_psl_overrides(url="https://example.test/ov")
             self.assertEqual(result, ["-fetched-brand.com", ".cdn-fetched.net"])
@@ -427,11 +481,9 @@ class TestLoadPSLOverrides(unittest.TestCase):
 
     def test_url_failure_falls_back_to_local(self):
         """A network error falls back to the bundled copy."""
-        import requests
-
         with patch(
-            "parsedmarc.utils.requests.get",
-            side_effect=requests.exceptions.ConnectionError("nope"),
+            "parsedmarc.utils.httpx.get",
+            side_effect=httpx.ConnectError("nope"),
         ):
             result = parsedmarc.utils.load_psl_overrides(url="https://example.test/ov")
         # Bundled file still loaded.
@@ -439,8 +491,8 @@ class TestLoadPSLOverrides(unittest.TestCase):
         self.assertIn(".linode.com", result)
 
     def test_always_use_local_skips_network(self):
-        """always_use_local_file=True must not call requests.get."""
-        with patch("parsedmarc.utils.requests.get") as mock_get:
+        """always_use_local_file=True must not call httpx.get."""
+        with patch("parsedmarc.utils.httpx.get") as mock_get:
             parsedmarc.utils.load_psl_overrides(always_use_local_file=True)
             mock_get.assert_not_called()
 
@@ -490,6 +542,67 @@ class TestLoadReverseDnsMapReloadsPSLOverrides(unittest.TestCase):
             local_file_path="/tmp/custom.txt",
             url="https://example.test/ov",
             offline=True,
+        )
+
+    def _write_psl_overrides_file(self):
+        """Write a temp PSL overrides file with a unique suffix and register
+        cleanup, returning its path."""
+        tf = tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8"
+        )
+        tf.write(".internal.example-503.net\n")
+        tf.close()
+        self.addCleanup(os.unlink, tf.name)
+        return tf.name
+
+    def test_lazy_reverse_dns_map_load_applies_psl_overrides(self):
+        """Regression test for GitHub issue #503: the lazy
+        ``load_reverse_dns_map()`` call inside
+        ``get_service_from_reverse_dns_base_domain`` previously omitted
+        ``psl_overrides_path``/``psl_overrides_url``, so
+        ``load_reverse_dns_map``'s unconditional ``load_psl_overrides()``
+        call (utils.py) silently reloaded ``psl_overrides`` with the bundled
+        defaults, discarding an operator-configured overrides file. This
+        proves the lazy load now threads the caller's
+        ``psl_overrides_path`` through: after calling with an empty
+        ``reverse_dns_map`` (which forces the lazy load) and a custom
+        ``psl_overrides_path``, the custom override must be in effect.
+        """
+        path = self._write_psl_overrides_file()
+        parsedmarc.utils.get_service_from_reverse_dns_base_domain(
+            "something.example",
+            reverse_dns_map={},
+            always_use_local_file=True,
+            offline=True,
+            psl_overrides_path=path,
+        )
+        self.assertEqual(
+            parsedmarc.utils.get_base_domain("deep.sub.internal.example-503.net"),
+            "internal.example-503.net",
+        )
+
+    def test_get_ip_address_info_lazy_load_applies_psl_overrides(self):
+        """Regression test for GitHub issue #503, exercising the
+        ASN-fallback lazy ``load_reverse_dns_map()`` call inside
+        ``get_ip_address_info`` (used when no PTR record resolves). Before
+        the fix, this lazy load also omitted ``psl_overrides_path``/
+        ``psl_overrides_url``, so it clobbered operator-configured PSL
+        overrides with the bundled defaults the same way. ``offline=True``
+        forces the no-PTR path so this call reaches the ASN-fallback lazy
+        load rather than the PTR-driven
+        ``get_service_from_reverse_dns_base_domain`` call.
+        """
+        path = self._write_psl_overrides_file()
+        parsedmarc.utils.get_ip_address_info(
+            "192.0.2.1",
+            offline=True,
+            reverse_dns_map={},
+            always_use_local_files=True,
+            psl_overrides_path=path,
+        )
+        self.assertEqual(
+            parsedmarc.utils.get_base_domain("deep.sub.internal.example-503.net"),
+            "internal.example-503.net",
         )
 
 
@@ -949,66 +1062,6 @@ Body"""
         self.assertNotIn("sha256", attachments[0])
         self.assertEqual(attachments[0]["payload"], "!!!notb64!!!")
 
-    def testStrictKwargTypeErrorGetsClearMessage(self):
-        """mail-parser's getaddresses(strict=True) TypeError on an
-        unpatched Python interpreter is re-raised as an actionable
-        EmailParserError naming the required Python patch releases,
-        instead of surfacing as a bare TypeError.
-
-        See fork #30, tracking upstream domainaware/parsedmarc#808:
-        mail-parser unconditionally calls
-        email.utils.getaddresses(strict=True), a keyword only supported
-        on Python patch releases >=3.10.15, >=3.11.10, >=3.12.6 (the
-        CVE-2023-27043 hardening). email.utils.supports_strict_parsing
-        is the stdlib's own feature-detection flag for this.
-        """
-        with (
-            patch("email.utils.supports_strict_parsing", False),
-            patch(
-                "parsedmarc.utils.mailparser.parse_from_string",
-                side_effect=TypeError(
-                    "getaddresses() got an unexpected keyword argument 'strict'"
-                ),
-            ),
-        ):
-            with self.assertRaises(parsedmarc.utils.EmailParserError) as ctx:
-                parsedmarc.utils.parse_email("From: a@b.com\r\n\r\nBody\r\n")
-        message = str(ctx.exception)
-        self.assertIn("3.10.15", message)
-        self.assertIn("3.11.10", message)
-        self.assertIn("3.12.6", message)
-        self.assertIn("mail-parser", message)
-        self.assertIsInstance(ctx.exception.__cause__, TypeError)
-
-    def testUnrelatedTypeErrorNotMisclassified(self):
-        """The strict= guard only fires for the specific mail-parser
-        TypeError on an unpatched interpreter - any other TypeError, or
-        the same message on a patched interpreter, propagates unchanged.
-        """
-        with (
-            patch("email.utils.supports_strict_parsing", False),
-            patch(
-                "parsedmarc.utils.mailparser.parse_from_string",
-                side_effect=TypeError("unrelated failure"),
-            ),
-        ):
-            with self.assertRaises(TypeError) as ctx:
-                parsedmarc.utils.parse_email("From: a@b.com\r\n\r\nBody\r\n")
-        self.assertNotIsInstance(ctx.exception, parsedmarc.utils.EmailParserError)
-
-        with (
-            patch("email.utils.supports_strict_parsing", True),
-            patch(
-                "parsedmarc.utils.mailparser.parse_from_string",
-                side_effect=TypeError(
-                    "getaddresses() got an unexpected keyword argument 'strict'"
-                ),
-            ),
-        ):
-            with self.assertRaises(TypeError) as ctx:
-                parsedmarc.utils.parse_email("From: a@b.com\r\n\r\nBody\r\n")
-        self.assertNotIsInstance(ctx.exception, parsedmarc.utils.EmailParserError)
-
 
 class TestUtilsOutlookMsg(unittest.TestCase):
     """Tests for Outlook MSG detection and conversion"""
@@ -1090,7 +1143,7 @@ class TestUtilsReverseDnsMap(unittest.TestCase):
         """load_reverse_dns_map in offline mode loads bundled map"""
         rdns_map = {}
         parsedmarc.utils.load_reverse_dns_map(rdns_map, offline=True)
-        self.assertTrue(len(rdns_map) > 0)
+        self.assertGreater(len(rdns_map), 0)
 
     def testLoadReverseDnsMapLocalOverride(self):
         """load_reverse_dns_map uses local_file_path when provided"""
@@ -1112,11 +1165,11 @@ class TestUtilsReverseDnsMap(unittest.TestCase):
         """load_reverse_dns_map falls back to bundled on network error"""
         rdns_map = {}
         with patch(
-            "parsedmarc.utils.requests.get",
-            side_effect=requests.exceptions.ConnectionError("no network"),
+            "parsedmarc.utils.httpx.get",
+            side_effect=httpx.ConnectError("no network"),
         ):
             parsedmarc.utils.load_reverse_dns_map(rdns_map)
-        self.assertTrue(len(rdns_map) > 0)
+        self.assertGreater(len(rdns_map), 0)
 
     def testLoadReverseDnsMapInvalidCsvFallback(self):
         """A fetch that returns a non-map CSV body logs a warning and
@@ -1125,7 +1178,7 @@ class TestUtilsReverseDnsMap(unittest.TestCase):
         response.text = "not,the,map\nfoo,bar,baz\n"
         response.raise_for_status.return_value = None
         rdns_map = {}
-        with patch("parsedmarc.utils.requests.get", return_value=response):
+        with patch("parsedmarc.utils.httpx.get", return_value=response):
             with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
                 parsedmarc.utils.load_reverse_dns_map(rdns_map)
         self.assertTrue(any("Not a valid CSV file" in message for message in cm.output))
@@ -1230,9 +1283,238 @@ class TestQueryDnsRetries(unittest.TestCase):
         self.assertEqual(mock_resolve.call_count, 3)
 
 
+class TestEncryptedDnsNameservers(unittest.TestCase):
+    """Tests for the DNS over HTTPS and DNS over TLS transports selected by
+    the form of each ``nameservers`` entry
+    (https://github.com/domainaware/parsedmarc/issues/880). The end-to-end
+    tests mock at the dnspython SDK boundary (``dns.query.https`` /
+    ``dns.query.tls``) and assert on the answer query_dns parses back out of
+    a real DNS response message, so the whole chain — entry mapping,
+    resolver, nameserver object, transport call — is exercised."""
+
+    def setUp(self):
+        # The DoH session is process-wide state; keep test ordering from
+        # leaking a client (or a PID) between tests.
+        self._old_session = parsedmarc.utils._DOH_SESSION
+        self._old_pid = parsedmarc.utils._DOH_SESSION_PID
+        parsedmarc.utils._DOH_SESSION = None
+        parsedmarc.utils._DOH_SESSION_PID = None
+
+        def restore():
+            session = parsedmarc.utils._DOH_SESSION
+            if session is not None and session is not self._old_session:
+                session.close()
+            parsedmarc.utils._DOH_SESSION = self._old_session
+            parsedmarc.utils._DOH_SESSION_PID = self._old_pid
+
+        self.addCleanup(restore)
+
+    @staticmethod
+    def _ptr_responder(captured: list, answer: str = "dns.example."):
+        """Builds a dns.query stand-in that answers any PTR query with
+        ``answer``, recording the keyword arguments it was called with."""
+
+        def responder(request, *args, **kwargs):
+            captured.append(kwargs)
+            response = dns.message.make_response(request)
+            # find_rrset(create=True) rather than appending to
+            # response.answer, so the message's rrset index is updated too —
+            # dnspython looks the answer up through that index.
+            rrset = response.find_rrset(
+                response.answer,
+                request.question[0].name,
+                dns.rdataclass.IN,
+                dns.rdatatype.PTR,
+                create=True,
+            )
+            rrset.add(dns.rdata.from_text("IN", "PTR", answer), 300)
+            return response
+
+        return responder
+
+    def test_plain_ip_entries_are_passed_through_untouched(self):
+        """An IP address is handed to dnspython as the same string object,
+        leaving its own Do53 enrichment (and port defaulting) in charge."""
+        entries = ["1.1.1.1", "2606:4700:4700::1111"]
+        mapped = parsedmarc.utils._nameservers_to_resolver_input(entries)
+        self.assertEqual(len(mapped), 2)
+        for original, result in zip(entries, mapped):
+            self.assertIs(result, original)
+
+    def _map_doh(self, entry: str) -> parsedmarc.utils._SessionDoHNameserver:
+        """Maps one entry and asserts it produced a DoH nameserver."""
+        (mapped,) = parsedmarc.utils._nameservers_to_resolver_input([entry])
+        self.assertIsInstance(mapped, parsedmarc.utils._SessionDoHNameserver)
+        return cast(parsedmarc.utils._SessionDoHNameserver, mapped)
+
+    def _map_dot(self, entry: str) -> dns.nameserver.DoTNameserver:
+        """Maps one entry and asserts it produced a DoT nameserver."""
+        (mapped,) = parsedmarc.utils._nameservers_to_resolver_input([entry])
+        self.assertIsInstance(mapped, dns.nameserver.DoTNameserver)
+        return cast(dns.nameserver.DoTNameserver, mapped)
+
+    def test_https_entry_becomes_a_session_doh_nameserver(self):
+        """An https:// entry maps to the DoH nameserver subclass that
+        queries through parsedmarc's own httpx client."""
+        url = "https://cloudflare-dns.com/dns-query"
+        self.assertEqual(self._map_doh(url).url, url)
+
+    def test_uppercase_scheme_is_recognized(self):
+        """The scheme is compared as urlsplit reports it, which is
+        lowercased, so HTTPS:// selects DoH rather than falling through to
+        dnspython as an unusable string."""
+        self._map_doh("HTTPS://cloudflare-dns.com/dns-query")
+
+    def test_tls_entry_defaults_to_port_853_with_no_hostname(self):
+        """tls://<ip> alone uses DoTNameserver's default port and performs
+        no certificate-identity substitution."""
+        mapped = self._map_dot("tls://9.9.9.9")
+        self.assertEqual(mapped.address, "9.9.9.9")
+        self.assertEqual(mapped.port, 853)
+        self.assertIsNone(mapped.hostname)
+
+    def test_tls_entry_port_and_hostname_are_parsed(self):
+        """tls://ip:port#hostname sets both the port and the TLS
+        certificate identity."""
+        mapped = self._map_dot("tls://9.9.9.9:8853#dns.quad9.net")
+        self.assertEqual(mapped.address, "9.9.9.9")
+        self.assertEqual(mapped.port, 8853)
+        self.assertEqual(mapped.hostname, "dns.quad9.net")
+
+    def test_bracketed_ipv6_tls_entry_is_parsed(self):
+        """An IPv6 address is bracketed so the colon before the port is
+        unambiguous; the brackets are not part of the address."""
+        mapped = self._map_dot("tls://[2620:fe::fe]:853#dns.quad9.net")
+        self.assertEqual(mapped.address, "2620:fe::fe")
+        self.assertEqual(mapped.port, 853)
+
+    def test_mixed_list_preserves_order_and_types(self):
+        """Transports can be mixed in one nameservers list, and the
+        configured order is the failover order dnspython will use."""
+        mapped = parsedmarc.utils._nameservers_to_resolver_input(
+            [
+                "1.1.1.1",
+                "https://cloudflare-dns.com/dns-query",
+                "tls://9.9.9.9#dns.quad9.net",
+            ]
+        )
+        self.assertEqual(mapped[0], "1.1.1.1")
+        self.assertIsInstance(mapped[1], parsedmarc.utils._SessionDoHNameserver)
+        self.assertIsInstance(mapped[2], dns.nameserver.DoTNameserver)
+
+    def test_tls_entry_without_a_host_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            parsedmarc.utils._nameservers_to_resolver_input(["tls://"])
+        self.assertIn("tls://", str(ctx.exception))
+
+    def test_tls_entry_with_a_hostname_instead_of_an_ip_is_rejected(self):
+        """DoTNameserver takes an IP address, not a name — it has no
+        resolver of its own to bootstrap with. The certificate identity is
+        supplied by the #hostname suffix instead."""
+        with self.assertRaises(ValueError) as ctx:
+            parsedmarc.utils._nameservers_to_resolver_input(["tls://dns.quad9.net"])
+        self.assertIn("tls://dns.quad9.net", str(ctx.exception))
+
+    def test_tls_entry_with_an_invalid_port_is_rejected(self):
+        """urlsplit only validates the port when it is read, so the
+        ValueError it raises there is re-raised naming the entry."""
+        with self.assertRaises(ValueError) as ctx:
+            parsedmarc.utils._nameservers_to_resolver_input(["tls://9.9.9.9:notaport"])
+        self.assertIn("tls://9.9.9.9:notaport", str(ctx.exception))
+
+    def test_tls_entry_with_a_path_is_rejected(self):
+        """tls://9.9.9.9/dns.quad9.net — a plausible slash-for-# typo —
+        must fail at configuration time naming the entry, not parse
+        "successfully" with no TLS certificate identity and then fail at
+        query time with an opaque certificate error. Userinfo and query
+        components are rejected the same way."""
+        for entry in (
+            "tls://9.9.9.9/dns.quad9.net",
+            "tls://user@9.9.9.9",
+            "tls://9.9.9.9?hostname=dns.quad9.net",
+        ):
+            with self.subTest(entry=entry):
+                with self.assertRaises(ValueError) as ctx:
+                    parsedmarc.utils._nameservers_to_resolver_input([entry])
+                self.assertIn(entry, str(ctx.exception))
+
+    def test_unsplittable_entry_is_left_for_dnspython_to_reject(self):
+        """urlsplit itself raises on some malformed input (an unbalanced
+        IPv6 bracket). Such an entry is passed through rather than reported
+        as a DoH/DoT problem, and dnspython rejects it with its own message
+        about what a nameserver may be."""
+        entry = "https://[::1"
+        (mapped,) = parsedmarc.utils._nameservers_to_resolver_input([entry])
+        self.assertIs(mapped, entry)
+        with self.assertRaises(ValueError):
+            dns.resolver.Resolver(configure=False).nameservers = [entry]
+
+    def test_doh_query_returns_answers_through_a_shared_httpx_client(self):
+        """An https:// nameserver resolves through dns.query.https, and the
+        session it is given is the module's shared client, an httpx.Client
+        with trust_env left on — httpx's documented switch for honoring
+        HTTP_PROXY/HTTPS_PROXY/NO_PROXY and SSL_CERT_FILE, which is what a
+        proxy-only network needs (issue #880). dnspython's stock DoH
+        nameserver passes no session at all, and the client dns.query.https
+        builds for itself has a custom transport, which disables environment
+        proxies. Asserting identity with the shared client also observes the
+        connection-reuse half of the claim: a fresh per-query client would
+        satisfy every other assertion here."""
+        captured: list = []
+        with patch("dns.query.https", side_effect=self._ptr_responder(captured)):
+            records = parsedmarc.utils.query_dns(
+                "1.0.0.1.in-addr.arpa",
+                "PTR",
+                cache=ExpiringDict(max_len=10, max_age_seconds=60),
+                nameservers=["https://dns.example/dns-query"],
+                timeout=2,
+            )
+        self.assertEqual(records, ["dns.example"])
+        self.assertEqual(len(captured), 1)
+        session = captured[0]["session"]
+        self.assertIsInstance(session, httpx.Client)
+        self.assertIs(session.trust_env, True)
+        self.assertIs(session, parsedmarc.utils._DOH_SESSION)
+
+    def test_dot_query_returns_answers_and_passes_the_tls_hostname(self):
+        """A tls:// nameserver resolves through dns.query.tls, and the
+        #hostname suffix reaches it as server_hostname — the name the
+        server's certificate is checked against."""
+        captured: list = []
+        with patch("dns.query.tls", side_effect=self._ptr_responder(captured)):
+            records = parsedmarc.utils.query_dns(
+                "1.0.0.1.in-addr.arpa",
+                "PTR",
+                cache=ExpiringDict(max_len=10, max_age_seconds=60),
+                nameservers=["tls://9.9.9.9#dns.quad9.net"],
+                timeout=2,
+            )
+        self.assertEqual(records, ["dns.example"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["server_hostname"], "dns.quad9.net")
+        self.assertEqual(captured[0]["port"], 853)
+
+    def test_doh_session_is_reused_within_a_process(self):
+        """Consecutive calls hand back the same client, so DoH lookups
+        reuse the connection instead of renegotiating TLS per query."""
+        first = parsedmarc.utils._get_doh_session()
+        self.assertIs(parsedmarc.utils._get_doh_session(), first)
+
+    def test_doh_session_is_rebuilt_after_a_fork(self):
+        """A forked worker (n_procs) inherits the module globals, including
+        the parent's open sockets. Recording the creating PID makes the
+        child build its own client rather than share the parent's."""
+        parent_session = parsedmarc.utils._get_doh_session()
+        parsedmarc.utils._DOH_SESSION_PID = os.getpid() + 1
+        child_session = parsedmarc.utils._get_doh_session()
+        self.addCleanup(parent_session.close)
+        self.assertIsNot(child_session, parent_session)
+        self.assertEqual(parsedmarc.utils._DOH_SESSION_PID, os.getpid())
+
+
 class TestLoadIpDb(unittest.TestCase):
     """Tests for the load_ip_db() download/cache/bundled fallback chain,
-    mocking at the requests SDK boundary."""
+    mocking at the httpx SDK boundary."""
 
     def setUp(self):
         old_ip_db_path = parsedmarc.utils._IP_DB_PATH
@@ -1258,7 +1540,7 @@ class TestLoadIpDb(unittest.TestCase):
         local_path = os.path.join(self.tmp_dir, "local.mmdb")
         with open(local_path, "wb") as f:
             f.write(b"local db")
-        with patch("parsedmarc.utils.requests.get") as mock_get:
+        with patch("parsedmarc.utils.httpx.get") as mock_get:
             parsedmarc.utils.load_ip_db(local_file_path=local_path)
         mock_get.assert_not_called()
         self.assertEqual(parsedmarc.utils._IP_DB_PATH, local_path)
@@ -1268,7 +1550,7 @@ class TestLoadIpDb(unittest.TestCase):
         response = MagicMock()
         response.content = b"downloaded db bytes"
         response.raise_for_status.return_value = None
-        with patch("parsedmarc.utils.requests.get", return_value=response) as mock_get:
+        with patch("parsedmarc.utils.httpx.get", return_value=response) as mock_get:
             parsedmarc.utils.load_ip_db(url="https://example.com/db.mmdb")
         self.assertEqual(mock_get.call_args.args[0], "https://example.com/db.mmdb")
         cached_path = os.path.join(self.tmp_dir, "parsedmarc", "ipinfo_lite.mmdb")
@@ -1284,8 +1566,8 @@ class TestLoadIpDb(unittest.TestCase):
         with open(cached_path, "wb") as f:
             f.write(b"stale cached db")
         with patch(
-            "parsedmarc.utils.requests.get",
-            side_effect=requests.exceptions.ConnectionError("no network"),
+            "parsedmarc.utils.httpx.get",
+            side_effect=httpx.ConnectError("no network"),
         ):
             with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
                 parsedmarc.utils.load_ip_db()
@@ -1297,8 +1579,8 @@ class TestLoadIpDb(unittest.TestCase):
     def testDownloadFailureFallsBackToBundledCopy(self):
         """On a network error with no cached copy, the bundled db is used"""
         with patch(
-            "parsedmarc.utils.requests.get",
-            side_effect=requests.exceptions.ConnectionError("no network"),
+            "parsedmarc.utils.httpx.get",
+            side_effect=httpx.ConnectError("no network"),
         ):
             parsedmarc.utils.load_ip_db()
         bundled = str(files(parsedmarc.resources.ipinfo).joinpath("ipinfo_lite.mmdb"))
@@ -1315,7 +1597,7 @@ class TestLoadIpDb(unittest.TestCase):
         response.content = b"downloaded db bytes"
         response.raise_for_status.return_value = None
         with patch("parsedmarc.utils.tempfile.gettempdir", return_value=blocker):
-            with patch("parsedmarc.utils.requests.get", return_value=response):
+            with patch("parsedmarc.utils.httpx.get", return_value=response):
                 with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
                     parsedmarc.utils.load_ip_db()
         self.assertTrue(
@@ -1335,7 +1617,7 @@ class TestConfigureIpinfoApiProbe(unittest.TestCase):
     def _response(status_code, json_body=None):
         response = MagicMock()
         response.status_code = status_code
-        response.ok = 200 <= status_code < 300
+        response.is_success = 200 <= status_code < 300
         response.json.return_value = json_body if json_body is not None else {}
         return response
 
@@ -1343,7 +1625,7 @@ class TestConfigureIpinfoApiProbe(unittest.TestCase):
         """A successful probe logs that the API is configured"""
         api_json = {"ip": "1.1.1.1", "asn": "AS13335", "country_code": "US"}
         with patch(
-            "parsedmarc.utils.requests.get",
+            "parsedmarc.utils.httpx.get",
             return_value=self._response(200, api_json),
         ):
             with self.assertLogs("parsedmarc.log", level="INFO") as cm:
@@ -1356,8 +1638,8 @@ class TestConfigureIpinfoApiProbe(unittest.TestCase):
         """A probe network error logs a warning but keeps the token so
         per-request fallback can take over later"""
         with patch(
-            "parsedmarc.utils.requests.get",
-            side_effect=requests.exceptions.ConnectionError("no network"),
+            "parsedmarc.utils.httpx.get",
+            side_effect=httpx.ConnectError("no network"),
         ):
             with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
                 parsedmarc.utils.configure_ipinfo_api("fake-token", probe=True)
@@ -1368,7 +1650,7 @@ class TestConfigureIpinfoApiProbe(unittest.TestCase):
 
     def testProbeInvalidKeyRaises(self):
         """A 401 during the probe raises InvalidIPinfoAPIKey"""
-        with patch("parsedmarc.utils.requests.get", return_value=self._response(401)):
+        with patch("parsedmarc.utils.httpx.get", return_value=self._response(401)):
             with self.assertRaises(parsedmarc.utils.InvalidIPinfoAPIKey):
                 parsedmarc.utils.configure_ipinfo_api("bad-token", probe=True)
 
@@ -1383,7 +1665,7 @@ class TestIpinfoApiLookupFallbacks(unittest.TestCase):
 
     def _assert_mmdb_fallback(self, response=None, side_effect=None):
         with patch(
-            "parsedmarc.utils.requests.get",
+            "parsedmarc.utils.httpx.get",
             return_value=response,
             side_effect=side_effect,
         ):
@@ -1394,21 +1676,19 @@ class TestIpinfoApiLookupFallbacks(unittest.TestCase):
         self.assertEqual(record["asn"], 15169)
 
     def testNetworkErrorFallsBackToMmdb(self):
-        self._assert_mmdb_fallback(
-            side_effect=requests.exceptions.ConnectionError("no network")
-        )
+        self._assert_mmdb_fallback(side_effect=httpx.ConnectError("no network"))
 
     def testNonJsonBodyFallsBackToMmdb(self):
         response = MagicMock()
         response.status_code = 200
-        response.ok = True
+        response.is_success = True
         response.json.side_effect = ValueError("not JSON")
         self._assert_mmdb_fallback(response=response)
 
     def testNonDictPayloadFallsBackToMmdb(self):
         response = MagicMock()
         response.status_code = 200
-        response.ok = True
+        response.is_success = True
         response.json.return_value = ["not", "a", "dict"]
         self._assert_mmdb_fallback(response=response)
 

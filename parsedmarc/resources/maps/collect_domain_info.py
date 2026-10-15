@@ -7,7 +7,8 @@ useful for classifying an unknown sender:
 
     domain, whois_org, whois_country, registrar, title, description,
     rebrand_signal, external_links, final_url, http_status, ips,
-    ip_whois_org, ip_whois_netname, ip_whois_country, error
+    ip_whois_org, ip_whois_netname, ip_whois_country, error,
+    title_source, link_target_domain
 
 `rebrand_signal` flags rows whose page text matches a phrase like "now X" or
 "formerly known as X" — useful both for classifying an unknown sender ("we
@@ -610,6 +611,9 @@ def _extract_metadata(domain: str, body: bytes, encoding: str) -> dict:
     try:
         parser.feed(text)
     except Exception:
+        # Defensive guard against malformed markup partway through a page;
+        # keep whatever title/description/body text it already extracted
+        # before the failure rather than losing the whole page's data.
         pass
     out["title"] = parser.title
     out["description"] = parser.description

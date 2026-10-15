@@ -28,8 +28,9 @@ from parsedmarc.postgres import (
 
 OFFLINE_MODE = os.environ.get("GITHUB_ACTIONS", "false").lower() == "true"
 
-# psycopg is an optional dependency and is not installed in CI (which installs
-# only the [build] extra). The save methods mock the connection, but the
+# psycopg is an optional dependency and is not installed in CI (whose
+# unit-test job installs the [build,all] extras, deliberately without
+# postgresql). The save methods mock the connection, but the
 # failure path also references ``psycopg_json.Jsonb`` at module scope, so
 # mock that SDK boundary for the whole module when psycopg is absent.
 _types_patcher = None
@@ -656,6 +657,46 @@ class TestPostgreSQLClientSave(unittest.TestCase):
         self.assertIn("sts", policy_params)
         self.assertIn(100, policy_params)
         self.assertIn(2, policy_params)
+
+    def test_save_smtp_tls_report_blank_failure_detail_fields_become_null(self):
+        """Blank optional failure-detail fields reach PostgreSQL as None,
+        not "" (issue #915).
+
+        samples/smtp_tls/empty_failure_detail_fields.json reproduces a
+        real reporter's shape: sending-mta-ip/receiving-ip/
+        receiving-mx-hostname/additional-information sent as "" on an
+        sts-policy-fetch-error. "" is not a valid PostgreSQL INET value, so
+        before the parser fix in parsedmarc/__init__.py this reached
+        cur.execute() as an empty string and crashed the save with
+        "invalid input syntax for type inet: \"\"" against a real server.
+        This test goes through the real parser (parsedmarc.parse_report_file)
+        rather than a hand-built dict, so it fails on unfixed
+        parsedmarc/__init__.py even though this test file only mocks
+        psycopg.
+        """
+        client, mock_conn = _make_client()
+        cur = _mock_cursor(mock_conn, [(1,), (10,)])
+
+        result = parsedmarc.parse_report_file(
+            "samples/smtp_tls/empty_failure_detail_fields.json", offline=True
+        )
+        report = result["report"]
+
+        client.save_smtp_tls_report_to_postgresql(cast(dict, report))
+
+        sqls = _executed_sql(cur)
+        self.assertIn("smtp_tls_failure_detail", sqls[2])
+
+        detail_params = _named_params(cur.execute.call_args_list[2])
+        self.assertIsNone(detail_params["sending_mta_ip"])
+        self.assertIsNone(detail_params["receiving_ip"])
+        self.assertIsNone(detail_params["receiving_mx_hostname"])
+        self.assertIsNone(detail_params["additional_info_uri"])
+        # A non-blank optional field is preserved.
+        self.assertEqual(detail_params["failure_reason_code"], "no-policy-served")
+        # Required fields are preserved.
+        self.assertEqual(detail_params["result_type"], "sts-policy-fetch-error")
+        self.assertEqual(detail_params["failed_session_count"], 1)
 
     def test_save_smtp_tls_report_already_saved(self):
         """AlreadySaved is raised when ON CONFLICT returns no row."""

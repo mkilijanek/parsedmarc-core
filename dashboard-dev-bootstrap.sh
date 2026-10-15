@@ -1,14 +1,121 @@
 #!/usr/bin/env bash
-# Bring up docker-compose.dashboard-dev.yml, import the latest parsedmarc
-# dashboards into each viz system, and seed each backend with sample data so
-# the dashboards have something to render. Idempotent — safe to re-run.
+# Bring up docker-compose.dashboard-dev.yml (works with Docker or Podman),
+# import the latest parsedmarc dashboards into each viz system, and seed each
+# backend with sample data so the dashboards have something to render.
+# Idempotent — safe to re-run.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
-COMPOSE=(docker compose -f docker-compose.dashboard-dev.yml --env-file .env)
+usage() {
+    cat <<EOF
+Usage: $(basename "${BASH_SOURCE[0]}") [-b|--backend docker|podman] [-h|--help]
+
+Bring up the dashboard-dev stack, import dashboards, and seed sample data.
+
+Options:
+  -b, --backend docker|podman  Container backend to use (auto-detects when
+                               omitted; Docker is preferred if both work).
+  -h, --help                   Show this help and exit.
+
+Environment variables:
+  CONTAINER_BACKEND   Same as --backend; the flag takes precedence.
+  RESEED=1            Wipe and re-seed sample data.
+  OSD_TENANT          OpenSearch Dashboards tenant for the import (default: global).
+  WAIT_TIMEOUT        Per-service readiness timeout in seconds (default: 180).
+  PARSEDMARC_BIN      Explicit parsedmarc CLI to use for seeding.
+EOF
+}
+
+# A leftover docker CLI with no running daemon must not shadow a working
+# podman: require both the binary and a live `info` call, since `podman info`
+# works daemonless while `docker info` fails without a running daemon.
+engine_works() {
+    local engine="$1"
+    command -v "$engine" >/dev/null 2>&1 && "$engine" info >/dev/null 2>&1
+}
+
+# `podman compose` is a thin wrapper that delegates to an external provider
+# (docker-compose or podman-compose), so the version probe correctly fails
+# when no provider is installed and we fall back to the standalone binary —
+# itself probed with `version` so a broken install is rejected here rather
+# than partway through the run.
+resolve_compose() {
+    local engine="$1"
+    if "$engine" compose version >/dev/null 2>&1; then
+        COMPOSE_CMD=("$engine" compose)
+    elif command -v "${engine}-compose" >/dev/null 2>&1 &&
+        "${engine}-compose" version >/dev/null 2>&1; then
+        COMPOSE_CMD=("${engine}-compose")
+    else
+        return 1
+    fi
+}
+
+BACKEND="${CONTAINER_BACKEND:-}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -b|--backend)
+            if [ $# -lt 2 ] || [ -z "$2" ]; then
+                echo "ERROR: $1 requires a value (docker or podman)" >&2
+                usage >&2
+                exit 2
+            fi
+            BACKEND="$2"
+            shift 2
+            ;;
+        --backend=*)
+            BACKEND="${1#*=}"
+            if [ -z "$BACKEND" ]; then
+                echo "ERROR: --backend requires a value (docker or podman)" >&2
+                usage >&2
+                exit 2
+            fi
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+case "$BACKEND" in
+    docker|podman)
+        if ! engine_works "$BACKEND"; then
+            echo "ERROR: backend '$BACKEND' was requested but is not usable (missing, or its 'info' check failed — is it installed and running?)" >&2
+            exit 1
+        fi
+        if ! resolve_compose "$BACKEND"; then
+            echo "ERROR: no compose implementation found for '$BACKEND' (looked for '$BACKEND compose' and '${BACKEND}-compose')" >&2
+            exit 1
+        fi
+        ;;
+    "")
+        if engine_works docker && resolve_compose docker; then
+            BACKEND=docker
+        elif engine_works podman && resolve_compose podman; then
+            BACKEND=podman
+        else
+            echo "ERROR: no working container engine found. Install Docker or Podman with a Compose implementation, or pass --backend." >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: invalid backend '$BACKEND' from --backend or CONTAINER_BACKEND (expected docker or podman)" >&2
+        exit 1
+        ;;
+esac
+
+COMPOSE=("${COMPOSE_CMD[@]}" -f docker-compose.dashboard-dev.yml --env-file .env)
+echo "container backend: ${BACKEND} (${COMPOSE_CMD[*]})"
 
 # Load .env so this script can use the same secrets compose injects.
 set -a
@@ -48,7 +155,7 @@ wait_for() {
 # ---------------------------------------------------------------------------
 # 1. Bring up the stack
 # ---------------------------------------------------------------------------
-log "Starting docker compose dashboard-dev stack"
+log "Starting dashboard-dev stack (${COMPOSE_CMD[*]})"
 "${COMPOSE[@]}" up -d
 
 # ---------------------------------------------------------------------------
@@ -220,13 +327,15 @@ else
     fi
 
     # Resolve a Python environment for the seed and make sure parsedmarc plus
-    # the PostgreSQL extra (psycopg) are installed in it, so the same run can
-    # populate Postgres. Precedence:
+    # every output integration ([all]) and the PostgreSQL extra (psycopg) are
+    # installed in it, so the same run can populate Elasticsearch, OpenSearch,
+    # and Postgres. Precedence:
     #   1. An explicit PARSEDMARC_BIN — used as-is, nothing installed.
     #   2. An already-activated virtualenv ($VIRTUAL_ENV).
     #   3. An existing repo venv/ or .venv/.
     #   4. Otherwise a freshly created $REPO_ROOT/venv.
-    # Cases 2-4 run `pip install -e .[postgresql]` only when the CLI or psycopg
+    # Cases 2-4 run `pip install -e ".[all,postgresql]"` only when the CLI,
+    # psycopg, or an [all] integration (elasticsearch stands in for the group)
     # is missing, so it's a no-op once the environment is set up.
     if [ -n "${PARSEDMARC_BIN:-}" ]; then
         if [ ! -x "$PARSEDMARC_BIN" ]; then
@@ -251,9 +360,9 @@ else
         fi
         PARSEDMARC_BIN="$seed_venv/bin/parsedmarc"
         if [ ! -x "$PARSEDMARC_BIN" ] ||
-            ! "$seed_venv/bin/python" -c 'import psycopg' >/dev/null 2>&1; then
-            echo "  installing parsedmarc[postgresql] into $seed_venv"
-            "$seed_venv/bin/python" -m pip install -q -e "${REPO_ROOT}[postgresql]"
+            ! "$seed_venv/bin/python" -c 'import psycopg, elasticsearch' >/dev/null 2>&1; then
+            echo "  installing parsedmarc[all,postgresql] into $seed_venv"
+            "$seed_venv/bin/python" -m pip install -q -e "${REPO_ROOT}[all,postgresql]"
         fi
     fi
     if [ ! -x "$PARSEDMARC_BIN" ]; then
@@ -266,9 +375,14 @@ else
     # 2001:db8::, etc.) that won't resolve, so cap retries/timeout to bound
     # the cost of those NXDOMAIN-bound lookups. Intentionally invalid samples
     # (empty_reason.xml, invalid_xml.xml, etc.) are skipped from the list.
+    # samples/aggregate/!large-example.com!1711897200!1711983600.xml is
+    # deliberately NOT seeded: its 2,286 synthetic records would be ~99% of
+    # the corpus, drowning the realistic mix on every unfiltered dashboard
+    # (and its records carry no envelope_from and empty SPF domains, so that
+    # column reads almost entirely blank). To load it for scale or backfill
+    # testing, run the seed command below manually with that file appended.
     SAMPLE_FILES=(
         samples/aggregate/!example.com!1538204542!1538463818.xml
-        samples/aggregate/!large-example.com!1711897200!1711983600.xml
         'samples/aggregate/Report domain- borschow.com Submitter- google.com Report-ID- 949348866075514174.eml'
         samples/aggregate/addisonfoods.com!example.com!1536105600!1536191999.xml
         samples/aggregate/estadocuenta1.infonacot.gob.mx!example.com!1536853302!1536939702!2940.xml.zip
@@ -304,7 +418,16 @@ else
         # Reached only for an explicit PARSEDMARC_BIN whose env lacks psycopg
         # (the auto-resolved venv path installs the extra above).
         echo "  NOTE: 'psycopg' is not available to ${PARSEDMARC_BIN} — skipping the"
-        echo "        PostgreSQL seed. Enable it with: pip install -e '.[postgresql]'"
+        echo "        PostgreSQL seed. Enable it with: pip install -e '.[all,postgresql]'"
+    fi
+    # Like psycopg above, this is reachable only for an explicit
+    # PARSEDMARC_BIN: without the [all] integrations the seed run below
+    # exits 1 on its ConfigurationError (swallowed by the `|| true`),
+    # leaving every dashboard empty with nothing on the console to say why.
+    if [ -x "$seed_python" ] && ! "$seed_python" -c 'import elasticsearch' >/dev/null 2>&1; then
+        echo "  WARNING: the Elasticsearch/OpenSearch clients are not available to"
+        echo "           ${PARSEDMARC_BIN} — the seed run will fail to initialize its"
+        echo "           outputs. Install them with: pip install -e '.[all,postgresql]'"
     fi
     env "${pg_seed_env[@]}" \
         "$PARSEDMARC_BIN" -t 2.0 --dns-retries 1 -c parsedmarc-dev.ini "${SAMPLE_FILES[@]}" || true
@@ -340,6 +463,33 @@ curl -sS -X POST 'http://localhost:5602/api/saved_objects/_import?overwrite=true
     --form file=@dashboards/opensearch/opensearch_dashboards.ndjson | sed 's/^/  /'
 echo "  (imported into OSD tenant: ${OSD_TENANT})"
 
+log "Ensuring Grafana Elasticsearch datasource plugin is installed"
+# Grafana >= 13 no longer bundles the Elasticsearch datasource plugin, and
+# GF_INSTALL_PLUGINS cannot install it (the image ships a root-owned
+# plugins-bundled/elasticsearch remnant its background installer fails to
+# replace). `grafana cli` installs into /var/lib/grafana/plugins, which works;
+# a restart is needed for Grafana to load it.
+code=$(curl -sS -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
+    -o /dev/null -w "%{http_code}" \
+    "http://localhost:3000/api/plugins/elasticsearch/settings")
+if [ "$code" != "200" ]; then
+    "${COMPOSE[@]}" exec -T grafana grafana cli plugins install elasticsearch \
+        | sed 's/^/  /'
+    "${COMPOSE[@]}" restart grafana >/dev/null
+    wait_for "Grafana (after plugin install)" \
+        curl -sf http://localhost:3000/api/health
+    code=$(curl -sS -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \
+        -o /dev/null -w "%{http_code}" \
+        "http://localhost:3000/api/plugins/elasticsearch/settings")
+    if [ "$code" != "200" ]; then
+        echo "ERROR: elasticsearch datasource plugin failed to install" >&2
+        exit 1
+    fi
+    echo "  installed elasticsearch datasource plugin"
+else
+    echo "  elasticsearch datasource plugin already installed"
+fi
+
 log "Configuring Grafana datasources"
 # Two Elasticsearch datasources, one per index family, matching the dashboard's
 # template variables (dmarc-ag and dmarc-fo). Skipped when already present.
@@ -347,7 +497,7 @@ declare -a GF_DS_NAMES=("dmarc-ag" "dmarc-fo")
 # dmarc_f* matches both pre-rename dmarc_forensic* and post-rename
 # dmarc_failure* indices, mirroring the OpenSearch/Kibana dashboards.
 declare -a GF_DS_INDEX=("dmarc_aggregate*" "dmarc_f*")
-declare -a GF_DS_TIME=("date_range" "arrival_date")
+declare -a GF_DS_TIME=("date_begin" "arrival_date")
 for i in 0 1; do
     name="${GF_DS_NAMES[$i]}"
     code=$(curl -sS -u "${GRAFANA_USER}:${GRAFANA_PASSWORD}" \

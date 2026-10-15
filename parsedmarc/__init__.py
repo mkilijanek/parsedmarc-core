@@ -6,11 +6,15 @@ from __future__ import annotations
 
 import binascii
 import email
+import email.errors
+import email.message
 import email.utils
+import functools
 import json
 import logging
 import mailbox
 import os
+import quopri
 import re
 import shutil
 import tempfile
@@ -19,10 +23,11 @@ import xml.parsers.expat as expat
 import zipfile
 import zlib
 from base64 import b64decode
+from collections import deque
+from collections.abc import Callable, Sequence
 from csv import DictWriter
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from io import BytesIO, StringIO
-from collections.abc import Callable, Sequence
 from typing import (
     Any,
     BinaryIO,
@@ -30,10 +35,18 @@ from typing import (
 )
 
 import lxml.etree as etree
+import mailparser
 import xmltodict
 from expiringdict import ExpiringDict
 from mailsuite.smtp import send_email
+from tqdm import tqdm
 
+from parsedmarc.config import (
+    IP_ADDRESS_CACHE,
+    REVERSE_DNS_MAP,
+    SEEN_AGGREGATE_REPORT_IDS,
+    ParserConfig,
+)
 from parsedmarc.constants import (
     DEFAULT_DNS_MAX_RETRIES,
     DEFAULT_DNS_TIMEOUT,
@@ -53,12 +66,13 @@ from parsedmarc.types import (
     ForensicReport as ForensicReport,
     ParsedReport,
     ParsingResults,
+    ReportType,
     SMTPTLSReport,
 )
 from parsedmarc.utils import (
-    _mailparser_parse_from_string,
     convert_outlook_msg,
     get_base_domain,
+    get_filename_safe_string,
     get_ip_address_info,
     human_timestamp_to_datetime,
     is_outlook_msg,
@@ -66,9 +80,13 @@ from parsedmarc.utils import (
     timestamp_to_human,
 )
 
-logger.debug("parsedmarc v{0}".format(__version__))
+logger.debug(f"parsedmarc v{__version__}")
 
-feedback_report_regex = re.compile(r"^([\w\-]+): (.+)$", re.MULTILINE)
+# A message/feedback-report part is a MIME body part, so its lines end with
+# CRLF per RFC 5322 §2.1. In re.MULTILINE, ``$`` matches before the LF but not
+# before the CR, so the value must exclude the line ending explicitly rather
+# than relying on ``.`` — otherwise every field value keeps a trailing CR.
+feedback_report_regex = re.compile(r"^([\w\-]+): ([^\r\n]+)\r?$", re.MULTILINE)
 xml_header_regex = re.compile(r"^<\?xml .*?>", re.MULTILINE)
 xml_schema_regex = re.compile(r"</??xs:schema.*>", re.MULTILINE)
 text_report_regex = re.compile(r"\s*([a-zA-Z\s]+):\s(.+)", re.MULTILINE)
@@ -99,7 +117,42 @@ MAGIC_ZIP = b"\x50\x4b\x03\x04"
 MAGIC_GZIP = b"\x1f\x8b"
 MAGIC_XML = b"\x3c\x3f\x78\x6d\x6c\x20"
 MAGIC_XML_TAG = b"\x3c"  # '<' - XML starting with an element tag (no declaration)
-MAGIC_JSON = b"\7b"
+# 0x7B, "{" -- a JSON text that is an object begins with it (RFC 8259).
+# Previously written as b"\7b", which Python reads as the octal escape
+# \7 (BEL) followed by a literal "b", so the branch never matched real
+# JSON; every in-tree caller happened to pre-guard with its own zip/gzip
+# or "{" check, which masked it.
+MAGIC_JSON = b"\x7b"
+
+# Maximum size, in bytes, of the data extracted from one compressed report
+# attachment. Real reports compress at roughly 10:1, but the attachment's
+# content is chosen by whoever sent it, and deflate (used by both gzip and
+# zip) reaches about 1000:1 on degenerate input, so a 100 KB attachment from
+# any sender a monitored mailbox accepts could inflate to 100 MB -- and the
+# decoded str coexists with the decompressed bytes, so the peak is roughly
+# twice that. Deliberately not configurable: real DMARC aggregate, failure,
+# and SMTP TLS reports are orders of magnitude smaller than 100 MB, so no
+# legitimate deployment needs to change it.
+MAX_DECOMPRESSED_REPORT_SIZE = 100 * 1024 * 1024
+
+# Per-message count of consecutive failed saves, keyed on
+# ``(reports_folder, str(message_uid))``. Populated only when
+# ``get_dmarc_reports_from_mailbox()`` is given a ``save_callback`` that
+# reports a batch as unsaved; a message whose count exceeds
+# ``max_unsaved_retries`` is moved to ``{archive_folder}/Unsaved`` instead
+# of being retried forever, and its entry is dropped. A successful save
+# clears the entries for that batch's messages.
+#
+# Process-local and deliberately not persisted: a restart re-attempts every
+# message still in the reports folder, which is the safe direction (retry
+# rather than shelve). The key carries no connection identity, so a library
+# caller processing two connections that share a folder name (two IMAP
+# servers, both "INBOX") in one process could collide counters if UIDs
+# happen to match; the CLI uses one connection per process. It is not a
+# ``ParserConfig`` field for the same reason ``batch_size`` and the
+# ``delete`` flags are not -- it governs mailbox orchestration, not
+# parsing.
+_FAILED_SAVE_ATTEMPTS: dict[tuple[str, str], int] = {}
 
 EMAIL_SAMPLE_CONTENT_TYPES = (
     "text/rfc822",
@@ -111,10 +164,6 @@ EMAIL_SAMPLE_CONTENT_TYPES = (
     "message/rfc822-headers",
     "message/rfc-822-headers",
 )
-
-IP_ADDRESS_CACHE = ExpiringDict(max_len=10000, max_age_seconds=14400)
-SEEN_AGGREGATE_REPORT_IDS = ExpiringDict(max_len=100000000, max_age_seconds=3600)
-REVERSE_DNS_MAP = dict()
 
 
 class ParserError(RuntimeError):
@@ -141,6 +190,66 @@ class InvalidFailureReport(InvalidDMARCReport):
 InvalidForensicReport = InvalidFailureReport
 
 
+def _resolve_config(
+    config: ParserConfig | None,
+    *,
+    offline: bool = False,
+    ip_db_path: str | None = None,
+    always_use_local_files: bool = False,
+    reverse_dns_map_path: str | None = None,
+    reverse_dns_map_url: str | None = None,
+    nameservers: list[str] | None = None,
+    dns_timeout: float = DEFAULT_DNS_TIMEOUT,
+    dns_retries: int = DEFAULT_DNS_MAX_RETRIES,
+    strip_attachment_payloads: bool = False,
+    normalize_timespan_threshold_hours: float = 24.0,
+) -> ParserConfig:
+    """Resolve the effective :class:`~parsedmarc.config.ParserConfig` for a
+    public parsing call, from either an explicit ``config`` or the caller's
+    individual option keyword arguments.
+
+    If ``config`` is not ``None``, it is returned unchanged: per the
+    documented ``config=`` contract, the individual option keyword arguments
+    are ignored in favor of the config's own values, so no merging happens
+    here.
+
+    Otherwise, a new ``ParserConfig`` is built from the given keyword
+    arguments. Its three cache fields are deliberately *not* left to their
+    ``default_factory`` -- doing so would hand back a config with brand new,
+    empty caches on every call, silently defeating cross-call IP-info
+    caching and aggregate-report dedup. Instead, the module-default caches
+    (:data:`IP_ADDRESS_CACHE`, :data:`SEEN_AGGREGATE_REPORT_IDS`,
+    :data:`REVERSE_DNS_MAP`) are injected explicitly, so kwargs-style calls
+    keep observing and mutating the same shared caches they always have.
+
+    ``dataclasses.replace`` is deliberately not used here: it would need an
+    existing ``ParserConfig`` to start from, and there isn't one on the
+    kwargs path -- this function's job is to build the first one.
+
+    ``psl_overrides_path`` / ``psl_overrides_url`` have no corresponding
+    keyword arguments on the public functions (see AGENTS.md's guidance on
+    justifying new config options), so they stay ``None`` on this path; they
+    are only ever set via an explicitly constructed ``config=``.
+    """
+    if config is not None:
+        return config
+    return ParserConfig(
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        strip_attachment_payloads=strip_attachment_payloads,
+        normalize_timespan_threshold_hours=float(normalize_timespan_threshold_hours),
+        ip_address_cache=IP_ADDRESS_CACHE,
+        seen_aggregate_report_ids=SEEN_AGGREGATE_REPORT_IDS,
+        reverse_dns_map=REVERSE_DNS_MAP,
+    )
+
+
 def _exc_origin(error: BaseException) -> str:
     """Returns a ``" (raised at <file>:<line>)"`` suffix pointing at where an
     unexpected exception actually originated, but only when the parsedmarc
@@ -158,7 +267,7 @@ def _exc_origin(error: BaseException) -> str:
     if not frames:
         return ""
     last = frames[-1]
-    return " (raised at {0}:{1})".format(last.filename, last.lineno)
+    return f" (raised at {last.filename}:{last.lineno})"
 
 
 def _text(value: Any) -> str | None:
@@ -179,6 +288,15 @@ def _text(value: Any) -> str | None:
         text = value.get("#text")
         return None if text is None else str(text)
     return value
+
+
+def _normalize_result_word(value: Any) -> Any:
+    """Lowercase a reporter-supplied enum word; RFC 7489 Appendix C and
+    RFC 9990 define result/disposition types as lowercase tokens. Non-string
+    values (e.g. xmltodict dicts from attribute-bearing elements) pass
+    through unchanged.
+    """
+    return value.lower() if isinstance(value, str) else value
 
 
 def _bucket_interval_by_day(
@@ -365,14 +483,7 @@ def _append_parsed_record(
 def _parse_report_record(
     record: dict[str, Any],
     *,
-    ip_db_path: str | None = None,
-    always_use_local_files: bool = False,
-    reverse_dns_map_path: str | None = None,
-    reverse_dns_map_url: str | None = None,
-    offline: bool = False,
-    nameservers: list[str] | None = None,
-    dns_timeout: float = DEFAULT_DNS_TIMEOUT,
-    dns_retries: int = DEFAULT_DNS_MAX_RETRIES,
+    config: ParserConfig,
     is_rfc_9990: bool = False,
 ) -> dict[str, Any]:
     """
@@ -381,16 +492,9 @@ def _parse_report_record(
 
     Args:
         record (dict): The record to convert
-        always_use_local_files (bool): Do not download files
-        reverse_dns_map_path (str): Path to a reverse DNS map file
-        reverse_dns_map_url (str): URL to a reverse DNS map file
-        ip_db_path (str): Path to a MMDB file from IPinfo, MaxMind, or DBIP
-        offline (bool): Do not query online for geolocation or DNS
-        nameservers (list): A list of one or more nameservers to use
-        (Cloudflare's public DNS resolvers by default)
-        dns_timeout (float): Sets the DNS timeout in seconds
-        dns_retries (int): Number of times to retry DNS queries on timeout
-            or other transient errors
+        config (ParserConfig): Parsing and enrichment options, plus caches
+        is_rfc_9990 (bool): Whether the enclosing report was detected as
+            RFC 9990-shaped, for RFC 9990-aware validation warnings
 
     Returns:
         dict: The converted record
@@ -401,16 +505,18 @@ def _parse_report_record(
         raise ValueError("Source IP address is empty")
     new_record_source = get_ip_address_info(
         record["row"]["source_ip"],
-        cache=IP_ADDRESS_CACHE,
-        ip_db_path=ip_db_path,
-        always_use_local_files=always_use_local_files,
-        reverse_dns_map_path=reverse_dns_map_path,
-        reverse_dns_map_url=reverse_dns_map_url,
-        reverse_dns_map=REVERSE_DNS_MAP,
-        offline=offline,
-        nameservers=nameservers,
-        timeout=dns_timeout,
-        retries=dns_retries,
+        cache=config.ip_address_cache,
+        ip_db_path=config.ip_db_path,
+        always_use_local_files=config.always_use_local_files,
+        reverse_dns_map_path=config.reverse_dns_map_path,
+        reverse_dns_map_url=config.reverse_dns_map_url,
+        reverse_dns_map=config.reverse_dns_map,
+        offline=config.offline,
+        nameservers=config.nameservers,
+        timeout=config.dns_timeout,
+        retries=config.dns_retries,
+        psl_overrides_path=config.psl_overrides_path,
+        psl_overrides_url=config.psl_overrides_url,
     )
     new_record["source"] = new_record_source
     new_record["count"] = int(record["row"]["count"])
@@ -422,11 +528,12 @@ def _parse_report_record(
         "policy_override_reasons": [],
     }
     if "disposition" in policy_evaluated:
-        new_policy_evaluated["disposition"] = policy_evaluated["disposition"]
-    if "dkim" in policy_evaluated:
-        new_policy_evaluated["dkim"] = policy_evaluated["dkim"]
-    if "spf" in policy_evaluated:
-        new_policy_evaluated["spf"] = policy_evaluated["spf"]
+        new_policy_evaluated["disposition"] = _normalize_result_word(
+            policy_evaluated["disposition"]
+        )
+    for key in ("dkim", "spf"):
+        if key in policy_evaluated:
+            new_policy_evaluated[key] = _normalize_result_word(policy_evaluated[key])
     reasons = []
     spf_aligned = (
         policy_evaluated["spf"] is not None
@@ -505,7 +612,7 @@ def _parse_report_record(
                     )
                 new_result["selector"] = "none"
             if "result" in result and result["result"] is not None:
-                new_result["result"] = result["result"]
+                new_result["result"] = _normalize_result_word(result["result"])
             else:
                 new_result["result"] = "none"
             new_result["human_result"] = _text(result.get("human_result"))
@@ -521,7 +628,7 @@ def _parse_report_record(
             else:
                 new_result["scope"] = "mfrom"
             if "result" in result and result["result"] is not None:
-                new_result["result"] = result["result"]
+                new_result["result"] = _normalize_result_word(result["result"])
             else:
                 new_result["result"] = "none"
             new_result["human_result"] = _text(result.get("human_result"))
@@ -549,6 +656,26 @@ def _parse_report_record(
     return new_record
 
 
+def _non_blank(value: Any) -> Any:
+    """Treat ``None`` or a blank/whitespace-only string as absent.
+
+    Some SMTP TLS (RFC 8460) reporters send an empty string for an optional
+    failure-details field (e.g. ``sending-mta-ip``/``receiving-ip`` on a
+    ``sts-policy-fetch-error``) instead of omitting the key. An empty string
+    is not a valid IP address, so passing it through crashed the PostgreSQL
+    save (``INET`` columns) and would also have crashed the Elasticsearch
+    and OpenSearch saves: their ``Ip()`` fields' validation
+    (``elasticsearch.dsl``/``opensearchpy``'s ``Document.save()``) rejects
+    an empty string with a bare ``ValueError`` (issue #915). Non-string,
+    non-blank values pass through unchanged.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return value
+
+
 def _parse_smtp_tls_failure_details(failure_details: dict[str, Any]):
     try:
         new_failure_details: dict[str, Any] = {
@@ -556,26 +683,28 @@ def _parse_smtp_tls_failure_details(failure_details: dict[str, Any]):
             "failed_session_count": failure_details["failed-session-count"],
         }
 
-        if "sending-mta-ip" in failure_details:
-            new_failure_details["sending_mta_ip"] = failure_details["sending-mta-ip"]
-        if "receiving-ip" in failure_details:
-            new_failure_details["receiving_ip"] = failure_details["receiving-ip"]
-        if "receiving-mx-hostname" in failure_details:
-            new_failure_details["receiving_mx_hostname"] = failure_details[
-                "receiving-mx-hostname"
-            ]
-        if "receiving-mx-helo" in failure_details:
-            new_failure_details["receiving_mx_helo"] = failure_details[
-                "receiving-mx-helo"
-            ]
-        if "additional-info-uri" in failure_details:
-            new_failure_details["additional_info_uri"] = failure_details[
-                "additional-info-uri"
-            ]
-        if "failure-reason-code" in failure_details:
-            new_failure_details["failure_reason_code"] = failure_details[
-                "failure-reason-code"
-            ]
+        optional_fields = [
+            ("sending-mta-ip", "sending_mta_ip"),
+            ("receiving-ip", "receiving_ip"),
+            ("receiving-mx-hostname", "receiving_mx_hostname"),
+            ("receiving-mx-helo", "receiving_mx_helo"),
+            ("failure-reason-code", "failure_reason_code"),
+        ]
+        for src_key, dest_key in optional_fields:
+            value = _non_blank(failure_details.get(src_key))
+            if value is not None:
+                new_failure_details[dest_key] = value
+
+        # RFC 8460 §4.4 names the JSON key "additional-information" (its
+        # value is described as an "additional-info-uri"). Some reporters
+        # instead send the non-RFC key "additional-info-uri" directly; fall
+        # back to it for backward compatibility when the RFC key is absent
+        # or blank.
+        additional_info_uri = _non_blank(failure_details.get("additional-information"))
+        if additional_info_uri is None:
+            additional_info_uri = _non_blank(failure_details.get("additional-info-uri"))
+        if additional_info_uri is not None:
+            new_failure_details["additional_info_uri"] = additional_info_uri
 
         return new_failure_details
 
@@ -669,11 +798,25 @@ def parse_smtp_tls_report_json(report: str | bytes) -> SMTPTLSReport:
         raise InvalidSMTPTLSReport(str(e) + _exc_origin(e)) from e
 
 
+def _csv_safe(value: Any) -> Any:
+    """Strips NUL characters from a string CSV field.
+
+    Python 3.10's ``csv`` writer raises ``_csv.Error: need to escape, but
+    no escapechar set`` on any field containing NUL (CPython issue 97503,
+    fixed in 3.11). Report text fields come from untrusted mail, so the
+    character is dropped here, matching ``get_filename_safe_string``.
+    Non-string values are returned unchanged.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    return value
+
+
 def parsed_smtp_tls_reports_to_csv_rows(
     reports: SMTPTLSReport | list[SMTPTLSReport],
 ) -> list[dict[str, Any]]:
-    """Converts one oor more parsed SMTP TLS reports into a list of single
-    layer dict objects suitable for use in a CSV"""
+    """Converts one or more parsed SMTP TLS reports into a list of
+    single-layer dict objects suitable for use in a CSV"""
     if isinstance(reports, dict):
         reports = [reports]
 
@@ -717,10 +860,10 @@ def parsed_smtp_tls_reports_to_csv(
     headers
 
     Args:
-        reports: A parsed aggregate report or list of parsed aggregate reports
+        reports: A parsed SMTP TLS report or list of parsed SMTP TLS reports
 
     Returns:
-        str: Parsed aggregate report data in flat CSV format, including headers
+        str: Parsed SMTP TLS report data in flat CSV format, including headers
     """
 
     fields = [
@@ -750,7 +893,7 @@ def parsed_smtp_tls_reports_to_csv(
     rows = parsed_smtp_tls_reports_to_csv_rows(reports)
 
     for row in rows:
-        writer.writerow(row)
+        writer.writerow({key: _csv_safe(value) for key, value in row.items()})
         csv_file_object.flush()
 
     return csv_file_object.getvalue()
@@ -769,6 +912,7 @@ def parse_aggregate_report_xml(
     retries: int = DEFAULT_DNS_MAX_RETRIES,
     keep_alive: Callable | None = None,
     normalize_timespan_threshold_hours: float = 24.0,
+    config: ParserConfig | None = None,
 ) -> AggregateReport:
     """Parses a DMARC XML report string and returns a consistent dict
 
@@ -785,12 +929,29 @@ def parse_aggregate_report_xml(
         timeout (float): Sets the DNS timeout in seconds
         retries (int): Number of times to retry DNS queries on timeout or
             other transient errors
-        keep_alive (callable): Keep alive function
+        keep_alive (callable): Keep alive function. Not part of ``config``;
+            always applies.
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, the
+            individual option keyword arguments listed above are ignored in
+            favor of the config's values.
 
     Returns:
         dict: The parsed aggregate DMARC report
     """
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=timeout,
+        dns_retries=retries,
+        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+    )
     errors = []
     # Parse XML and recover from errors
     if isinstance(xml, bytes):
@@ -813,7 +974,7 @@ def parse_aggregate_report_xml(
     try:
         xmltodict.parse(xml)["feedback"]
     except Exception as e:
-        errors.append("Invalid XML: {0}".format(e.__str__()))
+        errors.append(f"Invalid XML: {e.__str__()}")
         try:
             tree = etree.parse(
                 BytesIO(xml.encode("utf-8")),
@@ -861,13 +1022,10 @@ def parse_aggregate_report_xml(
             if new_org_name is not None:
                 org_name = new_org_name
         if not org_name:
-            logger.debug(
-                "Could not parse org_name from XML.\r\n{0}".format(report.__str__())
-            )
+            logger.debug(f"Could not parse org_name from XML.\r\n{report.__str__()}")
             raise KeyError(
-                "Organization name is missing. \
-                           This field is a requirement for \
-                           saving the report"
+                "Organization name is missing. This field is a requirement "
+                "for saving the report"
             )
         new_report_metadata["org_name"] = org_name
         new_report_metadata["org_email"] = report_metadata["email"]
@@ -885,7 +1043,9 @@ def parse_aggregate_report_xml(
         end_ts = int(date_range["end"].split(".")[0])
         span_seconds = end_ts - begin_ts
 
-        normalize_timespan = span_seconds > normalize_timespan_threshold_hours * 3600
+        normalize_timespan = (
+            span_seconds > cfg.normalize_timespan_threshold_hours * 3600
+        )
 
         date_range["begin"] = timestamp_to_human(begin_ts)
         date_range["end"] = timestamp_to_human(end_ts)
@@ -966,14 +1126,14 @@ def parse_aggregate_report_xml(
             if policy_published["np"] is not None:
                 np_ = policy_published["np"]
                 if np_ not in ("none", "quarantine", "reject"):
-                    logger.warning("Invalid np value: {0}".format(np_))
+                    logger.warning(f"Invalid np value: {np_}")
         new_policy_published["np"] = np_
         testing = None
         if "testing" in policy_published:
             if policy_published["testing"] is not None:
                 testing = policy_published["testing"]
                 if testing not in ("n", "y"):
-                    logger.warning("Invalid testing value: {0}".format(testing))
+                    logger.warning(f"Invalid testing value: {testing}")
         new_policy_published["testing"] = testing
         discovery_method = None
         if "discovery_method" in policy_published:
@@ -981,7 +1141,7 @@ def parse_aggregate_report_xml(
                 discovery_method = policy_published["discovery_method"]
                 if discovery_method not in ("psl", "treewalk"):
                     logger.warning(
-                        "Invalid discovery_method value: {0}".format(discovery_method)
+                        f"Invalid discovery_method value: {discovery_method}"
                     )
         new_policy_published["discovery_method"] = discovery_method
         new_report["policy_published"] = new_policy_published
@@ -991,18 +1151,11 @@ def parse_aggregate_report_xml(
                 if keep_alive is not None and i > 0 and i % 20 == 0:
                     logger.debug("Sending keepalive cmd")
                     keep_alive()
-                    logger.debug("Processed {0}/{1}".format(i, len(report["record"])))
+                    logger.debug("Processed {}/{}".format(i, len(report["record"])))
                 try:
                     report_record = _parse_report_record(
                         report["record"][i],
-                        ip_db_path=ip_db_path,
-                        offline=offline,
-                        always_use_local_files=always_use_local_files,
-                        reverse_dns_map_path=reverse_dns_map_path,
-                        reverse_dns_map_url=reverse_dns_map_url,
-                        nameservers=nameservers,
-                        dns_timeout=timeout,
-                        dns_retries=retries,
+                        config=cfg,
                         is_rfc_9990=is_rfc_9990,
                     )
                     _append_parsed_record(
@@ -1013,19 +1166,12 @@ def parse_aggregate_report_xml(
                         normalize=normalize_timespan,
                     )
                 except Exception as e:
-                    logger.warning("Could not parse record: {0}".format(e))
+                    logger.warning(f"Could not parse record: {e}")
 
         else:
             report_record = _parse_report_record(
                 report["record"],
-                ip_db_path=ip_db_path,
-                always_use_local_files=always_use_local_files,
-                reverse_dns_map_path=reverse_dns_map_path,
-                reverse_dns_map_url=reverse_dns_map_url,
-                offline=offline,
-                nameservers=nameservers,
-                dns_timeout=timeout,
-                dns_retries=retries,
+                config=cfg,
                 is_rfc_9990=is_rfc_9990,
             )
             _append_parsed_record(
@@ -1041,37 +1187,89 @@ def parse_aggregate_report_xml(
         return cast(AggregateReport, new_report)
 
     except expat.ExpatError as error:
-        raise InvalidAggregateReport(
-            "Invalid XML: {0}".format(error.__str__())
-        ) from error
+        raise InvalidAggregateReport(f"Invalid XML: {error.__str__()}") from error
 
     except KeyError as error:
-        raise InvalidAggregateReport(
-            "Missing field: {0}".format(error.__str__())
-        ) from error
+        raise InvalidAggregateReport(f"Missing field: {error.__str__()}") from error
     except AttributeError as error:
         raise InvalidAggregateReport("Report missing required section") from error
 
     except Exception as error:
         raise InvalidAggregateReport(
-            "Unexpected error: {0}{1}".format(error.__str__(), _exc_origin(error))
+            f"Unexpected error: {error.__str__()}{_exc_origin(error)}"
         ) from error
+
+
+def _decompress_gzip_bounded(data: bytes) -> bytes:
+    """
+    Decompresses a gzip stream, refusing to produce more than
+    ``MAX_DECOMPRESSED_REPORT_SIZE`` bytes.
+
+    The limit is read from the module global on every call so that it stays
+    a single source of truth (and can be patched in tests).
+
+    Args:
+        data: The gzip stream
+
+    Returns:
+        bytes: The decompressed data
+
+    Raises:
+        ParserError: The decompressed data exceeds the limit, or the gzip
+            stream ends before the decompressor reaches its end marker.
+        zlib.error: The stream is corrupt (bad header, deflate data, or
+            CRC); ``extract_report()`` wraps it in ``ParserError``.
+    """
+    limit = MAX_DECOMPRESSED_REPORT_SIZE
+    decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    decompressed = decompressor.decompress(data, max_length=limit + 1)
+    if len(decompressed) > limit:
+        raise ParserError(f"Decompressed report exceeds the {limit} byte limit")
+    # ``flush()`` ignores ``max_length``, so it must not run until the
+    # bounded read above has been accepted. It is bounded here: a bounded
+    # ``decompress()`` that returns fewer than ``max_length`` bytes has
+    # either consumed all of its input or hit the end of the stream (after
+    # which any trailing bytes are ``unused_data``, not input), so nothing
+    # unbounded is left for ``flush()`` to produce.
+    decompressed += decompressor.flush()
+    if not decompressor.eof:
+        # A one-shot zlib.decompress() raises on a stream that ends early;
+        # a decompressobj just stops, so the truncation is detected here.
+        raise ParserError("Incomplete or truncated gzip stream")
+
+    return decompressed
 
 
 def extract_report(content: bytes | str | BinaryIO) -> str:
     """
-    Extracts text from a zip or gzip file, as a base64-encoded string,
-    file-like object, or bytes.
+    Extracts report text from zip- or gzip-compressed content, and returns
+    plain XML or JSON content decoded as-is.
+
+    A caller-supplied file-like object is read from but never closed by
+    this function, on either the success or the exception path; it is
+    left open and positioned wherever the function's own reads left it,
+    so the caller is free to seek(0) and reuse it. A seekable stream is
+    seeked to position 0 unconditionally (not back to wherever the caller
+    had left it) after its 6-byte header is sniffed, and then read from
+    there, so a successful call typically leaves it at EOF. A non-seekable
+    stream is drained into a buffer this function creates and closes
+    itself; the caller's stream is left open but exhausted.
 
     Args:
-        content: report file as a base64-encoded string, file-like object or
-        bytes.
+        content: The report as a base64-encoded string, file-like object,
+            or bytes. A string that is not valid base64 is returned
+            unchanged.
 
     Returns:
         str: The extracted text
-
     """
     file_object: BinaryIO | None = None
+    # True while file_object is a BytesIO this function created itself
+    # (from a str/bytes input, or as a buffer copied from a non-seekable
+    # caller stream); it is closed in the ``finally`` below. It is set to
+    # False when file_object instead aliases a caller-supplied seekable
+    # stream, which this function must never close.
+    owns_file_object = True
     header: bytes
     try:
         if isinstance(content, str):
@@ -1105,7 +1303,10 @@ def extract_report(content: bytes | str | BinaryIO) -> str:
                     raise ParserError("File objects must be opened in binary (rb) mode")
                 header = bytes(header_raw)
                 stream.seek(0)
+                # file_object aliases the caller's own stream here, so it
+                # must not be closed by this function.
                 file_object = stream
+                owns_file_object = False
             else:
                 header_raw = stream.read(6)
                 if isinstance(header_raw, str):
@@ -1116,9 +1317,13 @@ def extract_report(content: bytes | str | BinaryIO) -> str:
 
         if header[: len(MAGIC_ZIP)] == MAGIC_ZIP:
             _zip = zipfile.ZipFile(file_object)
-            report = _zip.open(_zip.namelist()[0]).read().decode(errors="ignore")
+            limit = MAX_DECOMPRESSED_REPORT_SIZE
+            member = _zip.open(_zip.namelist()[0]).read(limit + 1)
+            if len(member) > limit:
+                raise ParserError(f"Decompressed report exceeds the {limit} byte limit")
+            report = member.decode(errors="ignore")
         elif header[: len(MAGIC_GZIP)] == MAGIC_GZIP:
-            report = zlib.decompress(file_object.read(), zlib.MAX_WBITS | 16).decode(
+            report = _decompress_gzip_bounded(file_object.read()).decode(
                 errors="ignore"
             )
         elif (
@@ -1132,13 +1337,16 @@ def extract_report(content: bytes | str | BinaryIO) -> str:
 
     except Exception as error:
         raise ParserError(
-            "Invalid archive file: {0}{1}".format(error.__str__(), _exc_origin(error))
+            f"Invalid archive file: {error.__str__()}{_exc_origin(error)}"
         ) from error
     finally:
-        if file_object:
+        if file_object and owns_file_object:
             try:
                 file_object.close()
             except Exception:
+                # Best-effort close; a failure here shouldn't shadow
+                # whatever exception (or successful result) is already
+                # propagating out of this function.
                 pass
 
     return report
@@ -1168,12 +1376,18 @@ def parse_aggregate_report_file(
     dns_retries: int = DEFAULT_DNS_MAX_RETRIES,
     keep_alive: Callable | None = None,
     normalize_timespan_threshold_hours: float = 24.0,
+    config: ParserConfig | None = None,
 ) -> AggregateReport:
-    """Parses a file at the given path, a file-like object. or bytes as an
+    """Parses a file at the given path, a file-like object, or bytes as an
     aggregate DMARC report
 
+    ``_input`` is forwarded to ``extract_report()`` unchanged, so a
+    caller-supplied file-like object is read from but never closed, on
+    either the success or the exception path; see ``extract_report()``
+    for exactly how such an object is left positioned afterward.
+
     Args:
-        _input (str | bytes | IO): A path to a file, a file like object, or bytes
+        _input (str | bytes | IO): A path to a file, a file-like object, or bytes
         offline (bool): Do not query online for geolocation or DNS
         always_use_local_files (bool): Do not download files
         reverse_dns_map_path (str): Path to a reverse DNS map file
@@ -1184,12 +1398,29 @@ def parse_aggregate_report_file(
         dns_timeout (float): Sets the DNS timeout in seconds
         dns_retries (int): Number of times to retry DNS queries on timeout
             or other transient errors
-        keep_alive (callable): Keep alive function
+        keep_alive (callable): Keep alive function. Not part of ``config``;
+            always applies.
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, the
+            individual option keyword arguments listed above are ignored in
+            favor of the config's values.
 
     Returns:
         dict: The parsed DMARC aggregate report
     """
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+    )
 
     try:
         xml = extract_report(_input)
@@ -1198,16 +1429,8 @@ def parse_aggregate_report_file(
 
     return parse_aggregate_report_xml(
         xml,
-        always_use_local_files=always_use_local_files,
-        reverse_dns_map_path=reverse_dns_map_path,
-        reverse_dns_map_url=reverse_dns_map_url,
-        ip_db_path=ip_db_path,
-        offline=offline,
-        nameservers=nameservers,
-        timeout=dns_timeout,
-        retries=dns_retries,
+        config=cfg,
         keep_alive=keep_alive,
-        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
     )
 
 
@@ -1414,7 +1637,7 @@ def parsed_aggregate_reports_to_csv(
     rows = parsed_aggregate_reports_to_csv_rows(reports)
 
     for row in rows:
-        writer.writerow(row)
+        writer.writerow({key: _csv_safe(value) for key, value in row.items()})
         csv_file_object.flush()
 
     return csv_file_object.getvalue()
@@ -1434,6 +1657,7 @@ def parse_failure_report(
     dns_timeout: float = DEFAULT_DNS_TIMEOUT,
     dns_retries: int = DEFAULT_DNS_MAX_RETRIES,
     strip_attachment_payloads: bool = False,
+    config: ParserConfig | None = None,
 ) -> FailureReport:
     """
     Converts a DMARC failure report and sample to a dict
@@ -1441,12 +1665,13 @@ def parse_failure_report(
     Args:
         feedback_report (str): A message's feedback report as a string
         sample (str): The RFC 822 headers or RFC 822 message sample
+        msg_date (datetime): The message's date, used as the arrival date
+            when the feedback report has no ``Arrival-Date`` field
         ip_db_path (str): Path to a MMDB file from IPinfo, MaxMind, or DBIP
         always_use_local_files (bool): Do not download files
         reverse_dns_map_path (str): Path to a reverse DNS map file
         reverse_dns_map_url (str): URL to a reverse DNS map file
         offline (bool): Do not query online for geolocation or DNS
-        msg_date (str): The message's date header
         nameservers (list): A list of one or more nameservers to use
             (Cloudflare's public DNS resolvers by default)
         dns_timeout (float): Sets the DNS timeout in seconds
@@ -1454,10 +1679,26 @@ def parse_failure_report(
             or other transient errors
         strip_attachment_payloads (bool): Remove attachment payloads from
             failure report results
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, the
+            individual option keyword arguments listed above are ignored in
+            favor of the config's values.
 
     Returns:
         dict: A parsed report and sample
     """
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        strip_attachment_payloads=strip_attachment_payloads,
+    )
     delivery_results = ["delivered", "spam", "policy", "reject", "other"]
 
     try:
@@ -1497,16 +1738,18 @@ def parse_failure_report(
         ip_address = re.split(r"\s", parsed_report["source_ip"]).pop(0)
         parsed_report_source = get_ip_address_info(
             ip_address,
-            cache=IP_ADDRESS_CACHE,
-            ip_db_path=ip_db_path,
-            always_use_local_files=always_use_local_files,
-            reverse_dns_map_path=reverse_dns_map_path,
-            reverse_dns_map_url=reverse_dns_map_url,
-            reverse_dns_map=REVERSE_DNS_MAP,
-            offline=offline,
-            nameservers=nameservers,
-            timeout=dns_timeout,
-            retries=dns_retries,
+            cache=cfg.ip_address_cache,
+            ip_db_path=cfg.ip_db_path,
+            always_use_local_files=cfg.always_use_local_files,
+            reverse_dns_map_path=cfg.reverse_dns_map_path,
+            reverse_dns_map_url=cfg.reverse_dns_map_url,
+            reverse_dns_map=cfg.reverse_dns_map,
+            offline=cfg.offline,
+            nameservers=cfg.nameservers,
+            timeout=cfg.dns_timeout,
+            retries=cfg.dns_retries,
+            psl_overrides_path=cfg.psl_overrides_path,
+            psl_overrides_url=cfg.psl_overrides_url,
         )
         parsed_report["source"] = parsed_report_source
         del parsed_report["source_ip"]
@@ -1543,6 +1786,27 @@ def parse_failure_report(
             f.strip() for f in parsed_report["auth_failure"].split(",") if f.strip()
         ]
 
+        # Feedback-Type is REQUIRED per RFC 5965 §3.1, but some gateways
+        # (e.g. Exim/cPanel-based ones that send a plain-text summary without
+        # a machine-readable message/feedback-report part) omit it. The
+        # Elasticsearch/OpenSearch outputs require the key, so default it
+        # instead of dropping the report there (see issue #332).
+        if "feedback_type" not in parsed_report:
+            logger.warning(
+                "Failure report missing required 'Feedback-Type' field "
+                "(RFC 5965 §3.1); defaulting to 'auth-failure'"
+            )
+            parsed_report["feedback_type"] = "auth-failure"
+
+        # Authentication-Results is likewise REQUIRED per RFC 6591 §3.1 and
+        # required by the Elasticsearch/OpenSearch outputs.
+        if "authentication_results" not in parsed_report:
+            logger.warning(
+                "Failure report missing required 'Authentication-Results' "
+                "field (RFC 6591 §3.1); defaulting to None"
+            )
+            parsed_report["authentication_results"] = None
+
         optional_fields = [
             "original_envelope_id",
             "dkim_domain",
@@ -1554,11 +1818,23 @@ def parse_failure_report(
                 parsed_report[optional_field] = None
 
         parsed_sample = parse_email(
-            sample, strip_attachment_payloads=strip_attachment_payloads
+            sample, strip_attachment_payloads=cfg.strip_attachment_payloads
         )
 
         if "reported_domain" not in parsed_report:
-            parsed_report["reported_domain"] = parsed_sample["from"]["domain"]
+            # reported_domain is a required str in the FailureReport contract
+            # (parsedmarc/types.py) and is read directly by the Elasticsearch
+            # and OpenSearch outputs, so it cannot be defaulted to None. When
+            # the report omits the Reported-Domain field and the sample's From
+            # header is missing or unparseable, the report is unusable.
+            sample_from = parsed_sample.get("from")
+            if not isinstance(sample_from, dict) or not sample_from.get("domain"):
+                raise InvalidFailureReport(
+                    "The failure report has no Reported-Domain field, and no "
+                    "domain could be parsed from the From header of the "
+                    "included sample message"
+                )
+            parsed_report["reported_domain"] = sample_from["domain"]
 
         sample_headers_only = False
         number_of_attachments = len(parsed_sample["attachments"])
@@ -1574,14 +1850,17 @@ def parse_failure_report(
 
         return cast(FailureReport, parsed_report)
 
+    except InvalidFailureReport:
+        # Already a clear, specific message; do not re-wrap it as an
+        # "Unexpected error" below.
+        raise
+
     except KeyError as error:
-        raise InvalidFailureReport(
-            "Missing value: {0}".format(error.__str__())
-        ) from error
+        raise InvalidFailureReport(f"Missing value: {error.__str__()}") from error
 
     except Exception as error:
         raise InvalidFailureReport(
-            "Unexpected error: {0}{1}".format(error.__str__(), _exc_origin(error))
+            f"Unexpected error: {error.__str__()}{_exc_origin(error)}"
         ) from error
 
 
@@ -1677,10 +1956,94 @@ def parsed_failure_reports_to_csv(
     for row in rows:
         new_row: dict[str, Any] = {}
         for key in fields:
-            new_row[key] = row.get(key)
+            new_row[key] = _csv_safe(row.get(key))
         csv_writer.writerow(new_row)
 
     return csv_file.getvalue()
+
+
+def _decode_mime_payload(part: email.message.Message, fallback: str) -> str:
+    """
+    Returns a MIME part's payload decoded per its ``Content-Transfer-Encoding``
+
+    Three non-obvious constraints shape this helper:
+
+    - Only ``quoted-printable`` and ``base64`` parts are touched at all. The
+      caller parses the message from a ``str``, so for a part with a 7bit,
+      8bit, or absent ``Content-Transfer-Encoding`` there is nothing to undo,
+      and ``compat32``'s ``get_payload(decode=True)`` would round-trip the
+      already-correct text through ``raw-unicode-escape`` bytes — re-decoding
+      those as the declared charset mangles every non-ASCII character. Such
+      parts return ``fallback``, which is the payload text as-is.
+    - The standard library's email parser nests **every** ``message/*``
+      subtype — including ``message/feedback-report`` and ``message/rfc822`` —
+      as a child ``Message`` object, so ``get_payload(decode=True)`` returns
+      ``None`` for those parts rather than decoded bytes. The caller's
+      re-serialization of that child message is passed in as ``fallback``, and
+      any transfer encoding is undone here instead.
+    - A composite part carrying a real ``Content-Transfer-Encoding`` of
+      ``quoted-printable`` or ``base64`` is illegal per RFC 2045 §6.4, but
+      real reporters send them anyway (issue
+      `#882 <https://github.com/domainaware/parsedmarc/issues/882>`_), and the
+      standard library nests the still-encoded text as-is. Parsing that text
+      as a message can insert a header/body separator that the encoded text
+      never had, which has to be undone before decoding; see below.
+
+    Any unexpected failure returns ``fallback`` unchanged, so a report that
+    parsed before cannot start failing because of this decoding step.
+
+    Args:
+        part: The MIME part
+        fallback: The payload text to use when the part carries no transfer
+            encoding to undo, or cannot be decoded with ``decode=True``
+            (i.e. nested ``message/*`` parts)
+
+    Returns:
+        str: The decoded payload
+    """
+    try:
+        cte = (part.get("Content-Transfer-Encoding") or "").strip().lower()
+        if cte not in ("quoted-printable", "base64"):
+            return fallback
+
+        payload_bytes = part.get_payload(decode=True)
+        if isinstance(payload_bytes, bytes):
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                return payload_bytes.decode(charset, errors="replace")
+            except LookupError:
+                return payload_bytes.decode("utf-8", errors="replace")
+
+        # Nested message/* part: undo the transfer encoding by hand.
+        #
+        # The still-encoded text was parsed as a message first. A soft line
+        # break (RFC 2045 §6.7) splits a long field across lines, and the
+        # continuation line has neither a colon nor leading whitespace, so the
+        # parser records a MissingHeaderBodySeparatorDefect and treats the
+        # remainder as the body -- which makes the re-serialized `fallback`
+        # carry a blank line that the encoded text never had. Decoding then
+        # consumes the soft break and leaves that inserted newline in the
+        # middle of the value, truncating it. Drop exactly that one separator:
+        # a header value cannot contain a blank line, so the first "\n\n" is
+        # the inserted boundary. Text with a genuine separator raises no
+        # defect, and nothing is removed.
+        text = fallback
+        child = part.get_payload()
+        if isinstance(child, list) and child:
+            child = child[0]
+        if isinstance(child, email.message.Message) and any(
+            isinstance(defect, email.errors.MissingHeaderBodySeparatorDefect)
+            for defect in child.defects
+        ):
+            text = fallback.replace("\n\n", "\n", 1)
+
+        if cte == "quoted-printable":
+            return quopri.decodestring(text.encode("utf-8", errors="replace")).decode(
+                "utf-8", errors="replace"
+            )
+        return b64decode(text).decode("utf-8", errors="replace")
+    except Exception:
+        return fallback
 
 
 def parse_report_email(
@@ -1697,9 +2060,10 @@ def parse_report_email(
     strip_attachment_payloads: bool = False,
     keep_alive: Callable | None = None,
     normalize_timespan_threshold_hours: float = 24.0,
+    config: ParserConfig | None = None,
 ) -> ParsedReport:
     """
-    Parses a DMARC report from an email
+    Parses a DMARC or SMTP TLS report from an email
 
     Args:
         input_: An emailed DMARC report in RFC 822 format, as bytes or a string
@@ -1707,21 +2071,39 @@ def parse_report_email(
         always_use_local_files (bool): Do not download files
         reverse_dns_map_path (str): Path to a reverse DNS map
         reverse_dns_map_url (str): URL to a reverse DNS map
-        offline (bool): Do not query online for geolocation on DNS
+        offline (bool): Do not query online for geolocation or DNS
         nameservers (list): A list of one or more nameservers to use
         dns_timeout (float): Sets the DNS timeout in seconds
         dns_retries (int): Number of times to retry DNS queries on timeout
             or other transient errors
         strip_attachment_payloads (bool): Remove attachment payloads from
             failure report results
-        keep_alive (callable): keep alive function
+        keep_alive (callable): keep alive function. Not part of ``config``;
+            always applies.
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, the
+            individual option keyword arguments listed above are ignored in
+            favor of the config's values.
 
     Returns:
         dict:
-        * ``report_type``: ``aggregate`` or ``failure``
+        * ``report_type``: ``aggregate``, ``failure``, or ``smtp_tls``
         * ``report``: The parsed report
     """
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        strip_attachment_payloads=strip_attachment_payloads,
+        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+    )
     result: ParsedReport | None = None
     msg_date: datetime = datetime.now(timezone.utc)
 
@@ -1742,7 +2124,7 @@ def parse_report_email(
         else:
             input_str = input_data
 
-        msg = _mailparser_parse_from_string(input_str)
+        msg = mailparser.parse_from_string(input_str)
         msg_headers = json.loads(msg.headers_json)
         if "Date" in msg_headers:
             msg_date = human_timestamp_to_datetime(msg_headers["Date"])
@@ -1757,7 +2139,7 @@ def parse_report_email(
     sample = None
     is_feedback_report: bool = False
     if "From" in msg_headers:
-        logger.info("Parsing mail from {0} on {1}".format(msg_headers["From"], date))
+        logger.info("Parsing mail from {} on {}".format(msg_headers["From"], date))
     if "Subject" in msg_headers:
         subject = msg_headers["Subject"]
     for part in msg.walk():
@@ -1772,18 +2154,19 @@ def parse_report_email(
             continue
         elif content_type == "message/feedback-report":
             is_feedback_report = True
+            decoded_payload = _decode_mime_payload(part, payload)
             try:
-                if "Feedback-Type" in payload:
-                    feedback_report = payload
+                if "Feedback-Type" in decoded_payload:
+                    feedback_report = decoded_payload
                 else:
-                    feedback_report = b64decode(payload).__str__()
+                    feedback_report = b64decode(decoded_payload).__str__()
                 feedback_report = feedback_report.lstrip("b'").rstrip("'")
                 feedback_report = feedback_report.replace("\\r", "")
                 feedback_report = feedback_report.replace("\\n", "\n")
             except (ValueError, TypeError, binascii.Error):
-                feedback_report = payload
+                feedback_report = decoded_payload
         elif is_feedback_report and content_type in EMAIL_SAMPLE_CONTENT_TYPES:
-            sample = payload
+            sample = _decode_mime_payload(part, payload)
         elif content_type == "application/tlsrpt+json":
             if not payload.strip().startswith("{"):
                 payload = b64decode(payload).decode("utf-8", errors="replace")
@@ -1807,9 +2190,7 @@ def parse_report_email(
                         fields["received-date"], fields["sender-ip-address"]
                     )
                 except Exception as e:
-                    error = 'Unable to parse message with subject "{0}": {1}{2}'.format(
-                        subject, e, _exc_origin(e)
-                    )
+                    error = f'Unable to parse message with subject "{subject}": {e}{_exc_origin(e)}'
                     raise InvalidDMARCReport(error) from e
 
                 sample = parts[1].lstrip()
@@ -1831,35 +2212,28 @@ def parse_report_email(
                 elif payload_text.strip().startswith("<"):
                     aggregate_report = parse_aggregate_report_xml(
                         payload_text,
-                        ip_db_path=ip_db_path,
-                        always_use_local_files=always_use_local_files,
-                        reverse_dns_map_path=reverse_dns_map_path,
-                        reverse_dns_map_url=reverse_dns_map_url,
-                        offline=offline,
-                        nameservers=nameservers,
-                        timeout=dns_timeout,
-                        retries=dns_retries,
+                        config=cfg,
                         keep_alive=keep_alive,
-                        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
                     )
                     result = {"report_type": "aggregate", "report": aggregate_report}
 
                     return result
 
             except (TypeError, ValueError, binascii.Error):
+                # b64decode() rejected this MIME part's payload as not
+                # base64-decodable, so it isn't a report attachment; fall
+                # through and keep walking the message for a part (or the
+                # feedback-report/sample pair below) that is.
                 pass
 
             except InvalidDMARCReport as e:
                 error = (
-                    'Message with subject "{0}" is not a valid '
-                    "DMARC report: {1}".format(subject, e)
+                    f'Message with subject "{subject}" is not a valid DMARC report: {e}'
                 )
                 raise ParserError(error) from e
 
             except Exception as e:
-                error = 'Unable to parse message with subject "{0}": {1}{2}'.format(
-                    subject, e, _exc_origin(e)
-                )
+                error = f'Unable to parse message with subject "{subject}": {e}{_exc_origin(e)}'
                 raise ParserError(error) from e
 
     if feedback_report and sample:
@@ -1868,21 +2242,13 @@ def parse_report_email(
                 feedback_report,
                 sample,
                 msg_date,
-                offline=offline,
-                ip_db_path=ip_db_path,
-                always_use_local_files=always_use_local_files,
-                reverse_dns_map_path=reverse_dns_map_path,
-                reverse_dns_map_url=reverse_dns_map_url,
-                nameservers=nameservers,
-                dns_timeout=dns_timeout,
-                dns_retries=dns_retries,
-                strip_attachment_payloads=strip_attachment_payloads,
+                config=cfg,
             )
         except InvalidFailureReport as e:
             error = (
-                'Message with subject "{0}" '
+                f'Message with subject "{subject}" '
                 "is not a valid "
-                "failure DMARC report: {1}".format(subject, e)
+                f"failure DMARC report: {e}"
             )
             raise InvalidFailureReport(error) from e
 
@@ -1890,7 +2256,7 @@ def parse_report_email(
         return result
 
     if result is None:
-        error = 'Message with subject "{0}" is not a valid report'.format(subject)
+        error = f'Message with subject "{subject}" is not a valid report'
         raise InvalidDMARCReport(error)
 
     return result
@@ -1933,11 +2299,11 @@ def _describe_parse_failure(
     sniff = sniff.lstrip()
 
     if sniff.startswith("<"):
-        return "Invalid aggregate report: {0}".format(aggregate_error)
+        return f"Invalid aggregate report: {aggregate_error}"
     if sniff.startswith("{"):
-        return "Invalid SMTP TLS report: {0}".format(smtp_tls_error)
+        return f"Invalid SMTP TLS report: {smtp_tls_error}"
     if _looks_like_email(sniff):
-        return "Invalid report email: {0}".format(email_error)
+        return f"Invalid report email: {email_error}"
     return (
         "Not a recognized report format (not a DMARC aggregate XML report, "
         "an SMTP TLS JSON report, or a DMARC report email)"
@@ -1957,10 +2323,16 @@ def parse_report_file(
     reverse_dns_map_url: str | None = None,
     offline: bool = False,
     keep_alive: Callable | None = None,
-    normalize_timespan_threshold_hours: float = 24,
+    normalize_timespan_threshold_hours: float = 24.0,
+    config: ParserConfig | None = None,
 ) -> ParsedReport:
-    """Parses a DMARC aggregate or failure file at the given path, a
-    file-like object. or bytes
+    """Parses a DMARC aggregate report, DMARC failure report, or SMTP TLS
+    report from a file at the given path, a file-like object, or bytes
+
+    A path is opened and closed by this function. A caller-supplied file
+    object is read from but never closed, on either the success or the
+    exception path; it is left open and positioned wherever its own
+    ``read()`` left it, so the caller is free to ``seek(0)`` and reuse it.
 
     Args:
         input_ (str | os.PathLike | bytes | BinaryIO): A path to a file,
@@ -1977,23 +2349,52 @@ def parse_report_file(
         reverse_dns_map_path (str): Path to a reverse DNS map
         reverse_dns_map_url (str): URL to a reverse DNS map
         offline (bool): Do not make online queries for geolocation or DNS
-        keep_alive (callable): Keep alive function
+        keep_alive (callable): Keep alive function. Not part of ``config``;
+            always applies.
+        normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, the
+            individual option keyword arguments listed above are ignored in
+            favor of the config's values.
 
     Returns:
         dict: The parsed DMARC report
     """
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        strip_attachment_payloads=strip_attachment_payloads,
+        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+    )
     file_object: BinaryIO
     if isinstance(input_, (str, os.PathLike)):
         file_path = os.fspath(input_)
-        logger.debug("Parsing {0}".format(file_path))
-        file_object = open(file_path, "rb")
-    elif isinstance(input_, (bytes, bytearray, memoryview)):
-        file_object = BytesIO(bytes(input_))
+        logger.debug(f"Parsing {file_path}")
+        # A path is a handle we opened ourselves, so it must be closed on
+        # both the success and exception paths.
+        with open(file_path, "rb") as file_object:
+            content = file_object.read()
     else:
-        file_object = input_
-
-    content = file_object.read()
-    file_object.close()
+        if isinstance(input_, (bytes, bytearray, memoryview)):
+            # The BytesIO wrapper is created here, so this function owns
+            # it and closes it once the bytes have been read out.
+            file_object = BytesIO(bytes(input_))
+            content = file_object.read()
+            file_object.close()
+        else:
+            # A caller-supplied file-like object is never closed by this
+            # function, on success or failure: the caller may want to
+            # seek(0) and retry, inspect tell(), or otherwise reuse the
+            # handle afterward.
+            file_object = input_
+            content = file_object.read()
     if content.startswith(MAGIC_ZIP) or content.startswith(MAGIC_GZIP):
         content = extract_report(content)
 
@@ -2006,16 +2407,8 @@ def parse_report_file(
     try:
         report = parse_aggregate_report_file(
             content,
-            ip_db_path=ip_db_path,
-            always_use_local_files=always_use_local_files,
-            reverse_dns_map_path=reverse_dns_map_path,
-            reverse_dns_map_url=reverse_dns_map_url,
-            offline=offline,
-            nameservers=nameservers,
-            dns_timeout=dns_timeout,
-            dns_retries=dns_retries,
+            config=cfg,
             keep_alive=keep_alive,
-            normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
         )
         results = {"report_type": "aggregate", "report": report}
     except InvalidAggregateReport as aggregate_error:
@@ -2026,17 +2419,8 @@ def parse_report_file(
             try:
                 results = parse_report_email(
                     content,
-                    ip_db_path=ip_db_path,
-                    always_use_local_files=always_use_local_files,
-                    reverse_dns_map_path=reverse_dns_map_path,
-                    reverse_dns_map_url=reverse_dns_map_url,
-                    offline=offline,
-                    nameservers=nameservers,
-                    dns_timeout=dns_timeout,
-                    dns_retries=dns_retries,
-                    strip_attachment_payloads=strip_attachment_payloads,
+                    config=cfg,
                     keep_alive=keep_alive,
-                    normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
                 )
             except InvalidDMARCReport as email_error:
                 raise ParserError(
@@ -2048,6 +2432,123 @@ def parse_report_file(
     if results is None:
         raise ParserError("Not a valid report")
     return results
+
+
+def _classify_parsed_email(
+    parsed_email: ParsedReport,
+    aggregate_reports: list[AggregateReport],
+    failure_reports: list[FailureReport],
+    smtp_tls_reports: list[SMTPTLSReport],
+    *,
+    seen_aggregate_report_ids: ExpiringDict,
+    pending_aggregate_keys: set[str] | None = None,
+) -> ReportType:
+    """Classify a parsed report email, appending it to the matching list.
+
+    Owns the seen-aggregate-report-ID dedup check against
+    ``seen_aggregate_report_ids``: an aggregate report already seen (keyed
+    on ``{org_name}_{report_id}``) is logged and dropped instead of
+    appended. Shared, unmodified, by the sequential and parallel branches
+    of ``get_dmarc_reports_from_mbox`` and ``get_dmarc_reports_from_mailbox``
+    so both dedup identically -- callers pass the config's
+    ``seen_aggregate_report_ids`` cache so dedup state stays scoped to
+    whichever ``ParserConfig`` (explicit or module-default) is in effect.
+
+    ``pending_aggregate_keys`` lets a caller *defer* the dedup-cache write:
+    when a set is supplied, a newly seen key is staged in that set instead
+    of being written to ``seen_aggregate_report_ids``, and the dedup check
+    consults both. The caller then folds the staged keys into the cache
+    once the batch is known to have been saved (see
+    ``get_dmarc_reports_from_mailbox``), or drops them so a retry reparses
+    the same reports rather than silently skipping them as duplicates.
+    ``None`` (the default) keeps the immediate-write behavior.
+
+    Returns the report type so mailbox callers know which UID list to
+    append the source message's UID to.
+    """
+    report_type = parsed_email["report_type"]
+    # Compare against parsed_email["report_type"] directly (not the
+    # report_type local above) in each branch so pyright's TypedDict
+    # discriminated-union narrowing applies to parsed_email["report"].
+    if parsed_email["report_type"] == "aggregate":
+        report_org = parsed_email["report"]["report_metadata"]["org_name"]
+        report_id = parsed_email["report"]["report_metadata"]["report_id"]
+        report_key = f"{report_org}_{report_id}"
+        already_seen = report_key in seen_aggregate_report_ids or (
+            pending_aggregate_keys is not None and report_key in pending_aggregate_keys
+        )
+        if not already_seen:
+            if pending_aggregate_keys is None:
+                seen_aggregate_report_ids[report_key] = True
+            else:
+                pending_aggregate_keys.add(report_key)
+            aggregate_reports.append(parsed_email["report"])
+        else:
+            logger.debug(
+                f"Skipping duplicate aggregate report from {report_org} "
+                f"with ID: {report_id}"
+            )
+    elif parsed_email["report_type"] == "failure":
+        failure_reports.append(parsed_email["report"])
+    elif parsed_email["report_type"] == "smtp_tls":
+        smtp_tls_reports.append(parsed_email["report"])
+    return report_type
+
+
+def _fetch_mailbox_message(
+    connection: MailboxConnection, msg_uid: Any, test: bool
+) -> tuple[int | str, str]:
+    """Fetch one message from ``connection`` by UID, casting the UID to the
+    type each backend's ``fetch_message`` expects.
+
+    Shared, unmodified, by the sequential and parallel branches of
+    ``get_dmarc_reports_from_mailbox`` so both fetch identically.
+
+    Returns ``(message_id, msg_content)``; ``message_id`` is the
+    backend-appropriate id to use for later move/delete calls.
+    """
+    message_id: int | str
+    if isinstance(connection, IMAPConnection):
+        message_id = int(msg_uid)
+        msg_content = connection.fetch_message(message_id)
+    elif isinstance(connection, MSGraphConnection):
+        message_id = str(msg_uid)
+        msg_content = connection.fetch_message(message_id, mark_read=not test)
+    elif isinstance(connection, MaildirConnection):
+        message_id = str(msg_uid) if not isinstance(msg_uid, str) else msg_uid
+        msg_content = connection.fetch_message(message_id, mark_read=not test)
+    else:
+        message_id = str(msg_uid) if not isinstance(msg_uid, str) else msg_uid
+        msg_content = connection.fetch_message(message_id)
+    return message_id, msg_content
+
+
+def _dispose_invalid_message(
+    connection: MailboxConnection,
+    message_id: int | str,
+    delete: bool,
+    invalid_reports_folder: str,
+) -> None:
+    """Delete or move an unparseable message, per ``delete``.
+
+    Callers pass their effective ``delete_invalid`` value as ``delete``.
+
+    Shared, unmodified, by the sequential and parallel branches of
+    ``get_dmarc_reports_from_mailbox`` so both dispose of invalid messages
+    identically.
+    """
+    if delete:
+        logger.debug(f"Deleting message UID {message_id}")
+        if isinstance(connection, IMAPConnection):
+            connection.delete_message(int(message_id))
+        else:
+            connection.delete_message(str(message_id))
+    else:
+        logger.debug(f"Moving message UID {message_id} to {invalid_reports_folder}")
+        if isinstance(connection, IMAPConnection):
+            connection.move_message(int(message_id), invalid_reports_folder)
+        else:
+            connection.move_message(str(message_id), invalid_reports_folder)
 
 
 def get_dmarc_reports_from_mbox(
@@ -2063,9 +2564,11 @@ def get_dmarc_reports_from_mbox(
     reverse_dns_map_url: str | None = None,
     offline: bool = False,
     normalize_timespan_threshold_hours: float = 24.0,
+    n_procs: int = 1,
+    config: ParserConfig | None = None,
 ) -> ParsingResults:
     """Parses a mailbox in mbox format containing e-mails with attached
-    DMARC reports
+    DMARC and SMTP TLS reports
 
     Args:
         input_ (str): A path to a mbox file
@@ -2082,11 +2585,32 @@ def get_dmarc_reports_from_mbox(
         ip_db_path (str): Path to a MMDB file from IPinfo, MaxMind, or DBIP
         offline (bool): Do not make online queries for geolocation or DNS
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
+        n_procs (int): Number of processes to use for parsing messages in
+            parallel. Message reading, deduplication, and result assembly
+            stay in the calling process; only parsing is parallelized. Not
+            part of ``config``; always applies.
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, the
+            individual option keyword arguments listed above are ignored in
+            favor of the config's values.
 
     Returns:
         dict: Lists of ``aggregate_reports``, ``failure_reports``, and ``smtp_tls_reports``
 
     """
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        strip_attachment_payloads=strip_attachment_payloads,
+        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+    )
     aggregate_reports: list[AggregateReport] = []
     failure_reports: list[FailureReport] = []
     smtp_tls_reports: list[SMTPTLSReport] = []
@@ -2094,46 +2618,54 @@ def get_dmarc_reports_from_mbox(
         mbox = mailbox.mbox(input_)
         message_keys = mbox.keys()
         total_messages = len(message_keys)
-        logger.debug("Found {0} messages in {1}".format(total_messages, input_))
-        for i in range(len(message_keys)):
-            message_key = message_keys[i]
-            logger.info("Processing message {0} of {1}".format(i + 1, total_messages))
-            msg_content = mbox.get_string(message_key)
-            try:
-                sa = strip_attachment_payloads
-                parsed_email = parse_report_email(
-                    msg_content,
-                    ip_db_path=ip_db_path,
-                    always_use_local_files=always_use_local_files,
-                    reverse_dns_map_path=reverse_dns_map_path,
-                    reverse_dns_map_url=reverse_dns_map_url,
-                    offline=offline,
-                    nameservers=nameservers,
-                    dns_timeout=dns_timeout,
-                    dns_retries=dns_retries,
-                    strip_attachment_payloads=sa,
-                    normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
-                )
-                if parsed_email["report_type"] == "aggregate":
-                    report_org = parsed_email["report"]["report_metadata"]["org_name"]
-                    report_id = parsed_email["report"]["report_metadata"]["report_id"]
-                    report_key = f"{report_org}_{report_id}"
-                    if report_key not in SEEN_AGGREGATE_REPORT_IDS:
-                        SEEN_AGGREGATE_REPORT_IDS[report_key] = True
-                        aggregate_reports.append(parsed_email["report"])
-                    else:
-                        logger.debug(
-                            "Skipping duplicate aggregate report "
-                            f"from {report_org} with ID: {report_id}"
-                        )
-                elif parsed_email["report_type"] == "failure":
-                    failure_reports.append(parsed_email["report"])
-                elif parsed_email["report_type"] == "smtp_tls":
-                    smtp_tls_reports.append(parsed_email["report"])
-            except InvalidDMARCReport as error:
-                logger.warning(error.__str__())
+        logger.debug(f"Found {total_messages} messages in {input_}")
+
+        if n_procs > 1 and total_messages > 1:
+            from parsedmarc.parallel import _parse_report_email_job, parallel_map
+
+            func = functools.partial(_parse_report_email_job, config=cfg)
+
+            def _jobs():
+                for i in range(total_messages):
+                    message_key = message_keys[i]
+                    logger.info(f"Processing message {i + 1} of {total_messages}")
+                    yield mbox.get_string(message_key)
+
+            for result in tqdm(
+                parallel_map(func, _jobs(), n_procs),
+                total=total_messages,
+                disable=None,
+            ):
+                if isinstance(result, InvalidDMARCReport):
+                    logger.warning(str(result))
+                elif isinstance(result, ParserError):
+                    raise result
+                else:
+                    _classify_parsed_email(
+                        result,
+                        aggregate_reports,
+                        failure_reports,
+                        smtp_tls_reports,
+                        seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
+                    )
+        else:
+            for i in tqdm(range(total_messages), disable=None):
+                message_key = message_keys[i]
+                logger.info(f"Processing message {i + 1} of {total_messages}")
+                msg_content = mbox.get_string(message_key)
+                try:
+                    parsed_email = parse_report_email(msg_content, config=cfg)
+                    _classify_parsed_email(
+                        parsed_email,
+                        aggregate_reports,
+                        failure_reports,
+                        smtp_tls_reports,
+                        seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
+                    )
+                except InvalidDMARCReport as error:
+                    logger.warning(error.__str__())
     except mailbox.NoSuchMailboxError:
-        raise InvalidDMARCReport("Mailbox {0} does not exist".format(input_))
+        raise InvalidDMARCReport(f"Mailbox {input_} does not exist")
     return {
         "aggregate_reports": aggregate_reports,
         "failure_reports": failure_reports,
@@ -2159,8 +2691,8 @@ def _migrate_forensic_archive_folder(
     (warn, don't crash). Uses the folder-management API added in mailsuite
     2.1.0 (``folder_exists`` / ``rename_folder`` / ``merge_folders``).
     """
-    old_folder = "{0}/Forensic".format(archive_folder)
-    new_folder = "{0}/Failure".format(archive_folder)
+    old_folder = f"{archive_folder}/Forensic"
+    new_folder = f"{archive_folder}/Failure"
     try:
         if not connection.folder_exists(old_folder):
             return
@@ -2169,24 +2701,36 @@ def _migrate_forensic_archive_folder(
             # created Failure folder): move the legacy folder's messages into
             # the new one and drop the now-empty legacy folder.
             connection.merge_folders(old_folder, new_folder)
-            logger.info(
-                "Merged legacy archive folder {0} into {1}".format(
-                    old_folder, new_folder
-                )
-            )
+            logger.info(f"Merged legacy archive folder {old_folder} into {new_folder}")
         else:
             connection.rename_folder(old_folder, new_folder)
-            logger.info(
-                "Renamed legacy archive folder {0} to {1}".format(
-                    old_folder, new_folder
-                )
-            )
+            logger.info(f"Renamed legacy archive folder {old_folder} to {new_folder}")
     except Exception as error:
         logger.warning(
-            "Could not migrate legacy archive folder {0} to {1}: {2}".format(
-                old_folder, new_folder, error
-            )
+            f"Could not migrate legacy archive folder {old_folder} to {new_folder}: {error}"
         )
+
+
+def _ensure_folder(connection: MailboxConnection, folder: str) -> None:
+    """Best-effort create ``folder`` if the backend says it is missing.
+
+    ``get_dmarc_reports_from_mailbox()`` creates its destination folders up
+    front, but only when ``create_folders`` is set -- watch mode calls it
+    with ``create_folders=False``, and the ``Unsaved`` holding folder is
+    only created up front when a ``save_callback`` was supplied. This is the
+    defensive check immediately before a message is moved there.
+
+    Like ``_migrate_forensic_archive_folder``, it never raises: a backend
+    that cannot report on or create the folder is logged and skipped, and
+    the move that follows either succeeds anyway (the folder already
+    existed) or fails and is logged by its own error handler -- warn, don't
+    crash.
+    """
+    try:
+        if not connection.folder_exists(folder):
+            connection.create_folder(folder)
+    except Exception as error:
+        logger.warning(f"Could not create folder {folder}: {error}")
 
 
 def get_dmarc_reports_from_mailbox(
@@ -2195,6 +2739,10 @@ def get_dmarc_reports_from_mailbox(
     reports_folder: str = "INBOX",
     archive_folder: str = "Archive",
     delete: bool = False,
+    delete_aggregate: bool | None = None,
+    delete_failure: bool | None = None,
+    delete_smtp_tls: bool | None = None,
+    delete_invalid: bool | None = None,
     test: bool = False,
     ip_db_path: str | None = None,
     always_use_local_files: bool = False,
@@ -2202,24 +2750,43 @@ def get_dmarc_reports_from_mailbox(
     reverse_dns_map_url: str | None = None,
     offline: bool = False,
     nameservers: list[str] | None = None,
-    dns_timeout: float = 6.0,
+    dns_timeout: float = DEFAULT_DNS_TIMEOUT,
     dns_retries: int = DEFAULT_DNS_MAX_RETRIES,
     strip_attachment_payloads: bool = False,
     results: ParsingResults | None = None,
     batch_size: int = 10,
     since: datetime | date | str | None = None,
     create_folders: bool = True,
-    normalize_timespan_threshold_hours: float = 24,
+    normalize_timespan_threshold_hours: float = 24.0,
+    n_procs: int = 1,
     save_callback: Callable[[ParsingResults], bool | None] | None = None,
+    max_unsaved_retries: int = 2,
+    config: ParserConfig | None = None,
 ) -> ParsingResults:
     """
-    Fetches and parses DMARC reports from a mailbox
+    Fetches and parses DMARC and SMTP TLS reports from a mailbox
 
     Args:
         connection: A Mailbox connection object
         reports_folder (str): The folder where reports can be found
         archive_folder (str): The folder to move processed mail to
-        delete (bool): Delete  messages after processing them
+        delete (bool): Delete messages after processing them
+        delete_aggregate (bool | None): Delete aggregate report messages
+            after processing them, instead of moving them to the
+            ``Aggregate`` archive subfolder; ``None`` (the default) inherits
+            the value of ``delete``
+        delete_failure (bool | None): Delete failure report messages after
+            processing them, instead of moving them to the ``Failure``
+            archive subfolder; ``None`` (the default) inherits the value of
+            ``delete``
+        delete_smtp_tls (bool | None): Delete SMTP TLS report messages after
+            processing them, instead of moving them to the ``SMTP-TLS``
+            archive subfolder; ``None`` (the default) inherits the value of
+            ``delete``
+        delete_invalid (bool | None): Delete unparseable messages, instead
+            of moving them to the ``Invalid`` archive subfolder where they
+            can be inspected for debugging; ``None`` (the default) inherits
+            the value of ``delete``
         test (bool): Do not move or delete messages after processing them
         ip_db_path (str): Path to a MMDB file from IPinfo, MaxMind, or DBIP
         always_use_local_files (bool): Do not download files
@@ -2235,37 +2802,111 @@ def get_dmarc_reports_from_mailbox(
         results (dict): Results from the previous run
         batch_size (int): Number of messages to read and process before saving
             (use 0 for no limit)
-        since: Search for messages since certain time
+        since: Search for messages since a certain time
             (units - {"m":"minutes", "h":"hours", "d":"days", "w":"weeks"})
         create_folders (bool): Whether to create the destination folders
             (not used in watch)
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
-        save_callback: Optional callable invoked once per fetched batch with
-            a ``ParsingResults`` dict containing only that batch's newly
-            parsed reports, after parsing but before messages are deleted or
-            moved out of ``reports_folder``. Returning ``False`` leaves the
-            batch's messages in place for retry on the next run (and does
-            not update the aggregate-report dedup cache, so the batch is
-            reprocessed rather than silently dropped); raising propagates
-            and also leaves messages untouched; any other return value
-            (including ``None``) commits the batch as today. With
-            ``save_callback=None`` (the default), this preserves prior
-            behavior for any batch that completes without an unhandled
-            exception; a mid-batch crash now leaves the aggregate-report
-            dedup cache unmodified for that batch instead of partially
-            populated, which is a related, strictly safer change. Ignored
-            when ``test`` is ``True``, except that it is still invoked
-            (mailbox state is never mutated in test mode regardless of the
-            result).
+        n_procs (int): Number of processes to use for parsing messages in
+            parallel. Fetching, archiving, and deduplication remain
+            sequential in the calling process; only parsing is
+            parallelized. With ``n_procs > 1``, invalid-message disposition
+            happens after the parsing phase completes, rather than
+            interleaved message-by-message as it is when ``n_procs`` is 1.
+            Not part of ``config``; always applies.
+        save_callback: An optional callable invoked once per fetched batch
+            with a ``ParsingResults`` dict holding only that batch's newly
+            parsed reports, after parsing but before any of the batch's
+            messages are deleted or moved out of ``reports_folder``. It
+            tells this function whether the batch was actually persisted:
+
+            * Returning ``False`` means "not saved": the batch's messages
+              are left in ``reports_folder`` for retry on the next run (or
+              moved to ``{archive_folder}/Unsaved`` once they have failed
+              ``max_unsaved_retries`` retries -- see below), and the
+              aggregate-report dedup cache is not updated for that batch, so
+              a retry reparses the same reports instead of skipping them as
+              duplicates.
+            * Raising counts as "not saved" too: the same bookkeeping runs
+              (the batch's messages are held back or moved to ``Unsaved`` at
+              the cap, and the failed attempt counts toward
+              ``max_unsaved_retries``), and the exception is then re-raised
+              to the caller.
+            * Any other return value, including ``None``, commits the batch:
+              the dedup cache is updated and the messages are deleted or
+              archived exactly as they are with no callback.
+
+            ``None`` (the default) commits every batch, preserving the prior
+            behavior. The callback is still invoked when ``test`` is
+            ``True``, so a test run exercises the full pipeline, but neither
+            the mailbox nor the retry counters are touched regardless of
+            what it returns.
+        max_unsaved_retries (int): How many times a message may be *retried*
+            after ``save_callback`` first reported its batch unsaved, before
+            it is moved to the ``Unsaved`` archive subfolder instead of
+            being retried again (default 2, i.e. the initial attempt plus
+            two retries -- at most three deliveries to any output
+            destination that does not deduplicate). ``0`` moves a message on
+            the first failed save; negative values raise ``ValueError``.
+            Messages moved to ``Unsaved`` are never deleted, whatever the
+            ``delete`` options say; recover them by fixing the output
+            destination and moving them back into ``reports_folder``.
+            Counts are kept in memory, per message and
+            per process, are reset by a successful save, and are only kept
+            when a ``save_callback`` is supplied -- so the cap applies
+            across repeated calls within one process (``watch_inbox()``'s
+            checks), not across separate one-shot processes, each of which
+            starts a message's count over. Mailbox orchestration, so like
+            ``batch_size`` it is not part of ``config``.
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, it replaces
+            the individual parsing and enrichment option keyword arguments
+            listed above (DNS, GeoIP, offline mode, attachment payload
+            stripping, timespan normalization), whose values are then
+            ignored. The remaining keyword arguments control mailbox
+            handling and orchestration rather than parsing (the folder
+            names, the ``delete`` options, ``test``, ``since``,
+            ``batch_size``, ``save_callback``, ``max_unsaved_retries``);
+            they are not part of ``config`` and always apply.
 
     Returns:
         dict: Lists of ``aggregate_reports``, ``failure_reports``, and ``smtp_tls_reports``
     """
-    if delete and test:
-        raise ValueError("delete and test options are mutually exclusive")
+    # Each per-report-type flag inherits the overall ``delete`` value when it
+    # is left unset (``None``). Resolve once, up front: every decision below
+    # reads only these four resolved flags. The raw ``delete`` parameter is
+    # still forwarded verbatim to the recursive self-call at the end of this
+    # function, where it is inert because all four resolved flags accompany
+    # it.
+    delete_aggregate = delete if delete_aggregate is None else delete_aggregate
+    delete_failure = delete if delete_failure is None else delete_failure
+    delete_smtp_tls = delete if delete_smtp_tls is None else delete_smtp_tls
+    delete_invalid = delete if delete_invalid is None else delete_invalid
+
+    if test and (
+        delete_aggregate or delete_failure or delete_smtp_tls or delete_invalid
+    ):
+        raise ValueError("delete options and test are mutually exclusive")
+
+    if max_unsaved_retries < 0:
+        raise ValueError("max_unsaved_retries must be >= 0")
 
     if connection is None:
         raise ValueError("Must supply a connection")
+
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        strip_attachment_payloads=strip_attachment_payloads,
+        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+    )
 
     # current_time useful to fetch_messages later in the program
     current_time: datetime | date | str | None = None
@@ -2273,17 +2914,25 @@ def get_dmarc_reports_from_mailbox(
     aggregate_reports: list[AggregateReport] = []
     failure_reports: list[FailureReport] = []
     smtp_tls_reports: list[SMTPTLSReport] = []
+    # This call's own reports, kept separate from the accumulated lists
+    # above (which carry earlier batches' reports in via ``results``) so the
+    # save callback is handed only what this batch parsed.
     batch_aggregate_reports: list[AggregateReport] = []
     batch_failure_reports: list[FailureReport] = []
     batch_smtp_tls_reports: list[SMTPTLSReport] = []
-    batch_seen_aggregate_keys: set[str] = set()
+    # Aggregate dedup keys are staged here and only written to the shared
+    # cache once the batch is known to be saved, so an unsaved batch (or a
+    # mid-batch crash) leaves the cache clean and the reports are reparsed
+    # on the retry instead of being dropped as duplicates.
+    pending_aggregate_keys: set[str] = set()
     aggregate_report_msg_uids = []
     failure_report_msg_uids = []
     smtp_tls_msg_uids = []
-    aggregate_reports_folder = "{0}/Aggregate".format(archive_folder)
-    failure_reports_folder = "{0}/Failure".format(archive_folder)
-    smtp_tls_reports_folder = "{0}/SMTP-TLS".format(archive_folder)
-    invalid_reports_folder = "{0}/Invalid".format(archive_folder)
+    aggregate_reports_folder = f"{archive_folder}/Aggregate"
+    failure_reports_folder = f"{archive_folder}/Failure"
+    smtp_tls_reports_folder = f"{archive_folder}/SMTP-TLS"
+    invalid_reports_folder = f"{archive_folder}/Invalid"
+    unsaved_reports_folder = f"{archive_folder}/Unsaved"
 
     if results:
         aggregate_reports = results["aggregate_reports"].copy()
@@ -2297,6 +2946,11 @@ def get_dmarc_reports_from_mailbox(
         connection.create_folder(failure_reports_folder)
         connection.create_folder(smtp_tls_reports_folder)
         connection.create_folder(invalid_reports_folder)
+        if save_callback is not None:
+            # Only reachable when a callback can report a batch unsaved;
+            # without one no message is ever held back, so the folder would
+            # sit empty in every mailbox.
+            connection.create_folder(unsaved_reports_folder)
 
     if since and isinstance(since, str):
         _since = 1440  # default one day
@@ -2312,17 +2966,17 @@ def get_dmarc_reports_from_mailbox(
                 _since = int(s[1]) * 60 * 24 * 7
         else:
             logger.warning(
-                "Incorrect format for 'since' option. \
-                           Provided value:{0}, Expected values:(5m|3h|2d|1w). \
-                           Ignoring option, fetching messages for last 24hrs"
-                "SMTP does not support a time or timezone in since."
-                "See https://www.rfc-editor.org/rfc/rfc3501#page-52".format(since)
+                f"Incorrect format for 'since' option. Provided value: {since}, "
+                "expected values: (5m|3h|2d|1w). Ignoring option, fetching "
+                "messages for last 24hrs. SMTP does not support a time or "
+                "timezone in since. See "
+                "https://www.rfc-editor.org/rfc/rfc3501#page-52"
             )
 
         if isinstance(connection, IMAPConnection):
             logger.debug(
-                "Only days and weeks values in 'since' option are \
-                         considered for IMAP connections. Examples: 2d or 1w"
+                "Only days and weeks values in 'since' option are considered "
+                "for IMAP connections. Examples: 2d or 1w"
             )
             since = (datetime.now(timezone.utc) - timedelta(minutes=_since)).strftime(
                 "%d-%b-%Y"
@@ -2343,213 +2997,268 @@ def get_dmarc_reports_from_mailbox(
         reports_folder, batch_size=batch_size, since=since
     )
     total_messages = len(messages)
-    logger.debug("Found {0} messages in {1}".format(len(messages), reports_folder))
+    logger.debug(f"Found {len(messages)} messages in {reports_folder}")
 
     if batch_size and not since:
         message_limit = min(total_messages, batch_size)
     else:
         message_limit = total_messages
 
-    logger.debug("Processing {0} messages".format(message_limit))
+    logger.debug(f"Processing {message_limit} messages")
 
-    for i in range(message_limit):
-        msg_uid = messages[i]
-        logger.debug(
-            "Processing message {0} of {1}: UID {2}".format(
-                i + 1, message_limit, msg_uid
-            )
-        )
-        message_id: int | str
-        if isinstance(connection, IMAPConnection):
-            message_id = int(msg_uid)
-            msg_content = connection.fetch_message(message_id)
-        elif isinstance(connection, MSGraphConnection):
-            message_id = str(msg_uid)
-            msg_content = connection.fetch_message(message_id, mark_read=not test)
-        elif isinstance(connection, MaildirConnection):
-            message_id = str(msg_uid) if not isinstance(msg_uid, str) else msg_uid
-            msg_content = connection.fetch_message(message_id, mark_read=not test)
-        else:
-            message_id = str(msg_uid) if not isinstance(msg_uid, str) else msg_uid
-            msg_content = connection.fetch_message(message_id)
-        try:
-            sa = strip_attachment_payloads
-            parsed_email = parse_report_email(
-                msg_content,
-                nameservers=nameservers,
-                dns_timeout=dns_timeout,
-                dns_retries=dns_retries,
-                ip_db_path=ip_db_path,
-                always_use_local_files=always_use_local_files,
-                reverse_dns_map_path=reverse_dns_map_path,
-                reverse_dns_map_url=reverse_dns_map_url,
-                offline=offline,
-                strip_attachment_payloads=sa,
-                keep_alive=connection.keepalive,
-                normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
-            )
-            if parsed_email["report_type"] == "aggregate":
-                report_org = parsed_email["report"]["report_metadata"]["org_name"]
-                report_id = parsed_email["report"]["report_metadata"]["report_id"]
-                report_key = f"{report_org}_{report_id}"
-                if (
-                    report_key not in SEEN_AGGREGATE_REPORT_IDS
-                    and report_key not in batch_seen_aggregate_keys
-                ):
-                    batch_seen_aggregate_keys.add(report_key)
-                    batch_aggregate_reports.append(parsed_email["report"])
-                else:
-                    logger.debug(
-                        f"Skipping duplicate aggregate report with ID: {report_id}"
-                    )
-                aggregate_report_msg_uids.append(message_id)
-            elif parsed_email["report_type"] == "failure":
-                batch_failure_reports.append(parsed_email["report"])
-                failure_report_msg_uids.append(message_id)
-            elif parsed_email["report_type"] == "smtp_tls":
-                batch_smtp_tls_reports.append(parsed_email["report"])
-                smtp_tls_msg_uids.append(message_id)
-        except ParserError as error:
-            logger.warning(error.__str__())
-            if not test:
-                if delete:
-                    logger.debug("Deleting message UID {0}".format(msg_uid))
-                    if isinstance(connection, IMAPConnection):
-                        connection.delete_message(int(message_id))
-                    else:
-                        connection.delete_message(str(message_id))
-                else:
-                    logger.debug(
-                        "Moving message UID {0} to {1}".format(
-                            msg_uid, invalid_reports_folder
-                        )
-                    )
-                    if isinstance(connection, IMAPConnection):
-                        connection.move_message(int(message_id), invalid_reports_folder)
-                    else:
-                        connection.move_message(str(message_id), invalid_reports_folder)
+    if n_procs > 1 and message_limit > 1:
+        from parsedmarc.parallel import _parse_report_email_job, parallel_map
 
+        # The config's caches (ip_address_cache, seen_aggregate_report_ids,
+        # reverse_dns_map) never cross the process boundary --
+        # ParserConfig.__getstate__ drops them, and each worker accumulates
+        # its own via the module defaults it rebinds to on unpickling (see
+        # ParserConfig.__setstate__). keep_alive is a bound method of the
+        # live connection object and is not a ParserConfig field, so it is
+        # never submitted to the pool either; the heartbeat passed to
+        # parallel_map below keeps the connection alive instead.
+        func = functools.partial(_parse_report_email_job, config=cfg)
+
+        # parallel_map yields results in submission order, so the oldest
+        # queued id always belongs to the next yielded result; popping as
+        # results arrive keeps this queue no larger than the in-flight
+        # submission window.
+        fetched_ids: deque[int | str] = deque()
+        invalid_msg_ids: list[int | str] = []
+
+        def _jobs():
+            for i in range(message_limit):
+                msg_uid = messages[i]
+                logger.debug(
+                    f"Processing message {i + 1} of {message_limit}: UID {msg_uid}"
+                )
+                message_id, msg_content = _fetch_mailbox_message(
+                    connection, msg_uid, test
+                )
+                fetched_ids.append(message_id)
+                yield msg_content
+
+        for result in parallel_map(
+            func, _jobs(), n_procs, heartbeat=connection.keepalive
+        ):
+            message_id = fetched_ids.popleft()
+            if isinstance(result, ParserError):
+                logger.warning(str(result))
+                invalid_msg_ids.append(message_id)
+            else:
+                report_type = _classify_parsed_email(
+                    result,
+                    batch_aggregate_reports,
+                    batch_failure_reports,
+                    batch_smtp_tls_reports,
+                    seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
+                    pending_aggregate_keys=pending_aggregate_keys,
+                )
+                if report_type == "aggregate":
+                    aggregate_report_msg_uids.append(message_id)
+                elif report_type == "failure":
+                    failure_report_msg_uids.append(message_id)
+                elif report_type == "smtp_tls":
+                    smtp_tls_msg_uids.append(message_id)
+
+        if not test:
+            for invalid_message_id in invalid_msg_ids:
+                _dispose_invalid_message(
+                    connection,
+                    invalid_message_id,
+                    delete_invalid,
+                    invalid_reports_folder,
+                )
+    else:
+        for i in range(message_limit):
+            msg_uid = messages[i]
+            logger.debug(
+                f"Processing message {i + 1} of {message_limit}: UID {msg_uid}"
+            )
+            message_id, msg_content = _fetch_mailbox_message(connection, msg_uid, test)
+            try:
+                parsed_email = parse_report_email(
+                    msg_content,
+                    config=cfg,
+                    keep_alive=connection.keepalive,
+                )
+                report_type = _classify_parsed_email(
+                    parsed_email,
+                    batch_aggregate_reports,
+                    batch_failure_reports,
+                    batch_smtp_tls_reports,
+                    seen_aggregate_report_ids=cfg.seen_aggregate_report_ids,
+                    pending_aggregate_keys=pending_aggregate_keys,
+                )
+                if report_type == "aggregate":
+                    aggregate_report_msg_uids.append(message_id)
+                elif report_type == "failure":
+                    failure_report_msg_uids.append(message_id)
+                elif report_type == "smtp_tls":
+                    smtp_tls_msg_uids.append(message_id)
+            except ParserError as error:
+                logger.warning(error.__str__())
+                if not test:
+                    _dispose_invalid_message(
+                        connection, message_id, delete_invalid, invalid_reports_folder
+                    )
+
+    # Ask the caller whether this batch actually made it to its output
+    # destinations before touching a single message. A callback that says
+    # otherwise (or raises) means the reports exist nowhere else yet, so no
+    # message may be archived or deleted -- only retained for retry, or moved
+    # intact to the Unsaved folder once retries run out (#242).
     batch_results: ParsingResults = {
         "aggregate_reports": batch_aggregate_reports,
         "failure_reports": batch_failure_reports,
         "smtp_tls_reports": batch_smtp_tls_reports,
     }
     persisted = True
+    callback_error: Exception | None = None
     if save_callback is not None:
-        persisted = save_callback(batch_results) is not False
+        try:
+            persisted = save_callback(batch_results) is not False
+        except Exception as error:
+            # A raising callback is a failed save too: the failure
+            # bookkeeping below still runs (count the attempt, hold or shelve
+            # the messages) before the exception is re-raised, so a callback
+            # that always raises -- e.g. the CLI's under
+            # ``fail_on_output_error`` -- is still bounded by
+            # ``max_unsaved_retries`` even when the caller's watch loop
+            # swallows the exception and keeps checking, as mailsuite's IMAP
+            # and Maildir backends do.
+            persisted = False
+            callback_error = error
+
+    batch_msg_uids = (
+        aggregate_report_msg_uids + failure_report_msg_uids + smtp_tls_msg_uids
+    )
 
     if persisted:
-        for key in batch_seen_aggregate_keys:
-            SEEN_AGGREGATE_REPORT_IDS[key] = True
+        # Committing: the reports are safely stored elsewhere, so record
+        # their dedup keys and forget any earlier failures for these
+        # messages.
+        for report_key in pending_aggregate_keys:
+            cfg.seen_aggregate_report_ids[report_key] = True
         if not test:
-            if delete:
-                processed_messages = (
-                    aggregate_report_msg_uids
-                    + failure_report_msg_uids
-                    + smtp_tls_msg_uids
-                )
-
-                number_of_processed_msgs = len(processed_messages)
-                for i in range(number_of_processed_msgs):
-                    msg_uid = processed_messages[i]
-                    logger.debug(
-                        "Deleting message {0} of {1}: UID {2}".format(
-                            i + 1, number_of_processed_msgs, msg_uid
-                        )
-                    )
-                    try:
-                        connection.delete_message(msg_uid)
-
-                    except Exception as e:
-                        message = "Error deleting message UID"
-                        e = "{0} {1}: {2}".format(message, msg_uid, e)
-                        logger.error("Mailbox error: {0}".format(e))
+            for msg_uid in batch_msg_uids:
+                _FAILED_SAVE_ATTEMPTS.pop((reports_folder, str(msg_uid)), None)
+    elif not test:
+        # Held back for retry. Messages that have now failed the initial
+        # attempt plus ``max_unsaved_retries`` retries stop being retried and
+        # move to the Unsaved folder, bounding duplicate delivery to output
+        # destinations that do not deduplicate; the rest stay put.
+        retained_uids: list[int | str] = []
+        over_cap_uids: list[int | str] = []
+        highest_attempt = 0
+        for msg_uid in batch_msg_uids:
+            attempts_key = (reports_folder, str(msg_uid))
+            attempts = _FAILED_SAVE_ATTEMPTS.get(attempts_key, 0) + 1
+            _FAILED_SAVE_ATTEMPTS[attempts_key] = attempts
+            if attempts > max_unsaved_retries:
+                over_cap_uids.append(msg_uid)
             else:
-                if len(aggregate_report_msg_uids) > 0:
-                    log_message = "Moving aggregate report messages from"
-                    logger.debug(
-                        "{0} {1} to {2}".format(
-                            log_message, reports_folder, aggregate_reports_folder
-                        )
-                    )
-                    number_of_agg_report_msgs = len(aggregate_report_msg_uids)
-                    for i in range(number_of_agg_report_msgs):
-                        msg_uid = aggregate_report_msg_uids[i]
-                        logger.debug(
-                            "Moving message {0} of {1}: UID {2}".format(
-                                i + 1, number_of_agg_report_msgs, msg_uid
-                            )
-                        )
-                        try:
-                            connection.move_message(msg_uid, aggregate_reports_folder)
-                        except Exception as e:
-                            message = "Error moving message UID"
-                            e = "{0} {1}: {2}".format(message, msg_uid, e)
-                            logger.error("Mailbox error: {0}".format(e))
-                if len(failure_report_msg_uids) > 0:
-                    message = "Moving failure report messages from"
-                    logger.debug(
-                        "{0} {1} to {2}".format(
-                            message, reports_folder, failure_reports_folder
-                        )
-                    )
-                    number_of_failure_msgs = len(failure_report_msg_uids)
-                    for i in range(number_of_failure_msgs):
-                        msg_uid = failure_report_msg_uids[i]
-                        message = "Moving message"
-                        logger.debug(
-                            "{0} {1} of {2}: UID {3}".format(
-                                message, i + 1, number_of_failure_msgs, msg_uid
-                            )
-                        )
-                        try:
-                            connection.move_message(msg_uid, failure_reports_folder)
-                        except Exception as e:
-                            e = "Error moving message UID {0}: {1}".format(msg_uid, e)
-                            logger.error("Mailbox error: {0}".format(e))
-                if len(smtp_tls_msg_uids) > 0:
-                    message = "Moving SMTP TLS report messages from"
-                    logger.debug(
-                        "{0} {1} to {2}".format(
-                            message, reports_folder, smtp_tls_reports_folder
-                        )
-                    )
-                    number_of_smtp_tls_uids = len(smtp_tls_msg_uids)
-                    for i in range(number_of_smtp_tls_uids):
-                        msg_uid = smtp_tls_msg_uids[i]
-                        message = "Moving message"
-                        logger.debug(
-                            "{0} {1} of {2}: UID {3}".format(
-                                message, i + 1, number_of_smtp_tls_uids, msg_uid
-                            )
-                        )
-                        try:
-                            connection.move_message(msg_uid, smtp_tls_reports_folder)
-                        except Exception as e:
-                            e = "Error moving message UID {0}: {1}".format(msg_uid, e)
-                            logger.error("Mailbox error: {0}".format(e))
-    else:
-        batch_msg_count = (
-            len(aggregate_report_msg_uids)
-            + len(failure_report_msg_uids)
-            + len(smtp_tls_msg_uids)
-        )
-        logger.warning(
-            "Results were not confirmed saved; leaving %d messages in %s for retry",
-            batch_msg_count,
-            reports_folder,
-        )
+                retained_uids.append(msg_uid)
+                highest_attempt = max(highest_attempt, attempts)
+        if retained_uids:
+            logger.error(
+                f"Reports were not saved: leaving {len(retained_uids)} "
+                f"message(s) in {reports_folder} to retry on the next run "
+                f"or check (failed attempt {highest_attempt} of "
+                f"{max_unsaved_retries + 1})"
+            )
+        if over_cap_uids:
+            logger.error(
+                f"Reports were not saved after {max_unsaved_retries + 1} "
+                f"attempt(s): moving {len(over_cap_uids)} message(s) from "
+                f"{reports_folder} to {unsaved_reports_folder} instead of "
+                "retrying them further. They are never deleted -- fix the "
+                f"output destination, then move them back to {reports_folder}"
+            )
+            _ensure_folder(connection, unsaved_reports_folder)
+            for msg_uid in over_cap_uids:
+                try:
+                    connection.move_message(msg_uid, unsaved_reports_folder)
+                except Exception as e:
+                    e = f"Error moving message UID {msg_uid}: {e}"
+                    logger.error(f"Mailbox error: {e}")
+                else:
+                    # Drop the counter only once the message is actually out
+                    # of the retry loop. Clearing it before a failed move
+                    # would hand the still-in-place message a fresh set of
+                    # under-cap retries (and deliveries); keeping it means
+                    # the next failed save classifies the message over-cap
+                    # again and re-attempts the move instead.
+                    _FAILED_SAVE_ATTEMPTS.pop((reports_folder, str(msg_uid)), None)
+
+    if callback_error is not None:
+        raise callback_error
 
     aggregate_reports += batch_aggregate_reports
     failure_reports += batch_failure_reports
     smtp_tls_reports += batch_smtp_tls_reports
 
+    if persisted and not test:
+        # Each report type is disposed of according to its own effective
+        # delete flag: deleted outright, or moved to its archive subfolder.
+        for msg_uids, delete_type, destination_folder, label in (
+            (
+                aggregate_report_msg_uids,
+                delete_aggregate,
+                aggregate_reports_folder,
+                "aggregate report",
+            ),
+            (
+                failure_report_msg_uids,
+                delete_failure,
+                failure_reports_folder,
+                "failure report",
+            ),
+            (
+                smtp_tls_msg_uids,
+                delete_smtp_tls,
+                smtp_tls_reports_folder,
+                "SMTP TLS report",
+            ),
+        ):
+            number_of_msgs = len(msg_uids)
+            if number_of_msgs == 0:
+                continue
+            if not delete_type:
+                message = f"Moving {label} messages from"
+                logger.debug(f"{message} {reports_folder} to {destination_folder}")
+            for i in range(number_of_msgs):
+                msg_uid = msg_uids[i]
+                if delete_type:
+                    logger.debug(
+                        f"Deleting message {i + 1} of {number_of_msgs}: UID {msg_uid}"
+                    )
+                    try:
+                        connection.delete_message(msg_uid)
+                    except Exception as e:
+                        message = "Error deleting message UID"
+                        e = f"{message} {msg_uid}: {e}"
+                        logger.error(f"Mailbox error: {e}")
+                else:
+                    message = "Moving message"
+                    logger.debug(
+                        f"{message} {i + 1} of {number_of_msgs}: UID {msg_uid}"
+                    )
+                    try:
+                        connection.move_message(msg_uid, destination_folder)
+                    except Exception as e:
+                        e = f"Error moving message UID {msg_uid}: {e}"
+                        logger.error(f"Mailbox error: {e}")
     results = {
         "aggregate_reports": aggregate_reports,
         "failure_reports": failure_reports,
         "smtp_tls_reports": smtp_tls_reports,
     }
 
+    # An unsaved batch left its messages in ``reports_folder``, so the
+    # re-check below would find them again and immediately reprocess the
+    # very messages that just failed -- burning through the retry cap in one
+    # call. Skip it and let the next run retry them.
     if persisted and not test and not batch_size:
         if current_time:
             total_messages = len(
@@ -2567,20 +3276,17 @@ def get_dmarc_reports_from_mailbox(
             reports_folder=reports_folder,
             archive_folder=archive_folder,
             delete=delete,
+            delete_aggregate=delete_aggregate,
+            delete_failure=delete_failure,
+            delete_smtp_tls=delete_smtp_tls,
+            delete_invalid=delete_invalid,
             test=test,
-            nameservers=nameservers,
-            dns_timeout=dns_timeout,
-            dns_retries=dns_retries,
-            strip_attachment_payloads=strip_attachment_payloads,
             results=results,
-            ip_db_path=ip_db_path,
-            always_use_local_files=always_use_local_files,
-            reverse_dns_map_path=reverse_dns_map_path,
-            reverse_dns_map_url=reverse_dns_map_url,
-            offline=offline,
             since=current_time,
-            normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+            n_procs=n_procs,
             save_callback=save_callback,
+            max_unsaved_retries=max_unsaved_retries,
+            config=cfg,
         )
 
     return results
@@ -2593,6 +3299,10 @@ def watch_inbox(
     reports_folder: str = "INBOX",
     archive_folder: str = "Archive",
     delete: bool = False,
+    delete_aggregate: bool | None = None,
+    delete_failure: bool | None = None,
+    delete_smtp_tls: bool | None = None,
+    delete_invalid: bool | None = None,
     test: bool = False,
     check_timeout: int = 30,
     ip_db_path: str | None = None,
@@ -2601,35 +3311,60 @@ def watch_inbox(
     reverse_dns_map_url: str | None = None,
     offline: bool = False,
     nameservers: list[str] | None = None,
-    dns_timeout: float = 6.0,
+    dns_timeout: float = DEFAULT_DNS_TIMEOUT,
     dns_retries: int = DEFAULT_DNS_MAX_RETRIES,
     strip_attachment_payloads: bool = False,
     batch_size: int = 10,
     since: datetime | date | str | None = None,
-    normalize_timespan_threshold_hours: float = 24,
+    normalize_timespan_threshold_hours: float = 24.0,
     config_reloading: Callable | None = None,
+    n_procs: int = 1,
+    max_unsaved_retries: int = 2,
+    config: ParserConfig | None = None,
 ):
     """
-    Watches the mailbox for new messages and
-      sends the results to a callback function
+    Watches the mailbox for new messages and sends the results to a
+    callback function
 
     Args:
         mailbox_connection: The mailbox connection object
         callback: The callback function to receive the parsing results.
-            Passed to ``get_dmarc_reports_from_mailbox()`` as
-            ``save_callback``, so it now runs once per fetched batch
-            *before* that batch's messages are deleted or moved out of
-            ``reports_folder``, rather than being invoked afterward.
-            Returning ``False`` leaves the batch's messages in place and
-            defers the dedup-cache update, so they are retried on the
-            next check instead of being lost; raising also leaves the
-            messages untouched and propagates the exception.
-        reports_folder (str): The IMAP folder where reports can be found
+            Passed straight through to ``get_dmarc_reports_from_mailbox()``
+            as its ``save_callback``, so it now runs once per fetched batch,
+            with only that batch's reports, *before* those messages are
+            deleted or moved out of ``reports_folder`` -- rather than once
+            afterward with the whole check's accumulated results. Returning
+            ``False`` reports the batch as unsaved, leaving its messages in
+            place to be retried on the next check instead of archived or
+            deleted (see ``save_callback`` and ``max_unsaved_retries`` on
+            ``get_dmarc_reports_from_mailbox()``). Raising counts as an
+            unsaved batch too -- same retention and retry cap -- before the
+            exception reaches the mailbox backend's watch loop; what happens
+            then is backend-specific: the Microsoft Graph and Gmail backends
+            let it propagate and end the watch, while mailsuite's IMAP and
+            Maildir watch loops log it and keep checking.
+        reports_folder (str): The folder where reports can be found
         archive_folder (str): The folder to move processed mail to
-        delete (bool): Delete  messages after processing them
+        delete (bool): Delete messages after processing them
+        delete_aggregate (bool | None): Delete aggregate report messages
+            after processing them, instead of moving them to the
+            ``Aggregate`` archive subfolder; ``None`` (the default) inherits
+            the value of ``delete``
+        delete_failure (bool | None): Delete failure report messages after
+            processing them, instead of moving them to the ``Failure``
+            archive subfolder; ``None`` (the default) inherits the value of
+            ``delete``
+        delete_smtp_tls (bool | None): Delete SMTP TLS report messages after
+            processing them, instead of moving them to the ``SMTP-TLS``
+            archive subfolder; ``None`` (the default) inherits the value of
+            ``delete``
+        delete_invalid (bool | None): Delete unparseable messages, instead
+            of moving them to the ``Invalid`` archive subfolder where they
+            can be inspected for debugging; ``None`` (the default) inherits
+            the value of ``delete``
         test (bool): Do not move or delete messages after processing them
-        check_timeout (int): Number of seconds to wait for a IMAP IDLE response
-            or the number of seconds until the next mail check
+        check_timeout (int): Number of seconds to wait for an IMAP IDLE
+            response or the number of seconds until the next mail check
         ip_db_path (str): Path to a MMDB file from IPinfo, MaxMind, or DBIP
         always_use_local_files (bool): Do not download files
         reverse_dns_map_path (str): Path to a reverse DNS map file
@@ -2640,16 +3375,53 @@ def watch_inbox(
         dns_timeout (float): Set the DNS query timeout
         dns_retries (int): Number of times to retry DNS queries on timeout
             or other transient errors
-        strip_attachment_payloads (bool): Replace attachment payloads in
-            failure report samples with None
+        strip_attachment_payloads (bool): Remove attachment payloads from
+            failure report results
         batch_size (int): Number of messages to read and process before saving
-        since: Search for messages since certain time
+        since: Search for messages since a certain time
         normalize_timespan_threshold_hours (float): Normalize timespans beyond this
         config_reloading: Optional callable that returns True when a config
             reload (or shutdown) has been requested (e.g. via SIGHUP/SIGTERM).
             Polled by the mailbox backend between checks, including the IMAP
             IDLE loop, so the watcher exits cleanly at a safe boundary.
+        n_procs (int): Number of processes to use for parsing messages in
+            parallel. Passed through to ``get_dmarc_reports_from_mailbox``
+            on each check. Not part of ``config``; always applies.
+        max_unsaved_retries (int): How many times a message may be retried
+            after ``callback`` first reported its batch unsaved, before it is
+            moved to the ``Unsaved`` archive subfolder (default 2). Passed
+            through to ``get_dmarc_reports_from_mailbox``, where it is
+            documented in full. Not part of ``config``; always applies.
+        config (ParserConfig): a single object carrying all parsing and
+            enrichment options plus the caches; when provided, it replaces
+            the individual parsing and enrichment option keyword arguments
+            listed above (DNS, GeoIP, offline mode, attachment payload
+            stripping, timespan normalization), whose values are then
+            ignored. The remaining keyword arguments control mailbox
+            handling and orchestration rather than parsing (the folder
+            names, the ``delete`` options, ``test``, ``since``,
+            ``batch_size``, ``max_unsaved_retries``); they are not part of
+            ``config`` and always apply.
     """
+    # Validate before the watch loop starts: raised inside a check, this
+    # would be swallowed and endlessly retried by the IMAP and Maildir
+    # backends' per-check exception handling instead of surfacing.
+    if max_unsaved_retries < 0:
+        raise ValueError("max_unsaved_retries must be >= 0")
+
+    cfg = _resolve_config(
+        config,
+        offline=offline,
+        ip_db_path=ip_db_path,
+        always_use_local_files=always_use_local_files,
+        reverse_dns_map_path=reverse_dns_map_path,
+        reverse_dns_map_url=reverse_dns_map_url,
+        nameservers=nameservers,
+        dns_timeout=dns_timeout,
+        dns_retries=dns_retries,
+        strip_attachment_payloads=strip_attachment_payloads,
+        normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+    )
 
     def check_callback(connection):
         get_dmarc_reports_from_mailbox(
@@ -2657,21 +3429,18 @@ def watch_inbox(
             reports_folder=reports_folder,
             archive_folder=archive_folder,
             delete=delete,
+            delete_aggregate=delete_aggregate,
+            delete_failure=delete_failure,
+            delete_smtp_tls=delete_smtp_tls,
+            delete_invalid=delete_invalid,
             test=test,
-            ip_db_path=ip_db_path,
-            always_use_local_files=always_use_local_files,
-            reverse_dns_map_path=reverse_dns_map_path,
-            reverse_dns_map_url=reverse_dns_map_url,
-            offline=offline,
-            nameservers=nameservers,
-            dns_timeout=dns_timeout,
-            dns_retries=dns_retries,
-            strip_attachment_payloads=strip_attachment_payloads,
             batch_size=batch_size,
             since=since,
             create_folders=False,
-            normalize_timespan_threshold_hours=normalize_timespan_threshold_hours,
+            n_procs=n_procs,
             save_callback=callback,
+            max_unsaved_retries=max_unsaved_retries,
+            config=cfg,
         )
 
     watch_kwargs: dict = {
@@ -2751,6 +3520,15 @@ def save_output(
     """
     Save report data in the given directory
 
+    The message sample of each failure report is written to a ``samples``
+    subdirectory, named after the sample's own ``subject`` header run
+    through :func:`parsedmarc.utils.get_filename_safe_string`, falling back
+    to ``sample`` when sanitizing leaves nothing. Since a subject arrives
+    from an untrusted sender, sanitizing happens here, at write time; the
+    ``filename_safe_subject`` key a caller may supply alongside it is not
+    trusted and not used. Names that collide get a ``(1)``, ``(2)``, …
+    suffix.
+
     Args:
         results: Parsing results
         output_directory (str): The path to the directory to save in
@@ -2769,7 +3547,7 @@ def save_output(
 
     if os.path.exists(output_directory):
         if not os.path.isdir(output_directory):
-            raise ValueError("{0} is not a directory".format(output_directory))
+            raise ValueError(f"{output_directory} is not a directory")
     else:
         os.makedirs(output_directory)
 
@@ -2807,20 +3585,16 @@ def save_output(
         sample = failure_report["sample"]
         message_count = 0
         parsed_sample = failure_report["parsed_sample"]
-        subject = (
-            parsed_sample.get("filename_safe_subject")
-            or parsed_sample.get("subject")
-            or "sample"
-        )
+        subject = get_filename_safe_string(parsed_sample.get("subject")) or "sample"
         filename = subject
 
         while filename in sample_filenames:
             message_count += 1
-            filename = "{0} ({1})".format(subject, message_count)
+            filename = f"{subject} ({message_count})"
 
         sample_filenames.append(filename)
 
-        filename = "{0}.eml".format(filename)
+        filename = f"{filename}.eml"
         path = os.path.join(samples_directory, filename)
         with open(path, "w", newline="\n", encoding="utf-8") as sample_file:
             sample_file.write(sample)
@@ -2890,12 +3664,12 @@ def _build_report_email_content(
             attachment_filename += ".zip"
         filename = attachment_filename
     else:
-        filename = "DMARC-{0}.zip".format(date_string)
+        filename = f"DMARC-{date_string}.zip"
 
     if subject is None:
-        subject = "DMARC results for {0}".format(date_string)
+        subject = f"DMARC results for {date_string}"
     if message is None:
-        message = "DMARC results for {0}".format(date_string)
+        message = f"DMARC results for {date_string}"
     zip_bytes = get_report_zip(results)
     attachments = [(filename, zip_bytes)]
 
@@ -2928,7 +3702,7 @@ def email_results(
         mail_from: The value of the message from header
         mail_to (list): A list of addresses to mail to
         mail_cc (list): A list of addresses to CC
-        mail_bcc (list): A list addresses to BCC
+        mail_bcc (list): A list of addresses to BCC
         port (int): Port to use
         require_encryption (bool): Require a secure connection from the start
         verify (bool): verify the SSL/TLS certificate
@@ -2987,7 +3761,7 @@ def email_results_via_msgraph(
             Graph mailbox connection
         mail_to (list): A list of addresses to mail to
         mail_cc (list): A list of addresses to CC
-        mail_bcc (list): A list addresses to BCC
+        mail_bcc (list): A list of addresses to BCC
         subject (str): Overrides the default message subject
         attachment_filename (str): Override the default attachment filename
         message (str): Override the default plain text body

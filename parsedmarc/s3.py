@@ -92,9 +92,7 @@ class S3Client(object):
             report_id,
         )
         logger.debug(
-            "Saving {0} report to s3://{1}/{2}".format(
-                report_type, self.bucket_name, object_path
-            )
+            f"Saving {report_type} report to s3://{self.bucket_name}/{object_path}"
         )
         object_metadata = {
             k: v
@@ -113,6 +111,9 @@ class S3Client(object):
             if self.s3.meta is not None:
                 self.s3.meta.client.close()
         except Exception:
+            # Best-effort: this runs during shutdown/cleanup, and a
+            # failure to close the underlying boto3 client isn't
+            # actionable here.
             pass
 
     # Backward-compatible alias
