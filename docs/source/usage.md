@@ -832,10 +832,8 @@ The full set of configuration options is:
   - `paginate_messages` - bool: When `True`, fetch all applicable Gmail messages.
       When `False`, only fetch up to 100 new messages per run (Default: `True`)
 
-    **Setting up Gmail API access.** No separate `pip` extra is
-    needed — `mailsuite[gmail]` is already a base dependency of
-    parsedmarc, so a normal `pip install parsedmarc` includes
-    everything the Gmail backend needs.
+    **Setting up Gmail API access.** Install the `gmail` extra first:
+    `pip install "parsedmarc[gmail]"` (also included in `[all]`).
 
     1. In the [Google Cloud Console](https://console.cloud.google.com/),
        create or select a project, then enable the **Gmail API** for it
@@ -884,17 +882,6 @@ The full set of configuration options is:
        approve the requested scope. parsedmarc then writes the
        resulting token to `token_file`.
 
-       :::{warning}
-       As of `mailsuite` 2.2.2 (the version this project currently
-       requires), `[gmail_api] oauth2_port` does not actually change
-       the listener's port — a bug passes it under the wrong keyword
-       to the underlying OAuth library, so the listener always binds
-       the library's own default, `8080`, no matter what's configured.
-       Fixed upstream in
-       [seanthegeek/mailsuite#53](https://github.com/seanthegeek/mailsuite/pull/53);
-       until a `mailsuite` release with that fix is available, plan
-       for port `8080` regardless of the `oauth2_port` value.
-       :::
     6. On **subsequent runs**, parsedmarc reads `token_file` directly;
        an expired-but-refreshable token is refreshed silently with no
        browser interaction. Re-authorization (repeating step 5) is only
