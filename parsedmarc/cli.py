@@ -783,6 +783,10 @@ def _parse_config(config: ConfigParser, opts):
             opts.strip_attachment_payloads = bool(
                 general_config.getboolean("strip_attachment_payloads")
             )
+        if "dmarc_lookup_policy" in general_config:
+            opts.dmarc_lookup_policy = bool(
+                general_config.getboolean("dmarc_lookup_policy")
+            )
         if "output" in general_config:
             opts.output = _expand_path(general_config["output"])
         if "archive_directory" in general_config:
@@ -2336,6 +2340,7 @@ def _build_parser_config(opts: Namespace) -> ParserConfig:
             if opts.normalize_timespan_threshold_hours is not None
             else 24.0
         ),
+        dmarc_lookup_policy=bool(opts.dmarc_lookup_policy),
         ip_address_cache=IP_ADDRESS_CACHE,
         seen_aggregate_report_ids=SEEN_AGGREGATE_REPORT_IDS,
         reverse_dns_map=REVERSE_DNS_MAP,
@@ -3049,6 +3054,7 @@ def _main():
         webhook_smtp_tls_url=None,
         webhook_timeout=60,
         normalize_timespan_threshold_hours=24.0,
+        dmarc_lookup_policy=False,
         postgresql_host=None,
         postgresql_port=5432,
         postgresql_user=None,

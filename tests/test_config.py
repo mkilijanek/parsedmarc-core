@@ -136,6 +136,7 @@ class TestParserConfigPickling(unittest.TestCase):
         self.assertIsNone(restored.ip_db_path)
         self.assertIsNone(restored.nameservers)
         self.assertEqual(restored.normalize_timespan_threshold_hours, 24.0)
+        self.assertIs(restored.dmarc_lookup_policy, False)
         # Caches still rebind to the module defaults.
         self.assertIs(restored.ip_address_cache, parsedmarc_config.IP_ADDRESS_CACHE)
         self.assertIs(
@@ -143,6 +144,17 @@ class TestParserConfigPickling(unittest.TestCase):
             parsedmarc_config.SEEN_AGGREGATE_REPORT_IDS,
         )
         self.assertIs(restored.reverse_dns_map, parsedmarc_config.REVERSE_DNS_MAP)
+
+
+class TestParserConfigDmarcLookupPolicy(unittest.TestCase):
+    def test_defaults_off_and_survives_pickling(self):
+        """dmarc_lookup_policy is opt-in (it costs DNS queries per report)
+        and, like every option field, crosses a pickle round-trip, which is
+        how a config reaches a multiprocessing worker."""
+        self.assertIs(parsedmarc_config.ParserConfig().dmarc_lookup_policy, False)
+        cfg = parsedmarc_config.ParserConfig(dmarc_lookup_policy=True)
+        restored = pickle.loads(pickle.dumps(cfg))
+        self.assertIs(restored.dmarc_lookup_policy, True)
 
 
 class TestParserConfigFrozenAndReplace(unittest.TestCase):

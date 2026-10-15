@@ -120,6 +120,12 @@ class ParserConfig:
             email results.
         normalize_timespan_threshold_hours: Aggregate reports whose
             timespan exceeds this many hours are normalized/split.
+        dmarc_lookup_policy: Look up the DMARC policy currently published
+            in DNS for each aggregate report's ``policy_published`` domain
+            (RFC 9989 §4.10 discovery, up to eight TXT queries plus at most
+            one existence query per report) and log a warning when it
+            differs from the report's ``policy_published``. The report
+            itself is never changed. Ignored when ``offline`` is set.
         ip_address_cache: Cache of IP address enrichment results.
         seen_aggregate_report_ids: Cache of already-seen aggregate report
             IDs, used for de-duplication.
@@ -139,6 +145,7 @@ class ParserConfig:
     dns_retries: int = DEFAULT_DNS_MAX_RETRIES
     strip_attachment_payloads: bool = False
     normalize_timespan_threshold_hours: float = 24.0
+    dmarc_lookup_policy: bool = False
     ip_address_cache: ExpiringDict = field(
         default_factory=_new_ip_address_cache, repr=False, compare=False
     )

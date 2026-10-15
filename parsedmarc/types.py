@@ -237,3 +237,41 @@ class ParsingResults(TypedDict):
     aggregate_reports: list[AggregateReport]
     failure_reports: list[FailureReport]
     smtp_tls_reports: list[SMTPTLSReport]
+
+
+class DMARCPolicyRecord(TypedDict):
+    """A DMARC Policy Record parsed per RFC 9989 §4.7/§4.8.
+
+    ``sp`` and ``np`` are ``None`` when the record does not set them; their
+    fallbacks (``np`` -> ``sp`` -> ``p``) are applied by
+    :func:`parsedmarc.dmarc_policy.discover_dmarc_policy`, not here. The
+    other tags carry their RFC 9989 defaults when absent or malformed. The
+    historic ``pct``, ``rf``, and ``ri`` tags are not parsed.
+    """
+
+    raw: str
+    p: str
+    sp: str | None
+    np: str | None
+    adkim: str
+    aspf: str
+    fo: str
+    psd: str
+    t: str
+    rua: list[str]
+    ruf: list[str]
+
+
+class DMARCPolicyDiscovery(TypedDict):
+    """The result of an RFC 9989 §4.10 DMARC policy discovery.
+
+    Every domain name is in lowercase A-label (ASCII) form, without a
+    trailing dot.
+    """
+
+    domain: str
+    record: DMARCPolicyRecord | None
+    record_domain: str | None
+    organizational_domain: str
+    effective_policy: str | None
+    domain_exists: bool | None

@@ -52,6 +52,7 @@ from parsedmarc.constants import (
     DEFAULT_DNS_TIMEOUT,
     __version__,
 )
+from parsedmarc.dmarc_policy import discover_dmarc_policy as discover_dmarc_policy
 from parsedmarc.log import logger
 from parsedmarc.mail import (
     GmailConnection,
@@ -227,10 +228,11 @@ def _resolve_config(
     existing ``ParserConfig`` to start from, and there isn't one on the
     kwargs path -- this function's job is to build the first one.
 
-    ``psl_overrides_path`` / ``psl_overrides_url`` have no corresponding
-    keyword arguments on the public functions (see AGENTS.md's guidance on
-    justifying new config options), so they stay ``None`` on this path; they
-    are only ever set via an explicitly constructed ``config=``.
+    ``psl_overrides_path`` / ``psl_overrides_url`` and
+    ``dmarc_lookup_policy`` have no corresponding keyword arguments on the
+    public functions (see AGENTS.md's guidance on justifying new config
+    options), so they stay at their defaults (``None`` / ``False``) on this
+    path; they are only ever set via an explicitly constructed ``config=``.
     """
     if config is not None:
         return config
@@ -900,6 +902,78 @@ def parsed_smtp_tls_reports_to_csv(
     return csv_file_object.getvalue()
 
 
+def _check_published_dmarc_policy(
+    policy_published: dict[str, Any],
+    report_metadata: dict[str, Any],
+    cfg: ParserConfig,
+) -> None:
+    """Compare an aggregate report's ``policy_published`` with the DMARC
+    policy currently published in DNS, and log a warning on a difference.
+
+    The policy is discovered with :func:`discover_dmarc_policy` (RFC 9989
+    §4.10) for the ``policy_published`` domain. Only the tags both sides
+    carry are compared: ``p``, ``sp``, ``np`` (only when the report sets
+    it), ``adkim``, and ``aspf``. ``sp`` and ``np`` are compared as the
+    values that apply, with the RFC 9989 §4.7 fallbacks (``sp`` -> ``p``,
+    ``np`` -> ``sp`` -> ``p``), matching how the parser fills a missing
+    ``sp`` from ``p``. The report describes a past period and DNS the
+    present, so a difference may be a policy change rather than a reporter
+    error; the warning says so. Nothing is written to the report, and no
+    failure here (a DNS error, an invalid domain) ever fails parsing.
+    """
+    domain = policy_published.get("domain")
+    report_label = (
+        f"report {report_metadata.get('report_id')} from "
+        f"{report_metadata.get('org_name')}"
+    )
+    if not isinstance(domain, str) or not domain.strip():
+        logger.debug(f"Skipping DMARC policy lookup for {report_label}: no domain")
+        return
+    try:
+        discovery = discover_dmarc_policy(
+            domain,
+            nameservers=cfg.nameservers,
+            timeout=cfg.dns_timeout,
+            retries=cfg.dns_retries,
+        )
+    except Exception as e:
+        logger.warning(f"Could not look up the DMARC policy for {domain}: {e}")
+        return
+    record = discovery["record"]
+    if record is None:
+        logger.warning(
+            f"No usable DMARC policy record is currently published in DNS "
+            f"for {domain}, but {report_label} lists a published policy"
+        )
+        return
+
+    def _normalize(value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    dns_sp = record["sp"] or record["p"]
+    dns_values: dict[str, str] = {
+        "p": record["p"],
+        "sp": dns_sp,
+        "adkim": record["adkim"],
+        "aspf": record["aspf"],
+    }
+    if policy_published.get("np") is not None:
+        dns_values["np"] = record["np"] or dns_sp
+    differences = [
+        f"{tag}={_normalize(policy_published.get(tag))!s} in the report, "
+        f"{tag}={value} in DNS"
+        for tag, value in dns_values.items()
+        if _normalize(policy_published.get(tag)) != value
+    ]
+    if differences:
+        logger.warning(
+            f"The DMARC policy currently published at "
+            f"_dmarc.{discovery['record_domain']} differs from the "
+            f"policy_published for {domain} in {report_label} (the policy may "
+            f"have changed since the reporting period): " + "; ".join(differences)
+        )
+
+
 def parse_aggregate_report_xml(
     xml: str | bytes,
     *,
@@ -936,7 +1010,10 @@ def parse_aggregate_report_xml(
         config (ParserConfig): a single object carrying all parsing and
             enrichment options plus the caches; when provided, the
             individual option keyword arguments listed above are ignored in
-            favor of the config's values.
+            favor of the config's values. Its ``dmarc_lookup_policy`` option,
+            which has no keyword argument of its own, compares
+            ``policy_published`` with the DMARC policy currently published
+            in DNS and logs a warning on a difference.
 
     Returns:
         dict: The parsed aggregate DMARC report
@@ -1146,6 +1223,10 @@ def parse_aggregate_report_xml(
                     )
         new_policy_published["discovery_method"] = discovery_method
         new_report["policy_published"] = new_policy_published
+        if cfg.dmarc_lookup_policy and not cfg.offline:
+            _check_published_dmarc_policy(
+                new_policy_published, new_report_metadata, cfg
+            )
 
         if type(report["record"]) is list:
             for i in range(len(report["record"])):

@@ -1840,6 +1840,7 @@ class TestCliParserConfigWiring(unittest.TestCase):
         dns_timeout: float | None = None,
         dns_retries: int | None = None,
         extra_argv: list[str] | None = None,
+        extra_general: list[str] | None = None,
     ) -> parsedmarc.ParserConfig:
         """Runs a real one-shot _main() against a mocked IMAP connection and
         mocked get_dmarc_reports_from_mailbox, and returns the ParserConfig
@@ -1849,9 +1850,10 @@ class TestCliParserConfigWiring(unittest.TestCase):
         ``-c <config_path>`` -- e.g. to exercise a command-line flag such as
         ``--dns-timeout`` without involving the config file's [general]
         dns_timeout key at all. It defaults to None/no extra arguments, so
-        existing callers are unaffected.
+        existing callers are unaffected. ``extra_general`` lines are added
+        to the config file's ``[general]`` section.
         """
-        config_lines = ["[general]", "silent = true"]
+        config_lines = ["[general]", "silent = true"] + list(extra_general or [])
         if dns_timeout is not None:
             config_lines.append(f"dns_timeout = {dns_timeout}")
         if dns_retries is not None:
@@ -1920,6 +1922,15 @@ class TestCliParserConfigWiring(unittest.TestCase):
         self.assertEqual(cfg.dns_timeout, 7.0)
         cfg = self._run_one_shot_mailbox(extra_argv=["--dns_timeout", "9"])
         self.assertEqual(cfg.dns_timeout, 9.0)
+
+    def test_general_dmarc_lookup_policy_reaches_parser_config(self):
+        """``[general] dmarc_lookup_policy`` reaches the ParserConfig the
+        CLI passes as ``config=``, through _build_parser_config (the same
+        builder the SIGHUP reload uses), and is off when unset."""
+        cfg = self._run_one_shot_mailbox(extra_general=["dmarc_lookup_policy = true"])
+        self.assertIs(cfg.dmarc_lookup_policy, True)
+        cfg = self._run_one_shot_mailbox()
+        self.assertIs(cfg.dmarc_lookup_policy, False)
 
     def test_cli_config_binds_module_default_caches(self):
         """The ParserConfig built by the CLI must bind the process-wide
@@ -7435,6 +7446,30 @@ class TestParseConfigGeneral(unittest.TestCase):
             _parse_config(cp, opts)
         self.assertIn("pre-flight", str(ctx.exception))
         self.assertIn("tls://not-an-ip", str(ctx.exception))
+
+    def test_general_dmarc_lookup_policy(self):
+        """``[general] dmarc_lookup_policy`` is parsed as a boolean, from
+        the INI file or from PARSEDMARC_GENERAL_DMARC_LOOKUP_POLICY."""
+        from parsedmarc.cli import _load_config, _parse_config
+
+        for value, expected in (("true", True), ("off", False)):
+            with self.subTest(value=value):
+                opts = _opts()
+                _parse_config(
+                    _config_with("general", {"dmarc_lookup_policy": value}), opts
+                )
+                self.assertIs(opts.dmarc_lookup_policy, expected)
+
+        env = {"PARSEDMARC_GENERAL_DMARC_LOOKUP_POLICY": "yes"}
+        with patch.dict(os.environ, env, clear=False):
+            config = _load_config(None)
+        opts = _opts()
+        _parse_config(config, opts)
+        self.assertIs(opts.dmarc_lookup_policy, True)
+
+        opts = _opts()
+        _parse_config(_config_with("general", {"silent": "true"}), opts)
+        self.assertFalse(hasattr(opts, "dmarc_lookup_policy"))
 
     def test_general_normalize_timespan_threshold(self):
         from parsedmarc.cli import _parse_config

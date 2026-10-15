@@ -33,6 +33,7 @@ import dns.inet
 import dns.message
 import dns.nameserver
 import dns.query
+import dns.rdtypes.txtbase
 import dns.resolver
 import dns.reversename
 import httpx
@@ -373,6 +374,24 @@ def _nameservers_to_resolver_input(
     return resolver_input
 
 
+def _rdata_to_text(rdata) -> str:
+    """Render one answer record as the string ``query_dns`` returns.
+
+    A TXT record's character-strings are concatenated with no separator, as
+    RFC 7208 §3.3 (SPF) and RFC 6376 §3.6.2.2 (DKIM, whose tag-value syntax
+    DMARC records follow per RFC 9989 §4.7) require: "Strings in a TXT RR
+    MUST be concatenated together before use with no intervening
+    whitespace." The presentation form from ``to_text()`` would instead
+    quote each string and join them with a space, which splits a token at
+    every 255-byte chunk boundary, and it escapes quotes, backslashes, and
+    non-ASCII bytes. Other record types keep the presentation form, with
+    quotes and the trailing dot removed.
+    """
+    if isinstance(rdata, dns.rdtypes.txtbase.TXTBase):
+        return b"".join(rdata.strings).decode("utf-8", errors="backslashreplace")
+    return rdata.to_text().replace('"', "").rstrip(".")
+
+
 def query_dns(
     domain: str,
     record_type: str,
@@ -413,7 +432,8 @@ def query_dns(
             nameservers happens within each attempt.
 
     Returns:
-        list: A list of answers
+        list: A list of answers. A TXT record's character-strings are
+        concatenated with no separator, and the bytes are decoded as UTF-8.
     """
     domain = str(domain).lower()
     record_type = record_type.upper()
@@ -459,12 +479,7 @@ def query_dns(
             retries=retries,
             _attempt=_attempt,
         )
-    records = list(
-        map(
-            lambda r: r.to_text().replace('"', "").rstrip("."),
-            answers,
-        )
-    )
+    records = [_rdata_to_text(r) for r in answers]
     if cache:
         cache[cache_key] = records
 
