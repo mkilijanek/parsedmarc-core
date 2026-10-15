@@ -378,10 +378,11 @@ def _rdata_to_text(rdata) -> str:
     """Render one answer record as the string ``query_dns`` returns.
 
     A TXT record's character-strings are concatenated with no separator, as
-    RFC 7208 §3.3 (SPF) and RFC 6376 §3.6.2.2 (DKIM, whose tag-value syntax
-    DMARC records follow per RFC 9989 §4.7) require: "Strings in a TXT RR
-    MUST be concatenated together before use with no intervening
-    whitespace." The presentation form from ``to_text()`` would instead
+    RFC 6376 §3.6.2.2 (DKIM, whose tag-value syntax DMARC records follow per
+    RFC 9989 §4.7) requires: "Strings in a TXT RR MUST be concatenated
+    together before use with no intervening whitespace." RFC 7208 §3.3 (SPF)
+    likewise says to treat multiple strings as concatenated without adding
+    spaces. The presentation form from ``to_text()`` would instead
     quote each string and join them with a space, which splits a token at
     every 255-byte chunk boundary, and it escapes quotes, backslashes, and
     non-ASCII bytes. Other record types keep the presentation form, with

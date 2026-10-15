@@ -133,14 +133,28 @@ def _enum(value: str | None, allowed: frozenset[str]) -> str | None:
 
 
 def _parse_fo(value: str | None) -> str:
-    """Return a valid ``fo`` value (§4.8 dmarc-fo: colon-separated options,
-    "each may appear at most once"), or the §4.7 default ``"0"``."""
+    """Return a valid ``fo`` value, or the §4.7 default ``"0"``.
+
+    §4.8 dmarc-fo is colon-separated ``0``, ``1``, ``d``, and ``s`` options,
+    each at most once, in which ``0`` and ``1`` are mutually exclusive.
+    """
     if value is None:
         return "0"
     options = [option.strip(" \t").lower() for option in value.split(":")]
-    if len(set(options)) != len(options) or not set(options) <= _FO_VALUES:
+    if (
+        len(set(options)) != len(options)
+        or not set(options) <= _FO_VALUES
+        or {"0", "1"} <= set(options)
+    ):
         return "0"
     return ":".join(options)
+
+
+def effective_subdomain_policies(record: DMARCPolicyRecord) -> tuple[str, str]:
+    """Return the ``(sp, np)`` that apply, with the RFC 9989 §4.7 fallbacks
+    ``np`` -> ``sp`` -> ``p`` resolved for a record that leaves them unset."""
+    subdomain_policy = record["sp"] or record["p"]
+    return subdomain_policy, record["np"] or subdomain_policy
 
 
 def _record_from_tags(raw: str, tags: dict[str, str]) -> DMARCPolicyRecord | None:
@@ -453,8 +467,7 @@ def discover_dmarc_policy(
         result["effective_policy"] = record["p"]
         return result
 
-    subdomain_policy = record["sp"] or record["p"]
-    nonexistent_policy = record["np"] or subdomain_policy
+    subdomain_policy, nonexistent_policy = effective_subdomain_policies(record)
     if subdomain_policy == nonexistent_policy:
         result["effective_policy"] = subdomain_policy
         return result

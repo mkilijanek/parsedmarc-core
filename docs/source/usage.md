@@ -189,8 +189,8 @@ The full set of configuration options is:
       database and reverse DNS map.
   - `dmarc_lookup_policy` - bool: Look up the DMARC policy currently
       published in DNS for the `policy_published` domain of each aggregate
-      report, and log a warning when its `p`, `sp`, `np`, `adkim`, or `aspf`
-      differs from the report's `policy_published` (Default: `False`). The
+      report, and log a warning when its `p`, `sp`, `adkim`, or `aspf` (or
+      `np`, only when the report sets it) differs from the report's `policy_published` (Default: `False`). The
       lookup follows the RFC 9989 DNS Tree Walk, so it costs up to eight
       TXT queries per report, plus at most one query to test whether the
       domain exists when the record was found at a parent domain whose

@@ -178,12 +178,25 @@ class TestParseDmarcRecord(unittest.TestCase):
         self.assertEqual(record["t"], "n")
 
     def test_fo_options_at_most_once(self):
-        """§4.8 dmarc-afrf: "each may appear at most once in dmarc-fo"."""
+        """§4.8 dmarc-fo: each option may appear at most once."""
         valid = parse_dmarc_record("v=DMARC1; fo=0:S")
         repeated = parse_dmarc_record("v=DMARC1; fo=1:1")
         assert valid is not None and repeated is not None
         self.assertEqual(valid["fo"], "0:s")
         self.assertEqual(repeated["fo"], "0")
+
+    def test_fo_zero_and_one_are_mutually_exclusive(self):
+        """§4.8 dmarc-fo: each ABNF alternative takes one of "0"/"1", never
+        both, so fo=0:1 and fo=1:0 are malformed and fall back to the
+        default "0"; a single "1" with d/s options stays valid."""
+        for value in ("0:1", "1:0", "d:0:1"):
+            with self.subTest(fo=value):
+                record = parse_dmarc_record(f"v=DMARC1; fo={value}")
+                assert record is not None
+                self.assertEqual(record["fo"], "0")
+        record = parse_dmarc_record("v=DMARC1; fo=1:d:s")
+        assert record is not None
+        self.assertEqual(record["fo"], "1:d:s")
 
     def test_malformed_segments_are_skipped(self):
         """A segment that is not name=value with a 1*ALPHA name and a

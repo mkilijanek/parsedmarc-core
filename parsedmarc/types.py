@@ -243,8 +243,8 @@ class DMARCPolicyRecord(TypedDict):
     """A DMARC Policy Record parsed per RFC 9989 §4.7/§4.8.
 
     ``sp`` and ``np`` are ``None`` when the record does not set them; their
-    fallbacks (``np`` -> ``sp`` -> ``p``) are applied by
-    :func:`parsedmarc.dmarc_policy.discover_dmarc_policy`, not here. The
+    fallbacks (``np`` -> ``sp`` -> ``p``) are not applied here; use
+    :func:`parsedmarc.dmarc_policy.effective_subdomain_policies`. The
     other tags carry their RFC 9989 defaults when absent or malformed. The
     historic ``pct``, ``rf``, and ``ri`` tags are not parsed.
     """

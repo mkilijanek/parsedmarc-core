@@ -53,6 +53,7 @@ from parsedmarc.constants import (
     __version__,
 )
 from parsedmarc.dmarc_policy import discover_dmarc_policy as discover_dmarc_policy
+from parsedmarc.dmarc_policy import effective_subdomain_policies
 from parsedmarc.log import logger
 from parsedmarc.mail import (
     GmailConnection,
@@ -950,7 +951,7 @@ def _check_published_dmarc_policy(
     def _normalize(value: Any) -> Any:
         return value.strip().lower() if isinstance(value, str) else value
 
-    dns_sp = record["sp"] or record["p"]
+    dns_sp, dns_np = effective_subdomain_policies(record)
     dns_values: dict[str, str] = {
         "p": record["p"],
         "sp": dns_sp,
@@ -958,7 +959,7 @@ def _check_published_dmarc_policy(
         "aspf": record["aspf"],
     }
     if policy_published.get("np") is not None:
-        dns_values["np"] = record["np"] or dns_sp
+        dns_values["np"] = dns_np
     differences = [
         f"{tag}={_normalize(policy_published.get(tag))!s} in the report, "
         f"{tag}={value} in DNS"
@@ -966,11 +967,19 @@ def _check_published_dmarc_policy(
         if _normalize(policy_published.get(tag)) != value
     ]
     if differences:
+        record_domain = discovery["record_domain"]
+        if record_domain == domain:
+            where = f"The DMARC policy currently published at _dmarc.{domain}"
+        else:
+            where = (
+                f"No DMARC policy record is currently published at "
+                f"_dmarc.{domain}, so the comparison is against the record "
+                f"at its parent _dmarc.{record_domain}, which"
+            )
         logger.warning(
-            f"The DMARC policy currently published at "
-            f"_dmarc.{discovery['record_domain']} differs from the "
-            f"policy_published for {domain} in {report_label} (the policy may "
-            f"have changed since the reporting period): " + "; ".join(differences)
+            f"{where} differs from the policy_published for {domain} in "
+            f"{report_label} (the policy may have changed since the reporting "
+            f"period): " + "; ".join(differences)
         )
 
 

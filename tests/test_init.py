@@ -2940,6 +2940,29 @@ class TestDmarcLookupPolicy(unittest.TestCase):
             self._parse(zone, "<p>reject</p>")
         self.assertIn("_dmarc.example.com", zone.names())
 
+    def test_parent_record_mismatch_warning_names_both_domains(self):
+        """With no record at the report's domain, the warning says so and
+        names the parent whose record is the comparison target."""
+        zone = FakeDNS(txt={"_dmarc.example.com": ["v=DMARC1; p=reject"]})
+        xml = self.XML.format(policy="<p>none</p>").replace(
+            "<domain>example.com</domain>", "<domain>mail.example.com</domain>"
+        )
+        config = parsedmarc.ParserConfig(
+            dmarc_lookup_policy=True,
+            always_use_local_files=True,
+            nameservers=["192.0.2.53"],
+        )
+        with zone.patch(), self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+            parsedmarc.parse_aggregate_report_xml(xml, config=config)
+        warnings = [m for m in cm.output if "p=none in the report" in m]
+        self.assertEqual(len(warnings), 1, cm.output)
+        self.assertIn(
+            "No DMARC policy record is currently published at "
+            "_dmarc.mail.example.com, so the comparison is against the record "
+            "at its parent _dmarc.example.com",
+            warnings[0],
+        )
+
     def test_no_record_in_dns_logs_warning(self):
         zone = FakeDNS()
         with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
