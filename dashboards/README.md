@@ -11,7 +11,7 @@ Edits to any of these files should be exported from a running instance after aut
 
 ## The dev stack
 
-[docker-compose.dashboard-dev.yml](../docker-compose.dashboard-dev.yml) brings up every viz target at once so a single dashboard change can be authored and re-exported across all four UIs in one session. It `include:`s [docker-compose.yml](../docker-compose.yml) for the Elasticsearch and OpenSearch backends, then layers on Kibana, OpenSearch Dashboards, Grafana, and Splunk.
+[docker-compose.dashboard-dev.yml](../docker-compose.dashboard-dev.yml) brings up every viz target at once so a single dashboard change can be authored and re-exported across all four UIs in one session. It `include:`s [docker-compose.yml](../docker-compose.yml) for the Elasticsearch and OpenSearch backends, then layers on Kibana, OpenSearch Dashboards, Grafana, Splunk, and a PostgreSQL backend.
 
 | Service               | URL                                              | Credentials                                            |
 | --------------------- | ------------------------------------------------ | ------------------------------------------------------ |
@@ -20,13 +20,14 @@ Edits to any of these files should be exported from a running instance after aut
 | Kibana                | http://localhost:5601                            | (security disabled)                                    |
 | OpenSearch Dashboards | http://localhost:5602                            | `admin` / `$OPENSEARCH_INITIAL_ADMIN_PASSWORD`         |
 | Grafana               | http://localhost:3000                            | `admin` / `$GRAFANA_PASSWORD`                          |
+| PostgreSQL            | localhost:5432                                   | `parsedmarc` / `parsedmarc` (override: `POSTGRESQL_*`) |
 | Splunk Web / HEC      | http://localhost:8000 / https://localhost:8088   | `admin` / `$SPLUNK_PASSWORD`, HEC token `$SPLUNK_HEC_TOKEN` |
 
 All ports bind to `127.0.0.1` only.
 
 ## Prerequisites
 
-1. Docker with the Compose v2 plugin.
+1. Docker or Podman, with a Compose implementation (`docker compose` or `docker-compose`; `podman compose` or `podman-compose`). Compose v2 spec support is required because the compose file uses `include:`.
 2. A repo-root `.env` defining the secrets the compose file references:
 
    ```ini
@@ -37,7 +38,7 @@ All ports bind to `127.0.0.1` only.
    ```
 
    Pick any values you like — these are local-only dev secrets. Both `.env` and `parsedmarc*.ini` are gitignored. The matching values must also appear in [parsedmarc-dev.ini](../parsedmarc-dev.ini), which the bootstrap script feeds to the parsedmarc CLI for sample-data ingestion.
-3. The parsedmarc CLI on `PATH` (or in `./venv/bin/`) — `pip install -e .[build]` from the repo root works. Override the lookup with `PARSEDMARC_BIN=/path/to/parsedmarc` if needed.
+3. The parsedmarc CLI on `PATH` (or in `./venv/bin/`) — `pip install -e ".[all,postgresql]"` from the repo root works. The `all` and `postgresql` extras are what the bootstrap script installs, and the seed needs them: the Elasticsearch, OpenSearch, and PostgreSQL outputs each live behind an extra. Override the lookup with `PARSEDMARC_BIN=/path/to/parsedmarc` if needed.
 
 ## One-shot bootstrap
 
@@ -47,11 +48,13 @@ All ports bind to `127.0.0.1` only.
 ./dashboard-dev-bootstrap.sh
 ```
 
+It auto-detects the container backend (Docker preferred, Podman as a fallback), which can be forced with `--backend docker|podman` or the `CONTAINER_BACKEND` environment variable. Run `./dashboard-dev-bootstrap.sh --help` for the full option and env var list.
+
 It does, in order:
 
-1. `docker compose -f docker-compose.dashboard-dev.yml up -d` and waits for every service's health endpoint.
+1. Brings up the compose stack with the detected compose command (`docker compose -f docker-compose.dashboard-dev.yml up -d`, or the `docker-compose`/`podman compose`/`podman-compose` equivalent) and waits for every service's health endpoint.
 2. Provisions Splunk: creates the `email` index, creates the `DMARC` app, configures the auto-created HEC token to allow the `email` index, and scopes the search-app's "scheduled export" announcement view away from `global` so it stops appearing in the DMARC app's dashboard list.
-3. Seeds Elasticsearch, OpenSearch, and Splunk with parsedmarc-parsed sample reports (from [samples/](../samples/)) so the dashboards render against real data. Skipped when ES already has aggregate docs — pass `RESEED=1` to wipe and re-seed all three backends.
+3. Seeds Elasticsearch, OpenSearch, Splunk, and PostgreSQL with parsedmarc-parsed sample reports (from [samples/](../samples/)) so the dashboards render against real data. Skipped when ES already has aggregate docs — pass `RESEED=1` to wipe and re-seed all four backends.
 4. Imports the dashboard files from this directory into the running services. This step always runs, so the typical edit loop is **edit in the UI → export → save into this directory → re-run the bootstrap script** to verify the file imports cleanly into a fresh service.
 
 VS Code users can run this via the **Dev Dashboard: Bootstrap** task in [.vscode/tasks.json](../.vscode/tasks.json). **Dev Dashboard: Up** brings the stack up without importing or seeding.
@@ -82,13 +85,34 @@ The bootstrap script provisions two `elasticsearch` datasources (`dmarc-ag` for 
 2. Open the dashboard's **Source** view, copy the XML, and paste it over the matching file in [splunk/](splunk/) (`dmarc_aggregate_dashboard.xml`, `dmarc_failure_dashboard.xml`, or `smtp_tls_dashboard.xml`).
 3. Re-run the bootstrap script. It re-imports each view via `DELETE` + `POST` to the splunkd management API.
 
+## Screenshotting the dashboards
+
+[dashboard-dev-screenshots.py](../dashboard-dev-screenshots.py) captures how
+each UI actually renders the current sample data — useful for verifying a
+dashboard change end-to-end and for PR evidence. One-time setup, then run
+against the live stack:
+
+```bash
+pip install playwright && playwright install chromium
+set -a; . ./.env; set +a
+./dashboard-dev-screenshots.py            # all four UIs
+./dashboard-dev-screenshots.py grafana    # or a subset
+```
+
+Output lands in `dashboard-screenshots/` (gitignored). The script encodes
+the platform quirks that otherwise cost time to rediscover: Kibana/OSD
+dashboards never reach Playwright's "networkidle" (fixed render waits are
+used instead), OSD must be pinned to `?security_tenant=global` or a stale
+private-tenant copy may be captured, and Grafana/Splunk need their login
+forms driven rather than HTTP basic auth.
+
 ## Reseeding sample data
 
 ```bash
 RESEED=1 ./dashboard-dev-bootstrap.sh
 ```
 
-Wipes every `dmarc_aggregate*` / `dmarc_failure*` / `dmarc_forensic*` / `smtp_tls*` index from ES and OS, drops and recreates the Splunk `email` index, then re-runs the parsedmarc CLI against the curated sample list. Use this after changing parsedmarc's enrichment or output schemas.
+Wipes every `dmarc_aggregate*` / `dmarc_failure*` / `dmarc_forensic*` / `smtp_tls*` index from ES and OS, drops and recreates the Splunk `email` index and the PostgreSQL schema, then re-runs the parsedmarc CLI against the curated sample list. Use this after changing parsedmarc's enrichment or output schemas.
 
 ## Tearing the stack down
 
@@ -96,3 +120,5 @@ Wipes every `dmarc_aggregate*` / `dmarc_failure*` / `dmarc_forensic*` / `smtp_tl
 docker compose -f docker-compose.dashboard-dev.yml down          # stop containers, keep volumes
 docker compose -f docker-compose.dashboard-dev.yml down -v       # also drop volumes (full reset)
 ```
+
+Substitute `podman compose` (or `podman-compose`) for `docker compose` if Podman is the selected backend.

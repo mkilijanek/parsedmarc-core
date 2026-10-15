@@ -1,23 +1,33 @@
 """Tests for parsedmarc.cli — CLI entry point, config parsing,
 env-var overrides, mailbox watch wiring, and SIGHUP reload."""
 
+import importlib
+import importlib.abc
+import importlib.machinery
 import io
 import json
 import logging
 import os
+import shutil
 import signal
+import stat
 import sys
 import tempfile
 import unittest
 import zipfile
+from collections.abc import Iterator, Sequence
 from configparser import ConfigParser
+from contextlib import contextmanager
 from tempfile import NamedTemporaryFile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 import httpx
+import opensearchpy
 from azure.core.exceptions import ClientAuthenticationError
+from elasticsearch import Elasticsearch
+from kiota_abstractions.api_error import APIError
 from msgraph.generated.models.o_data_errors.inner_error import InnerError
 from msgraph.generated.models.o_data_errors.main_error import MainError
 from msgraph.generated.models.o_data_errors.o_data_error import ODataError
@@ -25,7 +35,49 @@ from msgraph.generated.models.o_data_errors.o_data_error import ODataError
 import parsedmarc
 import parsedmarc.cli
 import parsedmarc.elastic
+import parsedmarc.log
+import parsedmarc.mail
 import parsedmarc.opensearch as opensearch_module
+import parsedmarc.resources.ipinfo
+import parsedmarc.utils
+from parsedmarc.types import AggregateReport, ParsedReport
+
+SAMPLE_AGGREGATE_REPORT_PATH = (
+    "samples/aggregate/!example.com!1538204542!1538463818.xml"
+)
+
+
+def _sample_aggregate_reports() -> list[AggregateReport]:
+    """Parses a real sample aggregate report so tests that exercise the
+    real zip/CSV-building code path (email_results / email_results_via_msgraph)
+    have a fully valid AggregateReport rather than a hand-built partial
+    dict that would fail in parsed_aggregate_reports_to_csv_rows()."""
+    result = parsedmarc.parse_report_file(SAMPLE_AGGREGATE_REPORT_PATH, offline=True)
+    assert result["report_type"] == "aggregate"
+    return [cast(AggregateReport, result["report"])]
+
+
+def _fetch_invoking_save_callback(reports, *, batch=None):
+    """Build a ``get_dmarc_reports_from_mailbox`` mock side effect that
+    honors the real contract: every fetched batch is handed to
+    ``save_callback`` *before* the function returns, and the accumulated
+    results are returned afterward.
+
+    A plain ``return_value`` mock would leave ``save_callback`` uncalled, so
+    nothing would ever be written to any output destination -- which is not
+    how the CLI behaves against a real mailbox since #242.
+
+    ``batch`` overrides what the callback receives, for tests that need the
+    batch dict to be a distinct object from the returned results (the real
+    function builds its return value from its own accumulated lists, not
+    from the dict it passed to the callback).
+    """
+
+    def _fetch_and_save(**kwargs):
+        kwargs["save_callback"](reports if batch is None else batch)
+        return reports
+
+    return _fetch_and_save
 
 
 class _BreakLoop(BaseException):
@@ -175,20 +227,13 @@ aws_service = aoss
     ):
         """CLI should exit with code 1 when fail_on_output_error is enabled"""
         mock_imap_connection.return_value = object()
-        reports_dict = {
-            "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
-            "failure_reports": [],
-            "smtp_tls_reports": [],
-        }
-
-        def _fetch_and_save(**kwargs):
-            # Simulate the real get_dmarc_reports_from_mailbox contract:
-            # save_callback is invoked with the batch before this function
-            # returns.
-            kwargs["save_callback"](reports_dict)
-            return reports_dict
-
-        mock_get_reports.side_effect = _fetch_and_save
+        mock_get_reports.side_effect = _fetch_invoking_save_callback(
+            {
+                "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
+                "failure_reports": [],
+                "smtp_tls_reports": [],
+            }
+        )
         mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
             "simulated output failure"
         )
@@ -234,17 +279,13 @@ hosts = localhost
         mock_save_aggregate,
     ):
         mock_imap_connection.return_value = object()
-        reports_dict = {
-            "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
-            "failure_reports": [],
-            "smtp_tls_reports": [],
-        }
-
-        def _fetch_and_save(**kwargs):
-            kwargs["save_callback"](reports_dict)
-            return reports_dict
-
-        mock_get_reports.side_effect = _fetch_and_save
+        mock_get_reports.side_effect = _fetch_invoking_save_callback(
+            {
+                "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
+                "failure_reports": [],
+                "smtp_tls_reports": [],
+            }
+        )
         mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
             "simulated output failure"
         )
@@ -296,17 +337,13 @@ hosts = localhost
         mock_save_failure_opensearch,
     ):
         mock_imap_connection.return_value = object()
-        reports_dict = {
-            "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
-            "failure_reports": [{"reported_domain": "example.com"}],
-            "smtp_tls_reports": [],
-        }
-
-        def _fetch_and_save(**kwargs):
-            kwargs["save_callback"](reports_dict)
-            return reports_dict
-
-        mock_get_reports.side_effect = _fetch_and_save
+        mock_get_reports.side_effect = _fetch_invoking_save_callback(
+            {
+                "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
+                "failure_reports": [{"reported_domain": "example.com"}],
+                "smtp_tls_reports": [],
+            }
+        )
         mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
             "aggregate sink failed"
         )
@@ -345,74 +382,6 @@ hosts = localhost
         self.assertEqual(ctx.exception.code, 1)
         mock_save_aggregate.assert_called_once()
         mock_save_failure_opensearch.assert_called_once()
-
-    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
-    @patch("parsedmarc.cli.elastic.migrate_indexes")
-    @patch("parsedmarc.cli.elastic.set_hosts")
-    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
-    @patch("parsedmarc.cli.IMAPConnection")
-    def testSingleShotMailboxSaveCallbackReflectsOutputErrors(
-        self,
-        mock_imap_connection,
-        mock_get_reports,
-        _mock_set_hosts,
-        _mock_migrate_indexes,
-        mock_save_aggregate,
-    ):
-        """The save_callback the single-shot path passes to
-        get_dmarc_reports_from_mailbox is a callable that reports whether
-        the batch was actually saved: truthy when process_reports recorded
-        no output errors, False when it did. This is the contract
-        get_dmarc_reports_from_mailbox relies on to decide whether it is
-        safe to archive/delete the batch's mailbox messages."""
-        mock_imap_connection.return_value = object()
-        mock_get_reports.return_value = {
-            "aggregate_reports": [],
-            "failure_reports": [],
-            "smtp_tls_reports": [],
-        }
-
-        config = """[general]
-save_aggregate = true
-silent = true
-
-[imap]
-host = imap.example.com
-user = test-user
-password = test-password
-
-[elasticsearch]
-hosts = localhost
-"""
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".ini", delete=False
-        ) as config_file:
-            config_file.write(config)
-            config_path = config_file.name
-        self.addCleanup(lambda: os.path.exists(config_path) and os.remove(config_path))
-
-        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
-            parsedmarc.cli._main()
-
-        save_callback = mock_get_reports.call_args.kwargs.get("save_callback")
-        self.assertTrue(callable(save_callback))
-
-        passing_batch = {
-            "aggregate_reports": [],
-            "failure_reports": [],
-            "smtp_tls_reports": [],
-        }
-        self.assertIsNot(save_callback(passing_batch), False)
-
-        mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
-            "simulated output failure"
-        )
-        failing_batch = {
-            "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
-            "failure_reports": [],
-            "smtp_tls_reports": [],
-        }
-        self.assertFalse(save_callback(failing_batch))
 
     def test_resolve_section_key_simple(self):
         """Simple section names resolve correctly."""
@@ -480,6 +449,203 @@ hosts = localhost
                 sorted(_expand_file_path_args([wildcard])),
                 sorted([bracket, plain]),
             )
+
+    def test_expand_file_path_args_directory(self):
+        """A directory argument expands to the files directly inside it,
+        matching shell ``<dir>/*`` glob semantics: dotfile entries are
+        excluded and subdirectories are skipped (not descended into).
+        See https://docs.python.org/3/library/glob.html.
+        """
+        from parsedmarc.cli import _expand_file_path_args
+
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "sub"))
+            a_xml = os.path.join(d, "a.xml")
+            b_eml = os.path.join(d, "b.eml")
+            c_xml = os.path.join(d, "sub", "c.xml")
+            hidden = os.path.join(d, ".hidden")
+            for p in (a_xml, b_eml, c_xml, hidden):
+                with open(p, "w") as f:
+                    f.write("x")
+
+            result = _expand_file_path_args([d])
+
+            self.assertEqual(sorted(result), sorted([a_xml, b_eml]))
+            self.assertNotIn(os.path.join(d, "sub"), result)
+            self.assertNotIn(c_xml, result)
+            self.assertNotIn(hidden, result)
+
+            # A trailing separator on the directory argument behaves the same.
+            result_trailing = _expand_file_path_args([d + os.sep])
+            self.assertEqual(
+                sorted(os.path.basename(p) for p in result_trailing),
+                sorted(os.path.basename(p) for p in result),
+            )
+
+    def test_expand_file_path_args_directory_recursive(self):
+        """With recursive=True, a directory expands via ``<dir>/**``,
+        descending into subdirectories but still excluding dotfiles and
+        dot-directories (glob's ``**`` does not descend into hidden
+        directories unless explicitly matched).
+        See https://docs.python.org/3/library/glob.html.
+        """
+        from parsedmarc.cli import _expand_file_path_args
+
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "sub"))
+            os.makedirs(os.path.join(d, ".hiddendir"))
+            a_xml = os.path.join(d, "a.xml")
+            b_eml = os.path.join(d, "b.eml")
+            c_xml = os.path.join(d, "sub", "c.xml")
+            hidden = os.path.join(d, ".hidden")
+            hidden_dir_file = os.path.join(d, ".hiddendir", "d.xml")
+            for p in (a_xml, b_eml, c_xml, hidden, hidden_dir_file):
+                with open(p, "w") as f:
+                    f.write("x")
+
+            result = _expand_file_path_args([d], recursive=True)
+
+            self.assertEqual(sorted(result), sorted([a_xml, b_eml, c_xml]))
+            self.assertNotIn(d, result)
+            self.assertNotIn(os.path.join(d, "sub"), result)
+            self.assertNotIn(hidden, result)
+            self.assertNotIn(hidden_dir_file, result)
+
+    def test_expand_file_path_args_directory_with_glob_metacharacters(self):
+        """A directory name containing glob metacharacters must still be
+        expanded correctly, not treated as a character class.
+
+        Without escaping the directory component with ``glob.escape``,
+        a directory named ``reports [2024]`` would have ``[2024]``
+        interpreted as a character class matching a single '2', '0', or
+        '4' character, matching nothing and silently dropping every file
+        inside it. See https://docs.python.org/3/library/glob.html.
+        """
+        from parsedmarc.cli import _expand_file_path_args
+
+        with tempfile.TemporaryDirectory() as d:
+            bracket_dir = os.path.join(d, "reports [2024]")
+            os.makedirs(bracket_dir)
+            report = os.path.join(bracket_dir, "report.xml")
+            with open(report, "w") as f:
+                f.write("x")
+
+            self.assertEqual(_expand_file_path_args([bracket_dir]), [report])
+            self.assertEqual(
+                _expand_file_path_args([bracket_dir], recursive=True), [report]
+            )
+
+    def test_expand_file_path_args_recursive_glob_pattern(self):
+        """``recursive`` also governs whether ``**`` in an explicit glob
+        pattern recurses into subdirectories, matching stdlib ``glob()``
+        semantics exactly.
+
+        Per https://docs.python.org/3/library/glob.html: "If recursive is
+        true, the pattern '**' will match any files and zero or more
+        directories... If recursive is false (the default), the pattern
+        '**' will match the same files and directories described for the
+        pattern '*'" (i.e. exactly one path segment). For a pattern like
+        ``d/**/*.xml`` that means the non-recursive default only matches
+        files exactly one directory level below ``d`` (here, only the
+        nested file); this is unchanged from today's behavior since
+        ``_expand_file_path_args`` previously always called ``glob()``
+        without ``recursive=True``.
+        """
+        from parsedmarc.cli import _expand_file_path_args
+
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "sub"))
+            top_xml = os.path.join(d, "x.xml")
+            nested_xml = os.path.join(d, "sub", "y.xml")
+            for p in (top_xml, nested_xml):
+                with open(p, "w") as f:
+                    f.write("x")
+
+            pattern = os.path.join(d, "**", "*.xml")
+
+            self.assertEqual(
+                sorted(_expand_file_path_args([pattern], recursive=True)),
+                sorted([top_xml, nested_xml]),
+            )
+            # Default (no recursive kwarg): '**' degrades to matching a
+            # single path component, so only the one-level-nested file
+            # is found; the top-level file is not matched by this pattern.
+            self.assertEqual(
+                _expand_file_path_args([pattern]),
+                [nested_xml],
+            )
+
+    def test_expand_file_path_args_warns_on_nonexistent_path(self):
+        """A file_path argument that matches no files at all -- a plain
+        path that doesn't exist and isn't a glob match -- logs a WARNING
+        naming that argument, instead of silently vanishing as a
+        zero-match glob. The argument still contributes no paths to the
+        returned list.
+
+        Regression test: ``parsedmarc --offline -o out /nonexistent.xml``
+        used to exit 0 with empty results and no message of any kind, so
+        a typo'd path in a cron job "worked" forever while processing
+        nothing.
+        """
+        from parsedmarc.cli import _expand_file_path_args
+
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "nonexistent.xml")
+            with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+                result = _expand_file_path_args([missing])
+            self.assertEqual(result, [])
+            self.assertTrue(
+                any(missing in line for line in cm.output),
+                f"expected a warning naming {missing}, got: {cm.output}",
+            )
+
+    def test_expand_file_path_args_no_warning_for_matching_path(self):
+        """A file_path argument that matches at least one file logs no
+        warning at all."""
+        from parsedmarc.cli import _expand_file_path_args
+
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "report.xml")
+            with open(report, "w") as f:
+                f.write("x")
+
+            with self.assertNoLogs("parsedmarc.log", level="WARNING"):
+                result = _expand_file_path_args([report])
+            self.assertEqual(result, [report])
+
+            wildcard = os.path.join(d, "*.xml")
+            with self.assertNoLogs("parsedmarc.log", level="WARNING"):
+                result = _expand_file_path_args([wildcard])
+            self.assertEqual(result, [report])
+
+    def test_expand_file_path_args_empty_list_is_silent(self):
+        """An empty ``paths`` list (e.g. a mailbox-only run with no file
+        arguments) logs nothing."""
+        from parsedmarc.cli import _expand_file_path_args
+
+        with self.assertNoLogs("parsedmarc.log", level="WARNING"):
+            result = _expand_file_path_args([])
+        self.assertEqual(result, [])
+
+    def test_expand_file_path_args_mixed_warns_only_for_unmatched(self):
+        """When some arguments match and others don't, only the
+        unmatched argument produces a warning."""
+        from parsedmarc.cli import _expand_file_path_args
+
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "report.xml")
+            with open(report, "w") as f:
+                f.write("x")
+            missing = os.path.join(d, "nonexistent.xml")
+
+            with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+                result = _expand_file_path_args([report, missing])
+
+            self.assertEqual(result, [report])
+            warning_lines = [line for line in cm.output if "WARNING" in line]
+            self.assertEqual(len(warning_lines), 1)
+            self.assertIn(missing, warning_lines[0])
+            self.assertNotIn(report, warning_lines[0])
 
     def test_apply_env_overrides_injects_values(self):
         """Env vars are injected into an existing ConfigParser."""
@@ -893,6 +1059,463 @@ hosts = localhost
         )
 
 
+class TestDirectoryFilePaths(unittest.TestCase):
+    """End-to-end coverage of issue #397: a directory passed as a
+    ``file_path`` CLI argument expands to the report files inside it, and
+    ``-r``/``--recursive`` opts into descending into subdirectories. Runs
+    the real ``_main()`` entry point (real multiprocessing worker, real
+    parsing, real JSON output) against on-disk sample reports with no
+    mocking of parsedmarc's own code, per AGENTS.md's mock-at-SDK-boundary
+    rule (there is no external SDK boundary in this code path to mock)."""
+
+    TOP_LEVEL_SAMPLE = "samples/aggregate/!example.com!1538204542!1538463818.xml"
+    NESTED_SAMPLE = "samples/aggregate/!large-example.com!1711897200!1711983600.xml"
+
+    def setUp(self):
+        # SEEN_AGGREGATE_REPORT_IDS is a module-level ExpiringDict that
+        # dedupes report IDs across parses within one process; clear it so
+        # a report "seen" by an earlier test isn't silently dropped here.
+        # Precedent: tests/test_init.py TestGetDmarcReportsFromMailboxMaildir.setUp.
+        parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+        # Also clear on the way out: these tests reuse
+        # SAMPLE_AGGREGATE_REPORT_PATH's report ID, and other test classes
+        # later in this file (e.g. TestSkipsResultsEmailWhenNoReportsParsed)
+        # parse that same sample through the real _main() dedup path, so a
+        # left-over "seen" entry here would make their report look like a
+        # duplicate and silently vanish.
+        self.addCleanup(parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear)
+        self._env_patcher = patch.dict(
+            os.environ, {"GITHUB_ACTIONS": "true"}, clear=False
+        )
+        self._env_patcher.start()
+        self.addCleanup(self._env_patcher.stop)
+
+    def _build_reports_dir(self, tmp_dir):
+        reports_dir = os.path.join(tmp_dir, "reports")
+        nested_dir = os.path.join(reports_dir, "nested")
+        os.makedirs(nested_dir)
+        top_level_path = os.path.join(
+            reports_dir, os.path.basename(self.TOP_LEVEL_SAMPLE)
+        )
+        nested_path = os.path.join(nested_dir, os.path.basename(self.NESTED_SAMPLE))
+        with (
+            open(self.TOP_LEVEL_SAMPLE, "rb") as src,
+            open(top_level_path, "wb") as dst,
+        ):
+            dst.write(src.read())
+        with open(self.NESTED_SAMPLE, "rb") as src, open(nested_path, "wb") as dst:
+            dst.write(src.read())
+        return reports_dir
+
+    def _write_config(self, tmp_dir, output_dirname, n_procs=None):
+        cfg_path = os.path.join(tmp_dir, "parsedmarc.ini")
+        output_dir = os.path.join(tmp_dir, output_dirname)
+        config_text = (
+            f"[general]\noffline = True\nsilent = True\noutput = {output_dir}\n"
+        )
+        if n_procs is not None:
+            config_text += f"n_procs = {n_procs}\n"
+        with open(cfg_path, "w") as f:
+            f.write(config_text)
+        return cfg_path, output_dir
+
+    def _report_ids(self, output_dir):
+        with open(os.path.join(output_dir, "aggregate.json")) as f:
+            reports = json.load(f)
+        return {report["report_metadata"]["report_id"] for report in reports}
+
+    def _sample_report_id(self, path):
+        result = parsedmarc.parse_report_file(path, offline=True)
+        assert result["report_type"] == "aggregate"
+        report = cast(AggregateReport, result["report"])
+        return report["report_metadata"]["report_id"]
+
+    def test_directory_file_path_non_recursive_skips_nested(self):
+        """A bare directory ``file_path`` argument behaves like shell
+        ``reports/*``: the top-level sample is parsed, and the nested
+        subdirectory is skipped (not descended into) without ``-r``.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            reports_dir = self._build_reports_dir(tmp_dir)
+            cfg_path, output_dir = self._write_config(tmp_dir, "output_non_recursive")
+
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, reports_dir]):
+                parsedmarc.cli._main()
+
+            report_ids = self._report_ids(output_dir)
+
+        top_level_id = self._sample_report_id(self.TOP_LEVEL_SAMPLE)
+        nested_id = self._sample_report_id(self.NESTED_SAMPLE)
+
+        self.assertIn(top_level_id, report_ids)
+        self.assertNotIn(nested_id, report_ids)
+
+    def test_directory_file_path_recursive_includes_nested(self):
+        """With ``-r``/``--recursive``, the directory expands via ``**``
+        and both the top-level and nested sample reports are parsed.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            reports_dir = self._build_reports_dir(tmp_dir)
+            cfg_path, output_dir = self._write_config(tmp_dir, "output_recursive")
+
+            with patch.object(
+                sys, "argv", ["parsedmarc", "-c", cfg_path, "-r", reports_dir]
+            ):
+                parsedmarc.cli._main()
+
+            report_ids = self._report_ids(output_dir)
+
+        top_level_id = self._sample_report_id(self.TOP_LEVEL_SAMPLE)
+        nested_id = self._sample_report_id(self.NESTED_SAMPLE)
+
+        self.assertIn(top_level_id, report_ids)
+        self.assertIn(nested_id, report_ids)
+
+    def test_directory_file_path_recursive_includes_nested_n_procs_2(self):
+        """The same recursive-directory scenario as
+        ``test_directory_file_path_recursive_includes_nested``, but with
+        ``n_procs = 2`` in the config file so the direct-file parsing path
+        runs through ``parallel_map``'s process pool with more than one
+        worker. The report-id sets in the output JSON must match the
+        ``n_procs = 1`` (default) run exactly — parallelism must not change
+        which reports get parsed or deduplicated.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            reports_dir = self._build_reports_dir(tmp_dir)
+            cfg_path, output_dir = self._write_config(
+                tmp_dir, "output_recursive_n_procs_2", n_procs=2
+            )
+
+            with patch.object(
+                sys, "argv", ["parsedmarc", "-c", cfg_path, "-r", reports_dir]
+            ):
+                parsedmarc.cli._main()
+
+            report_ids = self._report_ids(output_dir)
+
+        top_level_id = self._sample_report_id(self.TOP_LEVEL_SAMPLE)
+        nested_id = self._sample_report_id(self.NESTED_SAMPLE)
+
+        self.assertIn(top_level_id, report_ids)
+        self.assertIn(nested_id, report_ids)
+        self.assertEqual(report_ids, {top_level_id, nested_id})
+
+
+class TestArchiveDirectory(unittest.TestCase):
+    """End-to-end coverage of issue #570: ``[general] archive_directory``
+    moves successfully processed local report files into a dated
+    ``<year>/<month>/<Aggregate|Failure|SMTP-TLS>/`` tree, and unparseable
+    files into ``<archive_directory>/Invalid/``. Runs the real ``_main()``
+    entry point via ``patch.object(sys, "argv", ...)`` against on-disk
+    sample reports, per AGENTS.md's mock-at-SDK-boundary rule (there is no
+    external SDK boundary in this code path to mock)."""
+
+    AGGREGATE_SAMPLE_1 = "samples/aggregate/!example.com!1538204542!1538463818.xml"
+    AGGREGATE_SAMPLE_2 = (
+        "samples/aggregate/!large-example.com!1711897200!1711983600.xml"
+    )
+    # Not dmarc_ruf_report_linkedin.eml: that sample begins with a
+    # "From dmarc-noreply@linkedin.com ..." mbox envelope line, which is
+    # why Python's mailbox module reads it as a (single-message) mbox
+    # file and is_mbox() classifies it as an mbox — routing it through
+    # _main()'s mbox_paths branch instead of the direct-file archiving
+    # path this test exercises (mbox files are intentionally never
+    # archived — see the archive_directory docs in docs/source/usage.md).
+    # The sharepoint sample below starts with a MIME header instead, so
+    # it isn't mbox-classified.
+    FAILURE_SAMPLE = (
+        "samples/failure/DMARC Failure Report for domain.de "
+        "(mail-from=sharepoint@domain.de, ip=10.10.10.10).eml"
+    )
+    SMTP_TLS_SAMPLE = "samples/smtp_tls/rfc8460.json"
+
+    def setUp(self):
+        # SEEN_AGGREGATE_REPORT_IDS is a module-level ExpiringDict that
+        # dedupes report IDs across parses within one process; clear it so
+        # a report "seen" by an earlier test isn't silently dropped here,
+        # and so tests within this class don't interfere with each other.
+        # Precedent: TestDirectoryFilePaths.setUp above.
+        parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+        self.addCleanup(parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear)
+        self._env_patcher = patch.dict(
+            os.environ, {"GITHUB_ACTIONS": "true"}, clear=False
+        )
+        self._env_patcher.start()
+        self.addCleanup(self._env_patcher.stop)
+
+    def _copy_sample(self, src_path, dest_dir, dest_basename=None):
+        dest_basename = dest_basename or os.path.basename(src_path)
+        dest_path = os.path.join(dest_dir, dest_basename)
+        with open(src_path, "rb") as src, open(dest_path, "wb") as dst:
+            dst.write(src.read())
+        return dest_path
+
+    def _expected_subdir(self, sample_path):
+        """Parse *sample_path* the same way the CLI does and return the
+        ``<year>/<month>/<type>`` subdirectory ``_archive_subdir_for_result``
+        computes for it. Computed dynamically rather than hardcoded because
+        aggregate ``begin_date`` is local-time, so month buckets are
+        timezone-dependent."""
+        result = parsedmarc.parse_report_file(sample_path, offline=True)
+        subdir = parsedmarc.cli._archive_subdir_for_result(result)
+        assert subdir is not None
+        return subdir
+
+    def _write_config(
+        self, tmp_dir, output_dirname, archive_dirname=None, n_procs=None
+    ):
+        cfg_path = os.path.join(tmp_dir, "parsedmarc.ini")
+        output_dir = os.path.join(tmp_dir, output_dirname)
+        config_text = (
+            f"[general]\noffline = True\nsilent = True\noutput = {output_dir}\n"
+        )
+        archive_dir = None
+        if archive_dirname is not None:
+            archive_dir = os.path.join(tmp_dir, archive_dirname)
+            config_text += f"archive_directory = {archive_dir}\n"
+        if n_procs is not None:
+            config_text += f"n_procs = {n_procs}\n"
+        with open(cfg_path, "w") as f:
+            f.write(config_text)
+        return cfg_path, output_dir, archive_dir
+
+    def test_archive_moves_all_three_types(self):
+        """Aggregate, failure, and SMTP TLS report files given as direct
+        ``file_path`` arguments are moved into
+        ``<archive>/<year>/<month>/<Aggregate|Failure|SMTP-TLS>/`` after a
+        successful parse, the source files are gone from the input
+        directory, and the aggregate JSON output is still produced."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            os.makedirs(input_dir)
+            agg1 = self._copy_sample(self.AGGREGATE_SAMPLE_1, input_dir)
+            agg2 = self._copy_sample(self.AGGREGATE_SAMPLE_2, input_dir)
+            failure = self._copy_sample(self.FAILURE_SAMPLE, input_dir)
+            smtp_tls = self._copy_sample(self.SMTP_TLS_SAMPLE, input_dir)
+
+            cfg_path, output_dir, archive_dir = self._write_config(
+                tmp_dir, "output", archive_dirname="archive"
+            )
+            assert archive_dir is not None
+
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, input_dir]):
+                parsedmarc.cli._main()
+
+            for src, sample_path in (
+                (agg1, self.AGGREGATE_SAMPLE_1),
+                (agg2, self.AGGREGATE_SAMPLE_2),
+                (failure, self.FAILURE_SAMPLE),
+                (smtp_tls, self.SMTP_TLS_SAMPLE),
+            ):
+                subdir = self._expected_subdir(sample_path)
+                dest = os.path.join(archive_dir, subdir, os.path.basename(src))
+                self.assertTrue(os.path.isfile(dest), f"missing {dest}")
+                self.assertFalse(os.path.isfile(src))
+
+            self.assertTrue(os.path.isfile(os.path.join(output_dir, "aggregate.json")))
+
+    def test_failed_parse_moved_to_invalid(self):
+        """A file that fails to parse (garbage content) is moved to
+        ``<archive_directory>/Invalid/`` rather than left in place, and
+        the run completes without raising."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            os.makedirs(input_dir)
+            garbage_path = os.path.join(input_dir, "garbage.xml")
+            with open(garbage_path, "wb") as f:
+                f.write(b"not a report")
+
+            cfg_path, output_dir, archive_dir = self._write_config(
+                tmp_dir, "output", archive_dirname="archive"
+            )
+            assert archive_dir is not None
+
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, input_dir]):
+                parsedmarc.cli._main()
+
+            dest = os.path.join(archive_dir, "Invalid", "garbage.xml")
+            self.assertTrue(os.path.isfile(dest))
+            self.assertFalse(os.path.isfile(garbage_path))
+
+    def test_collision_appends_numeric_suffix(self):
+        """A destination file that already exists at the computed archive
+        path is never overwritten: the newly archived file gets a
+        numeric suffix appended before its extension instead, and the
+        pre-existing file's content is untouched."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            os.makedirs(input_dir)
+            src = self._copy_sample(self.AGGREGATE_SAMPLE_1, input_dir)
+
+            cfg_path, output_dir, archive_dir = self._write_config(
+                tmp_dir, "output", archive_dirname="archive"
+            )
+            assert archive_dir is not None
+
+            subdir = self._expected_subdir(self.AGGREGATE_SAMPLE_1)
+            dest_dir = os.path.join(archive_dir, subdir)
+            os.makedirs(dest_dir)
+            basename = os.path.basename(src)
+            preexisting_path = os.path.join(dest_dir, basename)
+            with open(preexisting_path, "wb") as f:
+                f.write(b"PREEXISTING DUMMY CONTENT")
+
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, input_dir]):
+                parsedmarc.cli._main()
+
+            with open(preexisting_path, "rb") as f:
+                self.assertEqual(f.read(), b"PREEXISTING DUMMY CONTENT")
+
+            base, ext = os.path.splitext(basename)
+            suffixed_path = os.path.join(dest_dir, f"{base}-1{ext}")
+            self.assertTrue(os.path.isfile(suffixed_path))
+            self.assertFalse(os.path.isfile(src))
+
+    def test_second_run_skips_archived_files(self):
+        """Files already inside ``archive_directory`` are excluded from
+        the next run's ``file_path`` expansion, so the archive may safely
+        live inside an input directory without its own contents being
+        re-parsed and re-archived on a later run. SEEN_AGGREGATE_REPORT_IDS
+        is cleared between runs to prove the exclusion doesn't rely on
+        aggregate-report dedup (the failure/SMTP-TLS samples aren't
+        deduped at all, so they alone would already prove this, but
+        clearing it removes any doubt for the aggregate sample too)."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            os.makedirs(input_dir)
+            self._copy_sample(self.AGGREGATE_SAMPLE_1, input_dir)
+            self._copy_sample(self.FAILURE_SAMPLE, input_dir)
+            self._copy_sample(self.SMTP_TLS_SAMPLE, input_dir)
+
+            archive_dir = os.path.join(input_dir, "archive")
+            output_dir = os.path.join(tmp_dir, "output")
+            cfg_path = os.path.join(tmp_dir, "parsedmarc.ini")
+            config_text = (
+                "[general]\noffline = True\nsilent = True\n"
+                f"output = {output_dir}\narchive_directory = {archive_dir}\n"
+            )
+            with open(cfg_path, "w") as f:
+                f.write(config_text)
+
+            def _archive_tree():
+                tree = {}
+                for root, _dirs, files in os.walk(archive_dir):
+                    for name in files:
+                        path = os.path.join(root, name)
+                        rel = os.path.relpath(path, archive_dir)
+                        with open(path, "rb") as f:
+                            tree[rel] = f.read()
+                return tree
+
+            with patch.object(
+                sys, "argv", ["parsedmarc", "-c", cfg_path, "-r", input_dir]
+            ):
+                parsedmarc.cli._main()
+
+            first_run_tree = _archive_tree()
+            self.assertEqual(len(first_run_tree), 3)
+
+            parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+
+            with patch.object(
+                sys, "argv", ["parsedmarc", "-c", cfg_path, "-r", input_dir]
+            ):
+                parsedmarc.cli._main()
+
+            second_run_tree = _archive_tree()
+            self.assertEqual(first_run_tree, second_run_tree)
+            for rel in second_run_tree:
+                self.assertNotIn("-1", os.path.basename(rel))
+
+    def test_archive_with_n_procs_2(self):
+        """The same archiving behavior as
+        ``test_archive_moves_all_three_types``, but with ``n_procs = 2``
+        so the direct-file parsing path runs through the multiprocessing
+        pool."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            os.makedirs(input_dir)
+            agg1 = self._copy_sample(self.AGGREGATE_SAMPLE_1, input_dir)
+            agg2 = self._copy_sample(self.AGGREGATE_SAMPLE_2, input_dir)
+            failure = self._copy_sample(self.FAILURE_SAMPLE, input_dir)
+            smtp_tls = self._copy_sample(self.SMTP_TLS_SAMPLE, input_dir)
+
+            cfg_path, output_dir, archive_dir = self._write_config(
+                tmp_dir, "output", archive_dirname="archive", n_procs=2
+            )
+            assert archive_dir is not None
+
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, input_dir]):
+                parsedmarc.cli._main()
+
+            for src, sample_path in (
+                (agg1, self.AGGREGATE_SAMPLE_1),
+                (agg2, self.AGGREGATE_SAMPLE_2),
+                (failure, self.FAILURE_SAMPLE),
+                (smtp_tls, self.SMTP_TLS_SAMPLE),
+            ):
+                subdir = self._expected_subdir(sample_path)
+                dest = os.path.join(archive_dir, subdir, os.path.basename(src))
+                self.assertTrue(os.path.isfile(dest), f"missing {dest}")
+                self.assertFalse(os.path.isfile(src))
+
+            self.assertTrue(os.path.isfile(os.path.join(output_dir, "aggregate.json")))
+
+    def test_no_archive_when_option_unset(self):
+        """Without ``archive_directory`` configured, input files are left
+        in place after processing and no ``archive`` directory is
+        created."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            os.makedirs(input_dir)
+            agg1 = self._copy_sample(self.AGGREGATE_SAMPLE_1, input_dir)
+
+            cfg_path, output_dir, archive_dir = self._write_config(tmp_dir, "output")
+            self.assertIsNone(archive_dir)
+
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, input_dir]):
+                parsedmarc.cli._main()
+
+            self.assertTrue(os.path.isfile(agg1))
+            self.assertFalse(os.path.isdir(os.path.join(tmp_dir, "archive")))
+
+    def test_duplicate_aggregate_reports_both_archived(self):
+        """The same aggregate report content under two different
+        filenames is deduplicated down to one report in the JSON output,
+        but both source files are archived normally: archiving runs for
+        every file that parsed successfully, independent of the
+        in-process report-ID dedup."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_dir = os.path.join(tmp_dir, "input")
+            os.makedirs(input_dir)
+            copy1 = self._copy_sample(
+                self.AGGREGATE_SAMPLE_1, input_dir, dest_basename="copy-a.xml"
+            )
+            copy2 = self._copy_sample(
+                self.AGGREGATE_SAMPLE_1, input_dir, dest_basename="copy-b.xml"
+            )
+
+            cfg_path, output_dir, archive_dir = self._write_config(
+                tmp_dir, "output", archive_dirname="archive"
+            )
+            assert archive_dir is not None
+
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, input_dir]):
+                parsedmarc.cli._main()
+
+            with open(os.path.join(output_dir, "aggregate.json")) as f:
+                reports = json.load(f)
+            self.assertEqual(len(reports), 1)
+
+            subdir = self._expected_subdir(self.AGGREGATE_SAMPLE_1)
+            dest1 = os.path.join(archive_dir, subdir, "copy-a.xml")
+            dest2 = os.path.join(archive_dir, subdir, "copy-b.xml")
+            self.assertTrue(os.path.isfile(dest1))
+            self.assertTrue(os.path.isfile(dest2))
+            self.assertFalse(os.path.isfile(copy1))
+            self.assertFalse(os.path.isfile(copy2))
+
+
 class TestGmailAuthModes(unittest.TestCase):
     @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
     @patch("parsedmarc.cli.GmailConnection")
@@ -1042,27 +1665,36 @@ since = 2d
         self.assertEqual(system_exit.exception.code, 1)
         self.assertEqual(mock_watch_inbox.call_args.kwargs.get("since"), "2d")
 
-    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
-    @patch("parsedmarc.cli.watch_inbox")
-    @patch("parsedmarc.cli.IMAPConnection")
-    def testWatchCallbackIsSameAdapterAsSingleShotSaveCallback(
-        self, mock_imap_connection, mock_watch_inbox, mock_get_mailbox_reports
-    ):
-        """watch_inbox's callback must be the exact same save-then-report
-        adapter passed as save_callback to the single-shot mailbox fetch,
-        not process_reports directly -- otherwise watch mode would still
-        archive/delete messages before confirming the save, which is the
-        data-loss bug this feature fixes (fork #33 / upstream
-        domainaware/parsedmarc#242)."""
-        mock_imap_connection.return_value = object()
-        mock_get_mailbox_reports.return_value = {
-            "aggregate_reports": [],
-            "failure_reports": [],
-            "smtp_tls_reports": [],
-        }
-        mock_watch_inbox.side_effect = FileExistsError("stop-watch-loop")
 
-        config_text = """[general]
+class TestMailboxPerTypeDeleteOptions(unittest.TestCase):
+    """The [mailbox] per-report-type delete options (issue #256) must reach
+    the library unchanged, including the difference between an explicit
+    ``false`` and an unset option (``None``, meaning "inherit ``delete``")."""
+
+    def setUp(self):
+        from parsedmarc.log import logger as _logger
+
+        _logger.disabled = True
+        self._stdout_patch = patch("sys.stdout", new_callable=io.StringIO)
+        self._stderr_patch = patch("sys.stderr", new_callable=io.StringIO)
+        self._stdout_patch.start()
+        self._stderr_patch.start()
+
+    def tearDown(self):
+        from parsedmarc.log import logger as _logger
+
+        _logger.disabled = False
+        self._stderr_patch.stop()
+        self._stdout_patch.stop()
+
+    def _write_config(self, config_text):
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
+            cfg.write(config_text)
+            cfg_path = cfg.name
+        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+        return cfg_path
+
+    IMAP_CONFIG = """[general]
 silent = true
 
 [imap]
@@ -1071,25 +1703,240 @@ user = user
 password = pass
 
 [mailbox]
-watch = true
+delete = true
+delete_failure = false
 """
 
-        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
-            cfg.write(config_text)
-            cfg_path = cfg.name
-        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+    def _assert_per_type_delete_kwargs(self, kwargs):
+        self.assertIs(kwargs.get("delete"), True)
+        self.assertIs(kwargs.get("delete_failure"), False)
+        # Unset options stay None so the library applies the inheritance.
+        self.assertIsNone(kwargs.get("delete_aggregate"))
+        self.assertIsNone(kwargs.get("delete_smtp_tls"))
+        self.assertIsNone(kwargs.get("delete_invalid"))
+
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.watch_inbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testCliPassesPerTypeDeleteToWatchInbox(
+        self, mock_imap_connection, mock_watch_inbox, mock_get_mailbox_reports
+    ):
+        mock_imap_connection.return_value = object()
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        mock_watch_inbox.side_effect = FileExistsError("stop-watch-loop")
+        cfg_path = self._write_config(self.IMAP_CONFIG + "watch = true\n")
 
         with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path]):
             with self.assertRaises(SystemExit) as system_exit:
                 parsedmarc.cli._main()
 
         self.assertEqual(system_exit.exception.code, 1)
-        single_shot_save_callback = mock_get_mailbox_reports.call_args.kwargs.get(
-            "save_callback"
+        self._assert_per_type_delete_kwargs(mock_watch_inbox.call_args.kwargs)
+
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testCliPassesPerTypeDeleteToOneShotMailboxRun(
+        self, mock_imap_connection, mock_get_mailbox_reports
+    ):
+        mock_imap_connection.return_value = object()
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        cfg_path = self._write_config(self.IMAP_CONFIG)
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path]):
+            parsedmarc.cli._main()
+
+        self._assert_per_type_delete_kwargs(mock_get_mailbox_reports.call_args.kwargs)
+
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.GmailConnection")
+    def testGmailScopeGuardForcesAllDeleteFlagsOff(
+        self, mock_gmail_connection, mock_get_mailbox_reports
+    ):
+        """The Gmail deletion scope is a mailbox-wide capability grant, so a
+        per-report-type delete option alone (with ``delete`` unset) is enough
+        to trip the guard, and a missing scope turns every delete flag off."""
+        mock_gmail_connection.return_value = MagicMock()
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        cfg_path = self._write_config("""[general]
+silent = true
+
+[gmail_api]
+credentials_file = /tmp/gmail-credentials.json
+scopes = https://www.googleapis.com/auth/gmail.modify
+
+[mailbox]
+delete_aggregate = true
+""")
+
+        from parsedmarc.log import logger as _logger
+
+        _logger.disabled = False
+        try:
+            with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path]):
+                with self.assertLogs("parsedmarc.log", level="ERROR") as logs:
+                    parsedmarc.cli._main()
+        finally:
+            _logger.disabled = True
+
+        self.assertTrue(
+            any("Message deletion requires scope" in line for line in logs.output),
+            logs.output,
         )
-        watch_callback = mock_watch_inbox.call_args.kwargs.get("callback")
-        self.assertTrue(callable(single_shot_save_callback))
-        self.assertIs(watch_callback, single_shot_save_callback)
+        kwargs = mock_get_mailbox_reports.call_args.kwargs
+        for option in (
+            "delete",
+            "delete_aggregate",
+            "delete_failure",
+            "delete_smtp_tls",
+            "delete_invalid",
+        ):
+            with self.subTest(option=option):
+                self.assertIs(kwargs.get(option), False)
+
+
+class TestCliParserConfigWiring(unittest.TestCase):
+    """Tests that _main() builds a single ParserConfig (via
+    _build_parser_config) from parsed opts and passes it as ``config=`` to
+    the library's mailbox-fetching functions, rather than forwarding
+    individual option kwargs (offline, dns_timeout, ip_db_path, etc.) by
+    hand at each call site."""
+
+    def setUp(self):
+        from parsedmarc.log import logger as _logger
+
+        _logger.disabled = True
+        self._stdout_patch = patch("sys.stdout", new_callable=io.StringIO)
+        self._stderr_patch = patch("sys.stderr", new_callable=io.StringIO)
+        self._stdout_patch.start()
+        self._stderr_patch.start()
+        # SEEN_AGGREGATE_REPORT_IDS is a module-level ExpiringDict shared
+        # across tests in this process; clear it both ways so state from an
+        # earlier test class doesn't leak in, and so this class doesn't leak
+        # into a later one. Precedent: TestDirectoryFilePaths.setUp above.
+        parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+        self.addCleanup(parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear)
+
+    def tearDown(self):
+        from parsedmarc.log import logger as _logger
+
+        _logger.disabled = False
+        self._stderr_patch.stop()
+        self._stdout_patch.stop()
+
+    def _run_one_shot_mailbox(
+        self,
+        dns_timeout: float | None = None,
+        dns_retries: int | None = None,
+        extra_argv: list[str] | None = None,
+    ) -> parsedmarc.ParserConfig:
+        """Runs a real one-shot _main() against a mocked IMAP connection and
+        mocked get_dmarc_reports_from_mailbox, and returns the ParserConfig
+        the CLI passed as ``config=``.
+
+        ``extra_argv``, when given, is appended to the CLI invocation after
+        ``-c <config_path>`` -- e.g. to exercise a command-line flag such as
+        ``--dns-timeout`` without involving the config file's [general]
+        dns_timeout key at all. It defaults to None/no extra arguments, so
+        existing callers are unaffected.
+        """
+        config_lines = ["[general]", "silent = true"]
+        if dns_timeout is not None:
+            config_lines.append(f"dns_timeout = {dns_timeout}")
+        if dns_retries is not None:
+            config_lines.append(f"dns_retries = {dns_retries}")
+        config_lines += [
+            "",
+            "[imap]",
+            "host = imap.example.com",
+            "user = user",
+            "password = pass",
+        ]
+        config_text = "\n".join(config_lines) + "\n"
+
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
+            cfg.write(config_text)
+            cfg_path = cfg.name
+        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+
+        argv = ["parsedmarc", "-c", cfg_path] + list(extra_argv or [])
+
+        with (
+            patch("parsedmarc.cli.get_dmarc_reports_from_mailbox") as mock_get_reports,
+            patch("parsedmarc.cli.IMAPConnection") as mock_imap,
+        ):
+            mock_imap.return_value = object()
+            mock_get_reports.return_value = {
+                "aggregate_reports": [],
+                "failure_reports": [],
+                "smtp_tls_reports": [],
+            }
+            with patch.object(sys, "argv", argv):
+                parsedmarc.cli._main()
+            return mock_get_reports.call_args.kwargs["config"]
+
+    def test_one_shot_mailbox_run_honors_general_dns_timeout(self):
+        """Regression test for the one-shot mailbox call site in _main():
+        before this fix, that call to get_dmarc_reports_from_mailbox
+        omitted the dns_timeout/dns_retries kwargs entirely (and, before
+        config= existed, had no way to pass them at all), so a one-shot run
+        silently used the library's own hardcoded default
+        (``dns_timeout: float = 6.0`` on master's
+        get_dmarc_reports_from_mailbox signature) instead of the operator's
+        ``[general] dns_timeout`` / ``dns_retries`` config values. Watch-mode
+        runs were unaffected because the watch_inbox call site did pass
+        dns_timeout/dns_retries directly.
+        """
+        cfg = self._run_one_shot_mailbox(dns_timeout=11.5, dns_retries=3)
+        self.assertEqual(cfg.dns_timeout, 11.5)
+        self.assertEqual(cfg.dns_retries, 3)
+
+    def test_dns_timeout_hyphenated_alias_reaches_parser_config(self):
+        """``--dns-timeout`` (hyphenated) is an alias for ``--dns_timeout``
+        (underscored), which has been the public spelling since 6.0.0. The
+        hyphenated alias exists because ``--dns-retries`` (added in 9.7.1)
+        uses a hyphen while ``--dns_timeout`` predates it and must keep
+        working unchanged, so the change adds ``--dns-timeout`` as an
+        additional option string rather than renaming anything. Both
+        spellings must resolve to the same argparse dest (``dns_timeout``)
+        and reach the same ParserConfig field passed to
+        get_dmarc_reports_from_mailbox — and both halves are exercised
+        here, because dropping the legacy option string would leave the
+        dest (derived from the surviving long option) and every
+        config-file test green while breaking the promised compatibility.
+        """
+        cfg = self._run_one_shot_mailbox(extra_argv=["--dns-timeout", "7"])
+        self.assertEqual(cfg.dns_timeout, 7.0)
+        cfg = self._run_one_shot_mailbox(extra_argv=["--dns_timeout", "9"])
+        self.assertEqual(cfg.dns_timeout, 9.0)
+
+    def test_cli_config_binds_module_default_caches(self):
+        """The ParserConfig built by the CLI must bind the process-wide
+        default caches (parsedmarc.IP_ADDRESS_CACHE,
+        parsedmarc.SEEN_AGGREGATE_REPORT_IDS, parsedmarc.REVERSE_DNS_MAP) by
+        identity, not fresh/isolated caches — otherwise every CLI run would
+        get its own empty caches (defeating the point of the 4-hour IP
+        cache and the 1-hour dedup cache) even though ParserConfig's default
+        factories exist specifically to give library callers isolated
+        caches when they don't pass config=.
+        """
+        cfg = self._run_one_shot_mailbox()
+        self.assertIs(cfg.ip_address_cache, parsedmarc.IP_ADDRESS_CACHE)
+        self.assertIs(
+            cfg.seen_aggregate_report_ids, parsedmarc.SEEN_AGGREGATE_REPORT_IDS
+        )
+        self.assertIs(cfg.reverse_dns_map, parsedmarc.REVERSE_DNS_MAP)
 
 
 class TestMailboxPerformance(unittest.TestCase):
@@ -1974,7 +2821,7 @@ client_assertion = s3cret-signed-jwt-assertion
 
 
 class TestMSGraphEmailResults(unittest.TestCase):
-    """Fork issue #19: the periodic summary email is sent via the same
+    """#472: the periodic summary email is sent via the same
     already-authenticated Microsoft Graph mailbox connection when
     [smtp] host is not configured but [msgraph] is, so M365 tenants that
     block legacy SMTP AUTH can still receive the summary from the
@@ -2028,10 +2875,9 @@ certificate_password = s3cret-cert-pass
         self, mock_graph_connection, mock_get_mailbox_reports
     ):
         """[smtp] with only to/subject (no host) plus [msgraph] sends the
-        summary via Microsoft Graph's sendMail — acceptance criterion 3
-        of fork issue #19."""
+        summary via Microsoft Graph's sendMail."""
         mock_get_mailbox_reports.return_value = {
-            "aggregate_reports": [],
+            "aggregate_reports": _sample_aggregate_reports(),
             "failure_reports": [],
             "smtp_tls_reports": [],
         }
@@ -2057,6 +2903,44 @@ subject = DMARC Summary
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             self.assertIsNone(zf.testzip())
 
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.MSGraphConnection")
+    def testCliSkipsMsGraphSummaryEmailWhenNothingWasParsed(
+        self, mock_graph_connection, mock_get_mailbox_reports
+    ):
+        """Regression test for the Microsoft Graph half of the #200
+        empty-run guard: with an empty mailbox (no aggregate, failure,
+        or SMTP TLS reports), the Graph-sent summary email must not be
+        sent, and an INFO log line should explain why it was skipped.
+        A refactor that narrows the skip guard's condition to only the
+        SMTP branch (dropping the msgraph_connection/smtp_to_value
+        check) must fail this test."""
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        # verbose=true is added (CERT_CONFIG only sets silent=true) so the
+        # logger's effective level is INFO and the skip message is
+        # actually emitted for assertLogs to capture.
+        config_text = (
+            self.CERT_CONFIG.replace("silent = true", "silent = true\nverbose = true")
+            + """
+[smtp]
+to = admin@example.com
+subject = DMARC Summary
+"""
+        )
+        cfg_path = self._write_config(config_text)
+
+        with self.assertLogs("parsedmarc.log", level="INFO") as logs:
+            self._run_main(cfg_path)
+
+        mock_graph_connection.return_value.send_message.assert_not_called()
+        self.assertTrue(
+            any("skipping the results email" in line for line in logs.output)
+        )
+
     @patch("parsedmarc.cli.email_results")
     @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
     @patch("parsedmarc.cli.MSGraphConnection")
@@ -2067,7 +2951,7 @@ subject = DMARC Summary
         set, even with [msgraph] also configured — no fallback, no
         dual-send."""
         mock_get_mailbox_reports.return_value = {
-            "aggregate_reports": [],
+            "aggregate_reports": _sample_aggregate_reports(),
             "failure_reports": [],
             "smtp_tls_reports": [],
         }
@@ -2146,9 +3030,9 @@ to = admin@example.com
         self, mock_graph_connection, mock_get_mailbox_reports
     ):
         """A Graph sendMail failure gets the same single-ERROR-line
-        treatment as connection/fetch failures (fork issue #20)."""
+        treatment as connection/fetch failures."""
         mock_get_mailbox_reports.return_value = {
-            "aggregate_reports": [],
+            "aggregate_reports": _sample_aggregate_reports(),
             "failure_reports": [],
             "smtp_tls_reports": [],
         }
@@ -2183,12 +3067,44 @@ subject = DMARC Summary
         self.assertIn("request-id=rid-1", output)
         self.assertIn("client-request-id=crid-1", output)
 
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.MSGraphConnection")
+    def testCliPassesSmtpAttachmentAndMessageToMsGraphSend(
+        self, mock_graph_connection, mock_get_mailbox_reports
+    ):
+        """[smtp] attachment/message are parsed but were never wired
+        through to either summary-email transport. On the Microsoft
+        Graph path, the configured attachment filename and message
+        body must reach send_message()."""
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": _sample_aggregate_reports(),
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_text = (
+            self.CERT_CONFIG
+            + """
+[smtp]
+to = admin@example.com
+attachment = custom-report.zip
+message = Custom body text
+"""
+        )
+        cfg_path = self._write_config(config_text)
+        self._run_main(cfg_path)
+
+        send_message = mock_graph_connection.return_value.send_message
+        send_message.assert_called_once()
+        call_kwargs = send_message.call_args.kwargs
+        self.assertEqual(call_kwargs["attachments"][0][0], "custom-report.zip")
+        self.assertEqual(call_kwargs["plain_message"], "Custom body text")
+
 
 class TestMSGraphFailureLogging(unittest.TestCase):
-    """Fork issue #20: Microsoft Graph connection/fetch/watch failures
-    log a single clear ERROR line identifying the mailbox/tenant/auth
-    method and the Graph request-id/client-request-id when available,
-    instead of a bare logger.exception() that hides the actual error."""
+    """Microsoft Graph connection/fetch/watch failures log a single
+    clear ERROR line identifying the mailbox/tenant/auth method and
+    the Graph request-id/client-request-id when available, instead of
+    a bare logger.exception() that hides the actual error."""
 
     CERT_CONFIG = """[general]
 silent = true
@@ -2346,6 +3262,42 @@ certificate_password = s3cret-cert-pass
         output = "\n".join(cm.output)
         self.assertIn("Microsoft Graph mailbox watch failed", output)
         self.assertIn("ConnectError", output)
+
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testNonGraphMailboxErrorIsNotMislabeledAsMsGraph(
+        self, mock_imap_connection, mock_get_mailbox_reports
+    ):
+        """The mailbox-fetch handler catches
+        (ClientAuthenticationError, APIError, httpx.HTTPError) on every
+        mailbox backend, not just Graph, since httpx.HTTPError can in
+        principle surface from any HTTP-backed connection. Before this
+        fix, such an error on a non-Graph connection (e.g. IMAP) still
+        went through _log_msgraph_failure() and logged a misleading
+        "Microsoft Graph ... failed (mailbox=None, tenant_id=None,
+        auth_method=None)" line. It must now log a generic
+        "Mailbox Error" instead."""
+        mock_imap_connection.return_value = object()
+        mock_get_mailbox_reports.side_effect = httpx.ConnectError("boom")
+
+        config_text = """[general]
+silent = true
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+"""
+        cfg_path = self._write_config(config_text)
+
+        with self.assertLogs("parsedmarc.log", level="ERROR") as cm:
+            with self.assertRaises(SystemExit) as system_exit:
+                self._run_main(cfg_path)
+
+        self.assertEqual(system_exit.exception.code, 1)
+        output = "\n".join(cm.output)
+        self.assertIn("Mailbox Error", output)
+        self.assertNotIn("Microsoft Graph", output)
 
 
 class TestSighupReload(unittest.TestCase):
@@ -2542,6 +3494,83 @@ watch = true
     @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
     @patch("parsedmarc.cli.watch_inbox")
     @patch("parsedmarc.cli.IMAPConnection")
+    def testReloadPassesFreshDomainMapToOutputClients(
+        self,
+        mock_imap,
+        mock_watch,
+        mock_get_reports,
+        mock_load_config,
+        mock_parse_config,
+        mock_init_clients,
+    ):
+        """The index migrations resolve their target index names from
+        index_prefix_domain_map, so a reload has to hand the *reloaded* map
+        to _init_output_clients() -- otherwise a tenant onboarded into the
+        map is not covered until the process restarts (issue #868)."""
+        import signal as signal_module
+
+        mock_imap.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        mock_load_config.return_value = ConfigParser()
+
+        first_map = {"tenant_a": ["example.com"]}
+        second_map = {"tenant_a": ["example.com"], "tenant_b": ["example.net"]}
+        maps = [first_map, second_map]
+
+        def parse_side_effect(config, opts):
+            opts.imap_host = "imap.example.com"
+            opts.imap_user = "user"
+            opts.imap_password = "pass"
+            opts.mailbox_watch = True
+            return maps.pop(0) if maps else second_map
+
+        mock_parse_config.side_effect = parse_side_effect
+        mock_init_clients.return_value = {}
+
+        watch_calls = [0]
+
+        def watch_side_effect(*args, **kwargs):
+            watch_calls[0] += 1
+            if watch_calls[0] == 1:
+                os.kill(os.getpid(), signal_module.SIGHUP)
+                return
+            raise FileExistsError("stop-watch-loop")
+
+        mock_watch.side_effect = watch_side_effect
+
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
+            cfg.write(self._BASE_CONFIG)
+            cfg_path = cfg.name
+        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path]):
+            with self.assertRaises(SystemExit):
+                parsedmarc.cli._main()
+
+        self.assertEqual(mock_init_clients.call_count, 2)
+        self.assertIs(
+            mock_init_clients.call_args_list[0].kwargs["index_prefix_domain_map"],
+            first_map,
+        )
+        self.assertIs(
+            mock_init_clients.call_args_list[1].kwargs["index_prefix_domain_map"],
+            second_map,
+        )
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGHUP"),
+        "SIGHUP not available on this platform",
+    )
+    @patch("parsedmarc.cli._init_output_clients")
+    @patch("parsedmarc.cli._parse_config")
+    @patch("parsedmarc.cli._load_config")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.watch_inbox")
+    @patch("parsedmarc.cli.IMAPConnection")
     def testReloadClosesOldClients(
         self,
         mock_imap,
@@ -2576,7 +3605,7 @@ watch = true
         new_client = MagicMock()
         init_call = [0]
 
-        def init_side_effect(opts):
+        def init_side_effect(opts, index_prefix_domain_map=None):
             init_call[0] += 1
             if init_call[0] == 1:
                 return {"kafka_client": old_client}
@@ -2673,7 +3702,7 @@ watch = true
         # Capture opts used on each _init_output_clients call
         init_opts_captures = []
 
-        def init_side_effect(opts):
+        def init_side_effect(opts, index_prefix_domain_map=None):
             from argparse import Namespace as NS
 
             init_opts_captures.append(NS(**vars(opts)))
@@ -2785,6 +3814,1014 @@ watch = true
             refreshed,
             "Stale entry should have been cleared by reload",
         )
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGHUP"),
+        "SIGHUP not available on this platform",
+    )
+    @patch("parsedmarc.cli._init_output_clients")
+    @patch("parsedmarc.cli._parse_config")
+    @patch("parsedmarc.cli._load_config")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.watch_inbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def test_sighup_reload_rebuilds_parser_config(
+        self,
+        mock_imap,
+        mock_watch,
+        mock_get_reports,
+        mock_load_config,
+        mock_parse_config,
+        mock_init_clients,
+    ):
+        """After a SIGHUP reload, the ParserConfig passed to watch_inbox as
+        ``config=`` must reflect the reloaded ``[general] dns_timeout``, not
+        the value from the initial config load.
+
+        Guards against _build_parser_config(opts) being called only once at
+        startup: opts itself is correctly refreshed in place by the existing
+        ``for k, v in vars(new_opts).items(): setattr(opts, k, v)`` loop, but
+        parser_config is a separate ParserConfig snapshot built from opts —
+        if the reload path forgot to rebuild it, watch_inbox would keep
+        receiving the stale pre-reload config object forever.
+        """
+        import signal as signal_module
+
+        mock_imap.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+
+        mock_load_config.return_value = ConfigParser()
+
+        parse_calls = [0]
+
+        def parse_side_effect(config, opts):
+            parse_calls[0] += 1
+            opts.imap_host = "imap.example.com"
+            opts.imap_user = "user"
+            opts.imap_password = "pass"
+            opts.mailbox_watch = True
+            opts.dns_timeout = 5.0 if parse_calls[0] == 1 else 42.0
+            return None
+
+        mock_parse_config.side_effect = parse_side_effect
+        mock_init_clients.return_value = {}
+
+        watch_calls = [0]
+
+        def watch_side_effect(*args, **kwargs):
+            watch_calls[0] += 1
+            if watch_calls[0] == 1:
+                if hasattr(signal_module, "SIGHUP"):
+                    import os
+
+                    os.kill(os.getpid(), signal_module.SIGHUP)
+                return
+            else:
+                raise FileExistsError("stop-watch-loop")
+
+        mock_watch.side_effect = watch_side_effect
+
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
+            cfg.write(self._BASE_CONFIG)
+            cfg_path = cfg.name
+        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path]):
+            with self.assertRaises(SystemExit):
+                parsedmarc.cli._main()
+
+        self.assertEqual(mock_watch.call_count, 2)
+        first_config = mock_watch.call_args_list[0].kwargs["config"]
+        second_config = mock_watch.call_args_list[1].kwargs["config"]
+        self.assertEqual(first_config.dns_timeout, 5.0)
+        self.assertEqual(second_config.dns_timeout, 42.0)
+
+
+class _RaisingCloseClient:
+    """An output client whose close() fails, e.g. a Kafka producer whose
+    broker connection is already gone. Unlike the search handles, a plain
+    client like this lets the error reach _close_output_clients(), which is
+    where the SIGHUP reload closes the configuration it just replaced."""
+
+    def __init__(self):
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+        raise RuntimeError("broker connection already gone")
+
+
+class _RaisingCloseFileHandler(logging.FileHandler):
+    """A log FileHandler whose close() fails, the way flushing to a full
+    disk or a stale network mount does. Counts the attempts so a test can
+    tell "close() was tried and failed" from "close() was never called"."""
+
+    def __init__(self, filename):
+        super().__init__(filename, "a")
+        self.close_attempts = 0
+
+    def close(self):
+        self.close_attempts += 1
+        raise OSError("No space left on device")
+
+
+@unittest.skipUnless(
+    hasattr(signal, "SIGHUP"),
+    "SIGHUP not available on this platform",
+)
+class TestSighupReloadAtomicity(unittest.TestCase):
+    """A SIGHUP reload is all-or-nothing.
+
+    The reload builds the replacement output clients first and only then
+    re-reads the reverse DNS map, the PSL overrides and the IP database,
+    re-applies opts, and rebuilds the ParserConfig. Committing the clients
+    before those steps ran meant a failure in any of them logged "Config
+    reload failed, continuing with previous config" while the *new* clients
+    were already live, the old ones were closed and unrecoverable, and the
+    reverse DNS map had been emptied by the loader that then failed to
+    refill it. #906 made _init_output_clients() itself all-or-nothing; these
+    tests cover the same guarantee for the whole reload.
+
+    Each test drives the real _main() through one SIGHUP and reads the state
+    the *next* watch_inbox() call sees, which is the first point at which the
+    running configuration is observable from outside.
+    """
+
+    def setUp(self):
+        self._stdout_patch = patch("sys.stdout", new_callable=io.StringIO)
+        self._stderr_patch = patch("sys.stderr", new_callable=io.StringIO)
+        self._stdout_patch.start()
+        self._stderr_patch.start()
+        self.addCleanup(self._stderr_patch.stop)
+        self.addCleanup(self._stdout_patch.stop)
+
+        # _main() sets the parsedmarc logger's level and swaps its
+        # FileHandlers, and _configure_dependency_logging() copies its
+        # handler list onto every dependency logger -- including the
+        # temporary handler assertLogs installs. Snapshot all of them here,
+        # before anything runs, so no test leaves a dead handler behind for
+        # the next one.
+        loggers = [parsedmarc.log.logger] + [
+            logging.getLogger(name) for name in parsedmarc.cli._DEPENDENCY_LOGGERS
+        ]
+        saved_logging = [
+            (lg, lg.level, list(lg.handlers), lg.propagate, lg.disabled)
+            for lg in loggers
+        ]
+
+        def _restore_logging():
+            for lg, level, handlers, propagate, disabled in saved_logging:
+                for stray in lg.handlers:
+                    # A reload that changes log_file leaves an open
+                    # FileHandler behind; close it rather than waiting for
+                    # the garbage collector to release the descriptor.
+                    if isinstance(stray, logging.FileHandler) and (
+                        stray not in handlers
+                    ):
+                        stray.close()
+                lg.setLevel(level)
+                lg.handlers[:] = handlers
+                lg.propagate = propagate
+                lg.disabled = disabled
+
+        self.addCleanup(_restore_logging)
+        parsedmarc.log.logger.disabled = False
+
+        # _main() installs SIGHUP/SIGTERM/SIGINT handlers that would
+        # otherwise outlive the test and answer signals raised by later
+        # ones. Registered before the first _main() call installs them.
+        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+
+        # Process-wide state a reload writes. Restored explicitly rather
+        # than through _utils_globals_snapshot()/_restore_utils_globals(),
+        # which are themselves under test here.
+        original_map = dict(parsedmarc.REVERSE_DNS_MAP)
+
+        def _restore_map():
+            parsedmarc.REVERSE_DNS_MAP.clear()
+            parsedmarc.REVERSE_DNS_MAP.update(original_map)
+
+        self.addCleanup(_restore_map)
+
+        saved_overrides = list(parsedmarc.utils.psl_overrides)
+        saved_ip_db_path = parsedmarc.utils._IP_DB_PATH
+        saved_ipinfo_token = parsedmarc.utils._IPINFO_API_TOKEN
+
+        def _restore_utils():
+            parsedmarc.utils.psl_overrides[:] = saved_overrides
+            parsedmarc.utils._IP_DB_PATH = saved_ip_db_path
+            parsedmarc.utils._IPINFO_API_TOKEN = saved_ipinfo_token
+
+        self.addCleanup(_restore_utils)
+
+        # A distinctive map entry, so "the map still holds what it held
+        # before the reload" is an assertion about this dict and not about
+        # whatever the bundled CSV happens to contain.
+        parsedmarc.REVERSE_DNS_MAP.clear()
+        parsedmarc.REVERSE_DNS_MAP["before.example.com"] = {
+            "name": "Before Reload",
+            "type": "test",
+        }
+
+    def _write_file(self, contents, suffix):
+        with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False) as f:
+            f.write(contents)
+            path = f.name
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def _fake_search_clients(self, extra_old_clients=None):
+        """Stand in for _init_output_clients() against the *real* search
+        connection registry.
+
+        The real thing calls ``elastic.set_hosts()``, which registers the
+        client it builds under the process-wide ``default`` alias the moment
+        it is constructed, and stores it in the returned dict wrapped in an
+        _ElasticsearchHandle. That registry and that handle are the seam the
+        reload's rollback is written against, so both are real here and only
+        the cluster connection is a stand-in.
+
+        Returns:
+            tuple: the side effect to give the _init_output_clients patch,
+            the old connection, and the new one.
+        """
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        old_conn = _FakeSearchConnection("old")
+        new_conn = _FakeSearchConnection("new")
+        self._search_conns = (old_conn, new_conn)
+        calls = []
+
+        def init_clients(opts, index_prefix_domain_map=None):
+            conn = old_conn if not calls else new_conn
+            calls.append(conn)
+            connections.add_connection("default", cast(Elasticsearch, conn))
+            clients = {
+                "elasticsearch": parsedmarc.cli._ElasticsearchHandle(conn),
+            }
+            if conn is old_conn and extra_old_clients:
+                clients.update(extra_old_clients)
+            return clients
+
+        return init_clients, old_conn, new_conn
+
+    def _current_alias(self):
+        try:
+            return parsedmarc.elastic.connections.get_connection("default")
+        except KeyError:
+            return None
+
+    def _capture_state(self):
+        """Everything the reload can write, as the running configuration
+        sees it. Read at the moment the reload is over rather than after
+        _main() returns, because the trailing _close_output_clients() would
+        otherwise blur which clients the reload itself closed."""
+        old_conn, new_conn = self._search_conns
+        return SimpleNamespace(
+            reverse_dns_map=dict(parsedmarc.REVERSE_DNS_MAP),
+            psl_overrides=list(parsedmarc.utils.psl_overrides),
+            ip_db_path=parsedmarc.utils._IP_DB_PATH,
+            ipinfo_api_token=parsedmarc.utils._IPINFO_API_TOKEN,
+            alias=self._current_alias(),
+            old_closed=old_conn.close_count,
+            new_closed=new_conn.close_count,
+            # Read here rather than after _main() returns: assertLogs()
+            # restores the logger's handler list on the way out, so the
+            # handlers a reload attached or detached are only visible from
+            # inside the run.
+            log_handlers=list(parsedmarc.log.logger.handlers),
+        )
+
+    def _drive_reload(
+        self, initial_config, reload_config, init_clients, before_signal=None
+    ):
+        """Run _main() through exactly one SIGHUP reload.
+
+        The first watch_inbox() call rewrites the config file the way an
+        operator would, runs *before_signal* if one was given -- the seam
+        for anything that has to be set up inside the run, after
+        assertLogs() has replaced the logger's handlers -- and signals
+        SIGHUP. The second records the state the reload left behind and
+        signals SIGTERM, so the watch loop breaks and _main() returns
+        normally -- which runs its trailing
+        _close_output_clients(clients). That trailing close is what makes
+        "``clients`` still names the old dict" observable: the clients it
+        closes are, by definition, the ones the run ended with.
+
+        Returns:
+            tuple: the captured state, the watch_inbox mock, and the
+            captured log output.
+        """
+        cfg_path = self._write_file(initial_config, ".ini")
+        captured = {}
+        watch_calls = []
+
+        def watch_side_effect(*args, **kwargs):
+            watch_calls.append(kwargs)
+            if len(watch_calls) == 1:
+                with open(cfg_path, "w") as f:
+                    f.write(reload_config)
+                if before_signal is not None:
+                    before_signal()
+                os.kill(os.getpid(), signal.SIGHUP)
+                return
+            captured["state"] = self._capture_state()
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        with (
+            patch("parsedmarc.cli.IMAPConnection", return_value=object()),
+            patch(
+                "parsedmarc.cli.get_dmarc_reports_from_mailbox",
+                return_value={
+                    "aggregate_reports": [],
+                    "failure_reports": [],
+                    "smtp_tls_reports": [],
+                },
+            ),
+            patch(
+                "parsedmarc.cli.watch_inbox", side_effect=watch_side_effect
+            ) as mock_watch,
+            patch("parsedmarc.cli._init_output_clients", side_effect=init_clients),
+            patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path]),
+            self.assertLogs(parsedmarc.log.logger, level="INFO") as logs,
+        ):
+            parsedmarc.cli._main()
+
+        self.assertEqual(mock_watch.call_count, 2)
+        self.assertIn("state", captured)
+        return captured["state"], mock_watch, logs.output
+
+    _CONFIG_TEMPLATE = """[general]
+debug = true
+offline = true
+dns_timeout = {dns_timeout}
+{general_extra}
+[imap]
+host = imap.example.com
+user = user
+password = pass
+
+[mailbox]
+watch = true
+batch_size = {batch_size}
+"""
+
+    def _initial_config(self, general_extra=""):
+        """The configuration the run starts with: batch_size 3 and a 5
+        second DNS timeout."""
+        return self._CONFIG_TEMPLATE.format(
+            dns_timeout="5.0", general_extra=general_extra, batch_size=3
+        )
+
+    def _reload_config(self, general_extra=""):
+        """What the operator edits the file to before signalling: every
+        value here differs from the initial config, so committing half of
+        them would show."""
+        return self._CONFIG_TEMPLATE.format(
+            dns_timeout="42.0", general_extra=general_extra, batch_size=9
+        )
+
+    def _assert_previous_config_still_running(self, state, mock_watch, logs):
+        """The claim "continuing with previous config" makes, item by
+        item."""
+        self.assertTrue(
+            any("continuing with previous config" in line for line in logs),
+            logs,
+        )
+        self.assertEqual(
+            state.reverse_dns_map,
+            {"before.example.com": {"name": "Before Reload", "type": "test"}},
+        )
+        second_call = mock_watch.call_args_list[1].kwargs
+        self.assertEqual(second_call["batch_size"], 3)
+        self.assertEqual(second_call["config"].dns_timeout, 5.0)
+
+    def testFailedReloadKeepsOldClientsWhenMapFileIsMissing(self):
+        """A reverse DNS map path that does not exist fails the reload after
+        the replacement clients were built: the new clients must be closed
+        and the old ones left running and still registered under the
+        ``default`` alias.
+
+        open() on the missing file is the injected failure -- the loader
+        catches httpx and CSV errors but not a missing local file, which is
+        exactly what a typo in ``reverse_dns_map_path`` produces.
+        """
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+
+        state, mock_watch, logs = self._drive_reload(
+            self._initial_config(),
+            self._reload_config(
+                general_extra="local_reverse_dns_map_path = /nonexistent/map.csv\n"
+            ),
+            init_clients,
+        )
+
+        # The new clients were built, then closed and stripped of the alias.
+        self.assertEqual(state.new_closed, 1)
+        # The old ones are untouched and still hold the alias, so every save
+        # between now and the next reload reaches the cluster opts describes.
+        self.assertEqual(state.old_closed, 0)
+        self.assertIs(state.alias, old_conn)
+        self._assert_previous_config_still_running(state, mock_watch, logs)
+        # _main()'s trailing close ran against the old clients, which is
+        # only possible if `clients` still named them -- and it did not
+        # close the discarded clients a second time.
+        self.assertEqual(old_conn.close_count, 1)
+        self.assertEqual(new_conn.close_count, 1)
+
+    def testFailedReloadRestoresPslOverrides(self):
+        """load_psl_overrides() empties the module-level list before it
+        reads anything, so a missing overrides file leaves it empty -- and
+        load_reverse_dns_map() calls it first thing, which is why staging
+        the map into a fresh dict is not enough on its own.
+
+        The rollback must put the list back by value, or every later
+        get_base_domain() call would fold domains without the overrides.
+        """
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+        overrides_before = list(parsedmarc.utils.psl_overrides)
+        self.assertGreater(len(overrides_before), 0)
+
+        state, mock_watch, logs = self._drive_reload(
+            self._initial_config(),
+            self._reload_config(
+                general_extra="local_psl_overrides_path = /nonexistent/psl_overrides.txt\n"
+            ),
+            init_clients,
+        )
+
+        self.assertEqual(state.psl_overrides, overrides_before)
+        self.assertEqual(state.new_closed, 1)
+        self.assertEqual(state.old_closed, 0)
+        self.assertIs(state.alias, old_conn)
+        self._assert_previous_config_still_running(state, mock_watch, logs)
+
+    def testFailedReloadKeepsOldClientsWhenIpDatabaseIsUnavailable(self):
+        """load_ip_db() falls back to the bundled MMDB when the configured
+        file, the download and the cache are all unavailable; an install
+        without that bundled resource makes the fallback itself raise.
+
+        This is the deepest point a reload can fail and still be rolled
+        back: only configure_ipinfo_api() runs after it, and its documented
+        failure (an invalid token) exits the process rather than returning
+        to the watch loop. By the time it fails, the replacement clients
+        hold the ``default`` alias, the reverse DNS map has been staged from
+        a different file, and load_psl_overrides() has already replaced the
+        live overrides list -- so this is also where the most restores are
+        load-bearing at once.
+        """
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+        overrides_before = list(parsedmarc.utils.psl_overrides)
+        self.assertNotIn("reload-only.example", overrides_before)
+        # Files the reload names and the run must end up not using.
+        reload_map_path = self._write_file(
+            "base_reverse_dns,name,type\nafter.example.com,After Reload,test\n",
+            ".csv",
+        )
+        reload_overrides_path = self._write_file("reload-only.example\n", ".txt")
+
+        # The IP database the run starts with, and keeps.
+        ip_db_path = self._write_file("not really an mmdb", ".mmdb")
+        # An empty cache directory, so load_ip_db() cannot answer from a
+        # copy some earlier run downloaded and must reach the bundled file.
+        cache_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cache_dir, True)
+
+        real_files = parsedmarc.utils.files
+
+        def files_without_bundled_mmdb(package):
+            # The importlib.resources boundary: the maps package (the
+            # reverse DNS map and the PSL overrides, both loaded earlier in
+            # the same reload) still resolves normally.
+            if package is parsedmarc.resources.ipinfo:
+                raise ModuleNotFoundError("parsedmarc.resources.ipinfo")
+            return real_files(package)
+
+        with (
+            patch("parsedmarc.utils.files", side_effect=files_without_bundled_mmdb),
+            patch("parsedmarc.utils.tempfile.gettempdir", return_value=cache_dir),
+        ):
+            state, mock_watch, logs = self._drive_reload(
+                # Startup resolves the local file directly and never reaches
+                # the bundled fallback, so only the reload -- which drops
+                # ip_db_path -- fails.
+                self._initial_config(f"ip_db_path = {ip_db_path}\n"),
+                self._reload_config(
+                    general_extra=(
+                        f"local_reverse_dns_map_path = {reload_map_path}\n"
+                        f"local_psl_overrides_path = {reload_overrides_path}\n"
+                    )
+                ),
+                init_clients,
+            )
+
+        # The two restores that carry weight at this depth: the overrides
+        # list load_psl_overrides() had already replaced, and the map, which
+        # was staged into a dict that is simply dropped -- the live one
+        # still holds the pre-reload entry rather than the reload's file.
+        self.assertEqual(state.psl_overrides, overrides_before)
+        self.assertNotIn("after.example.com", state.reverse_dns_map)
+        # load_ip_db() assigns _IP_DB_PATH only as the last thing on each
+        # of its paths, so a raise from it leaves the previous selection in
+        # place rather than a half-applied one; that the snapshot can put a
+        # *changed* value back is covered by TestUtilsGlobalsSnapshot.
+        self.assertEqual(state.ip_db_path, ip_db_path)
+        self.assertEqual(state.new_closed, 1)
+        self.assertEqual(state.old_closed, 0)
+        self.assertIs(state.alias, old_conn)
+        self._assert_previous_config_still_running(state, mock_watch, logs)
+
+    def testSuccessfulReloadCommitsEveryStagedValue(self):
+        """The other half: when every step succeeds, the staged state is
+        what the run continues with -- new clients live and holding the
+        alias, old clients closed, the reverse DNS map replaced by the file
+        the new config names, and the new watch parameters and ParserConfig
+        in use.
+
+        (Passes against the pre-fix code too, necessarily: a reload with
+        nothing to roll back has to end in the same place either way. It is
+        here so that the failure tests above cannot be satisfied by a
+        reload that quietly stopped applying anything.)"""
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+        map_path = self._write_file(
+            "base_reverse_dns,name,type\nafter.example.com,After Reload,test\n",
+            ".csv",
+        )
+
+        state, mock_watch, logs = self._drive_reload(
+            self._initial_config(),
+            self._reload_config(
+                general_extra=f"local_reverse_dns_map_path = {map_path}\n"
+            ),
+            init_clients,
+        )
+
+        self.assertTrue(
+            any("Configuration reloaded successfully" in line for line in logs),
+            logs,
+        )
+        self.assertEqual(
+            state.reverse_dns_map,
+            {"after.example.com": {"name": "After Reload", "type": "test"}},
+        )
+        self.assertIs(state.alias, new_conn)
+        self.assertEqual(state.old_closed, 1)
+        self.assertEqual(state.new_closed, 0)
+        second_call = mock_watch.call_args_list[1].kwargs
+        self.assertEqual(second_call["batch_size"], 9)
+        self.assertEqual(second_call["config"].dns_timeout, 42.0)
+        # The ParserConfig keeps the live map object, so the in-place
+        # refresh above has to reach the parser through it.
+        self.assertIs(second_call["config"].reverse_dns_map, parsedmarc.REVERSE_DNS_MAP)
+        # _main()'s trailing close ran against the new clients.
+        self.assertEqual(new_conn.close_count, 1)
+
+    def testOldClientCloseFailureDoesNotUndoTheReload(self):
+        """Closing the replaced clients is the last step and is best effort:
+        a client whose close() raises is logged and the reloaded
+        configuration stays live.
+
+        (This one passes against the pre-fix code too -- there the same
+        close ran before the swap, and _close_output_clients() swallowed the
+        error either way. It guards the move: closing the old clients last
+        must not put the commit at risk.)
+        """
+        raising_client = _RaisingCloseClient()
+        init_clients, old_conn, new_conn = self._fake_search_clients(
+            extra_old_clients={"kafka": raising_client}
+        )
+        map_path = self._write_file(
+            "base_reverse_dns,name,type\nafter.example.com,After Reload,test\n",
+            ".csv",
+        )
+
+        state, mock_watch, logs = self._drive_reload(
+            self._initial_config(),
+            self._reload_config(
+                general_extra=f"local_reverse_dns_map_path = {map_path}\n"
+            ),
+            init_clients,
+        )
+
+        self.assertEqual(raising_client.close_count, 1)
+        self.assertTrue(
+            any("Error closing kafka" in line for line in logs),
+            logs,
+        )
+        self.assertTrue(
+            any("Configuration reloaded successfully" in line for line in logs),
+            logs,
+        )
+        self.assertIs(state.alias, new_conn)
+        self.assertEqual(state.new_closed, 0)
+        self.assertEqual(state.old_closed, 1)
+        self.assertEqual(
+            state.reverse_dns_map,
+            {"after.example.com": {"name": "After Reload", "type": "test"}},
+        )
+        self.assertEqual(mock_watch.call_args_list[1].kwargs["batch_size"], 9)
+
+    def testLogFileCloseFailureDoesNotUndoTheReload(self):
+        """Swapping the log file is the last thing the commit does, and
+        closing the replaced FileHandler can fail on a full disk or a stale
+        mount. Opening the replacement happens back in phase 1, so the close
+        is the only statement left in the commit that can raise, and it must
+        not take the reload -- which is already live by then -- with it."""
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+        map_path = self._write_file(
+            "base_reverse_dns,name,type\nafter.example.com,After Reload,test\n",
+            ".csv",
+        )
+        log_path = self._write_file("", ".log")
+        stale_handler = _RaisingCloseFileHandler(self._write_file("", ".log"))
+        # The subclass's close() raises; the unbound FileHandler.close()
+        # is what actually releases the descriptor.
+        self.addCleanup(logging.FileHandler.close, stale_handler)
+
+        state, mock_watch, logs = self._drive_reload(
+            self._initial_config(),
+            self._reload_config(
+                general_extra=(
+                    f"local_reverse_dns_map_path = {map_path}\nlog_file = {log_path}\n"
+                )
+            ),
+            init_clients,
+            # Inside the run: assertLogs() replaces the logger's handler
+            # list on the way in, so a handler attached before _main()
+            # started would not be there for the reload to close.
+            before_signal=lambda: parsedmarc.log.logger.addHandler(stale_handler),
+        )
+
+        self.assertEqual(stale_handler.close_attempts, 1)
+        self.assertTrue(
+            any("Unable to close the log file" in line for line in logs), logs
+        )
+        self.assertNotIn(stale_handler, state.log_handlers)
+        # The commit stands: new clients live and holding the alias, old
+        # ones closed, map replaced, new watch parameters in use.
+        self.assertTrue(
+            any("Configuration reloaded successfully" in line for line in logs), logs
+        )
+        self.assertIs(state.alias, new_conn)
+        self.assertEqual(state.new_closed, 0)
+        self.assertEqual(state.old_closed, 1)
+        self.assertEqual(
+            state.reverse_dns_map,
+            {"after.example.com": {"name": "After Reload", "type": "test"}},
+        )
+        self.assertEqual(mock_watch.call_args_list[1].kwargs["batch_size"], 9)
+
+    def testUnwritableLogFileAbortsTheReload(self):
+        """The replacement log file is opened in phase 1, with the previous
+        FileHandler still attached, so a ``log_file`` that cannot be opened
+        is a reload failure rather than a warning logged after the old
+        handler is already gone.
+
+        Everything else in this reload would have succeeded -- it names a
+        readable map file and a new batch size -- so the previous
+        configuration still running afterwards is the log file open's doing.
+        The old handler is still attached and still open, which is what
+        makes the "Config reload failed" record reach the log file the
+        operator is tailing, and no second FileHandler was left behind by
+        the open that failed.
+        """
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+        map_path = self._write_file(
+            "base_reverse_dns,name,type\nafter.example.com,After Reload,test\n",
+            ".csv",
+        )
+        # /proc has no subdirectories that can be created, so opening a file
+        # under a nonexistent one fails the way a bad ``log_file`` path
+        # does. Same trick as
+        # test_unwritable_log_file_logs_warning_does_not_raise.
+        unwritable_log = "/proc/nonexistent/parsedmarc-reload.log"
+        live_handler = logging.FileHandler(self._write_file("", ".log"), "a")
+        self.addCleanup(live_handler.close)
+        self.addCleanup(parsedmarc.log.logger.removeHandler, live_handler)
+
+        state, mock_watch, logs = self._drive_reload(
+            self._initial_config(),
+            self._reload_config(
+                general_extra=(
+                    f"local_reverse_dns_map_path = {map_path}\n"
+                    f"log_file = {unwritable_log}\n"
+                )
+            ),
+            init_clients,
+            # Inside the run, for the same reason as the close-failure test:
+            # assertLogs() replaces the logger's handler list on the way in.
+            before_signal=lambda: parsedmarc.log.logger.addHandler(live_handler),
+        )
+
+        self.assertTrue(
+            any(
+                "Config reload failed, continuing with previous config" in line
+                for line in logs
+            ),
+            logs,
+        )
+        self.assertFalse(
+            any("Configuration reloaded successfully" in line for line in logs),
+            logs,
+        )
+        # The log file the operator is tailing is still attached and still
+        # open, so the failure was reported into it -- and it is the only
+        # FileHandler on the logger, so nothing leaked from the failed open.
+        self.assertEqual(
+            [h for h in state.log_handlers if isinstance(h, logging.FileHandler)],
+            [live_handler],
+        )
+        self.assertTrue(
+            live_handler.stream is not None and not live_handler.stream.closed,
+            "the previous log file handler was closed",
+        )
+        # The rest of the reload was rolled back: the replacement clients
+        # are closed, the old ones still hold the alias, the map still holds
+        # its pre-reload entry, and the watch parameters are the originals.
+        self.assertEqual(state.new_closed, 1)
+        self.assertEqual(state.old_closed, 0)
+        self.assertIs(state.alias, old_conn)
+        self.assertNotIn("after.example.com", state.reverse_dns_map)
+        self._assert_previous_config_still_running(state, mock_watch, logs)
+
+    def testFailedReloadClosesTheStagedLogFileHandler(self):
+        """A reload that opens the replacement log file and then fails on a
+        later step has to close the file it opened: the handler was never
+        attached to the logger, so closing it is the whole undo, and leaving
+        it open would leak a descriptor on every such reload.
+
+        The missing map path is the injected failure, as in
+        testFailedReloadKeepsOldClientsWhenMapFileIsMissing; this reload also
+        names a writable log file, so the staged handler exists by the time
+        that failure lands. Capturing it needs a real FileHandler subclass
+        rather than a mock, because the code the reload runs afterwards
+        checks handlers with isinstance().
+        """
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+        log_path = self._write_file("", ".log")
+        opened: list[logging.FileHandler] = []
+
+        class _CapturingFileHandler(logging.FileHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                opened.append(self)
+
+        with patch("logging.FileHandler", _CapturingFileHandler):
+            state, mock_watch, logs = self._drive_reload(
+                self._initial_config(),
+                self._reload_config(
+                    general_extra=(
+                        "local_reverse_dns_map_path = /nonexistent/map.csv\n"
+                        f"log_file = {log_path}\n"
+                    )
+                ),
+                init_clients,
+            )
+
+        # The initial config names no log file, so the staging step is the
+        # only thing in the run that opens one.
+        self.assertEqual(len(opened), 1)
+        staged = opened[0]
+        self.addCleanup(staged.close)
+        self.assertEqual(staged.baseFilename, os.path.abspath(log_path))
+        # FileHandler.close() drops the stream it owns, so a None stream is
+        # the rollback having closed this handler.
+        self.assertIsNone(staged.stream)
+        # It was never attached, so there was nothing else to undo -- and
+        # the logger is still writing wherever it was before the SIGHUP.
+        self.assertNotIn(staged, state.log_handlers)
+        self.assertEqual(state.new_closed, 1)
+        self.assertEqual(state.old_closed, 0)
+        self.assertIs(state.alias, old_conn)
+        self._assert_previous_config_still_running(state, mock_watch, logs)
+
+    def testFailedReloadSurvivesAStagedLogFileHandlerThatCannotClose(self):
+        """A rollback whose staged-handler close fails must still restore
+        the search alias and finish as "continuing with previous config",
+        instead of the close error escaping the handler and taking the
+        watcher down with the alias left unrestored.
+
+        Same missing-map injected failure as
+        testFailedReloadClosesTheStagedLogFileHandler, but the staged
+        handler here is a _RaisingCloseFileHandler, so the rollback's own
+        ``staged_log_handler.close()`` call raises. Before the fix, that
+        raise propagated out of the ``except Exception:`` block, so
+        _restore_search_aliases() and _restore_utils_globals() below it
+        never ran and the exception itself replaced the "Config reload
+        failed" log message.
+        """
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+        log_path = self._write_file("", ".log")
+        opened: list[_RaisingCloseFileHandler] = []
+
+        class _CapturingRaisingCloseFileHandler(_RaisingCloseFileHandler):
+            # cli.py constructs the handler as FileHandler(path, "a"), and
+            # _RaisingCloseFileHandler always opens in append mode, so the
+            # mode argument only needs accepting.
+            def __init__(self, filename, mode="a"):
+                super().__init__(filename)
+                opened.append(self)
+
+        with patch("logging.FileHandler", _CapturingRaisingCloseFileHandler):
+            state, mock_watch, logs = self._drive_reload(
+                self._initial_config(),
+                self._reload_config(
+                    general_extra=(
+                        "local_reverse_dns_map_path = /nonexistent/map.csv\n"
+                        f"log_file = {log_path}\n"
+                    )
+                ),
+                init_clients,
+            )
+
+        # The initial config names no log file, so the staging step is the
+        # only thing in the run that opens one.
+        self.assertEqual(len(opened), 1)
+        self.addCleanup(logging.FileHandler.close, opened[0])
+        self.assertEqual(opened[0].close_attempts, 1)
+        self.assertTrue(
+            any(
+                "Unable to close the log file opened for the reload" in line
+                for line in logs
+            ),
+            logs,
+        )
+        # The close error was logged and swallowed rather than escaping, so
+        # the rollback still finished and reported itself normally.
+        self._assert_previous_config_still_running(state, mock_watch, logs)
+        # ... and the two restores that come after the close in source order
+        # still ran: the new clients are closed, the old ones still hold the
+        # alias, and the staged handler was never attached to the logger.
+        self.assertEqual(state.new_closed, 1)
+        self.assertEqual(state.old_closed, 0)
+        self.assertIs(state.alias, old_conn)
+        self.assertNotIn(opened[0], state.log_handlers)
+
+    def testLogFileUnopenableAtStartupIsRetriedOnReload(self):
+        """A ``log_file`` that could not be opened when parsedmarc started is
+        only a warning there -- startup has no previous configuration to
+        keep, so it logs "Unable to write to log file" and carries on. The
+        next reload has to retry that open even though the operator never
+        changed the setting, once the directory that was missing exists.
+
+        Before this fix, startup recorded the unopened path onto
+        ``opts.active_log_file`` anyway, so the reload's
+        ``old_log_file != new_log_file`` comparison saw the same path on
+        both sides and treated the log file as nothing to refresh -- file
+        logging stayed dead until the process was restarted, even after the
+        directory was created. Recording ``None`` when the open fails makes
+        the comparison true, so the reload opens it for real.
+        """
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        log_path = os.path.join(tmpdir, "later", "parsedmarc.log")
+
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+
+        state, mock_watch, logs = self._drive_reload(
+            self._initial_config(general_extra=f"log_file = {log_path}\n"),
+            self._reload_config(general_extra=f"log_file = {log_path}\n"),
+            init_clients,
+            # The operator fixes the missing directory before the SIGHUP
+            # that _drive_reload sends right after this runs.
+            before_signal=lambda: os.makedirs(os.path.dirname(log_path)),
+        )
+
+        self.assertTrue(
+            any("Unable to write to log file" in line for line in logs), logs
+        )
+        self.assertTrue(
+            any("Configuration reloaded successfully" in line for line in logs),
+            logs,
+        )
+        file_handlers = [
+            h for h in state.log_handlers if isinstance(h, logging.FileHandler)
+        ]
+        self.assertEqual(len(file_handlers), 1)
+        handler = file_handlers[0]
+        # assertLogs() already restored the logger's own handler list by
+        # the time this runs, so this handler is not attached to anything
+        # -- closing it is enough, with no removeHandler needed alongside
+        # it (contrast testUnwritableLogFileAbortsTheReload's live_handler,
+        # which stays attached and needs both).
+        self.addCleanup(handler.close)
+        self.assertEqual(handler.baseFilename, os.path.abspath(log_path))
+        self.assertEqual(state.old_closed, 1)
+        self.assertEqual(state.new_closed, 0)
+        self.assertIs(state.alias, new_conn)
+        self.assertTrue(os.path.exists(log_path))
+
+    def testLogFileOpenedAtStartupIsNotReopenedByAnUnchangedReload(self):
+        """The other half of testLogFileUnopenableAtStartupIsRetriedOnReload:
+        a ``log_file`` startup *can* open gets recorded as the active one, so
+        a reload that leaves the setting unchanged does not reopen it.
+
+        This is what guards the ``opts.active_log_file = opts.log_file``
+        assignment moving inside the ``try`` -- if startup stopped recording
+        a successful open, ``old_log_file`` would stay ``None`` and every
+        reload would treat an unchanged, already-open ``log_file`` as a
+        replacement to stage, opening it a second time for no reason.
+        """
+        log_path = self._write_file("", ".log")
+        opened: list[logging.FileHandler] = []
+
+        class _CapturingFileHandler(logging.FileHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                opened.append(self)
+
+        init_clients, old_conn, new_conn = self._fake_search_clients()
+
+        with patch("logging.FileHandler", _CapturingFileHandler):
+            state, mock_watch, logs = self._drive_reload(
+                self._initial_config(general_extra=f"log_file = {log_path}\n"),
+                self._reload_config(general_extra=f"log_file = {log_path}\n"),
+                init_clients,
+            )
+
+        self.assertFalse(
+            any("Unable to write to log file" in line for line in logs), logs
+        )
+        self.assertTrue(
+            any("Configuration reloaded successfully" in line for line in logs),
+            logs,
+        )
+        # Startup opened the file once; the reload, seeing the same path as
+        # its own active_log_file, did not stage a second FileHandler.
+        self.assertEqual(len(opened), 1)
+        file_handlers = [
+            h for h in state.log_handlers if isinstance(h, logging.FileHandler)
+        ]
+        self.assertEqual(len(file_handlers), 1)
+        self.assertIs(file_handlers[0], opened[0])
+        self.assertEqual(opened[0].baseFilename, os.path.abspath(log_path))
+        # assertLogs() already restored the logger's own handler list by the
+        # time this runs, so this handler is not attached to anything --
+        # closing it is enough, with no removeHandler needed alongside it.
+        self.addCleanup(opened[0].close)
+        self.assertEqual(state.old_closed, 1)
+        self.assertEqual(state.new_closed, 0)
+        self.assertIs(state.alias, new_conn)
+
+
+class TestUtilsGlobalsSnapshot(unittest.TestCase):
+    """_utils_globals_snapshot() / _restore_utils_globals() cover every
+    module global the config loaders the SIGHUP reload calls assign:
+    ``psl_overrides`` (load_psl_overrides), ``_IP_DB_PATH`` (load_ip_db) and
+    ``_IPINFO_API_TOKEN`` (configure_ipinfo_api)."""
+
+    def setUp(self):
+        saved_overrides = list(parsedmarc.utils.psl_overrides)
+        saved_ip_db_path = parsedmarc.utils._IP_DB_PATH
+        saved_token = parsedmarc.utils._IPINFO_API_TOKEN
+
+        def _restore():
+            parsedmarc.utils.psl_overrides[:] = saved_overrides
+            parsedmarc.utils._IP_DB_PATH = saved_ip_db_path
+            parsedmarc.utils._IPINFO_API_TOKEN = saved_token
+
+        self.addCleanup(_restore)
+
+    def testRestoresEveryLoaderGlobalAfterTheLoadersRanAgain(self):
+        parsedmarc.utils.psl_overrides[:] = ["example.co.uk"]
+        parsedmarc.utils._IP_DB_PATH = "/before/ipinfo_lite.mmdb"
+        parsedmarc.utils._IPINFO_API_TOKEN = "before-token"
+        overrides_object = parsedmarc.utils.psl_overrides
+
+        snapshot = parsedmarc.cli._utils_globals_snapshot()
+
+        # What the loaders do: the overrides list is cleared and refilled in
+        # place, and the other two are rebound.
+        parsedmarc.utils.psl_overrides.clear()
+        parsedmarc.utils.psl_overrides.append("example.com.au")
+        parsedmarc.utils._IP_DB_PATH = "/after/ipinfo_lite.mmdb"
+        parsedmarc.utils._IPINFO_API_TOKEN = "after-token"
+
+        parsedmarc.cli._restore_utils_globals(snapshot)
+
+        self.assertEqual(parsedmarc.utils.psl_overrides, ["example.co.uk"])
+        self.assertEqual(parsedmarc.utils._IP_DB_PATH, "/before/ipinfo_lite.mmdb")
+        self.assertEqual(parsedmarc.utils._IPINFO_API_TOKEN, "before-token")
+        # In place, not rebound: get_base_domain() reads the list through
+        # the module global, but the snapshot must not hand back a
+        # different object to anything holding a reference to this one.
+        self.assertIs(parsedmarc.utils.psl_overrides, overrides_object)
+
+    def testSnapshotIsNotAliasedToTheLiveOverridesList(self):
+        """The overrides list is snapshotted by value: load_psl_overrides()
+        mutates the live object, so a snapshot that aliased it would record
+        the failed reload's contents instead of the previous ones."""
+        parsedmarc.utils.psl_overrides[:] = ["example.co.uk"]
+
+        snapshot = parsedmarc.cli._utils_globals_snapshot()
+        parsedmarc.utils.psl_overrides.clear()
+
+        self.assertEqual(snapshot["psl_overrides"], ["example.co.uk"])
 
 
 class TestSigtermShutdown(unittest.TestCase):
@@ -2947,68 +4984,100 @@ watch = true
     @patch("parsedmarc.cli.get_dmarc_reports_from_mbox")
     @patch("parsedmarc.cli.is_mbox", side_effect=lambda p: p.endswith(".mbox"))
     @patch("parsedmarc.cli._init_output_clients")
-    @patch("parsedmarc.cli.Process")
+    @patch("parsedmarc.parallel.ProcessPoolExecutor")
     @patch("parsedmarc.cli.glob")
-    def testSigtermDuringOneShotStopsBetweenBatchesAndMbox(
+    def testSigtermDuringOneShotStopsEarlyAndSkipsMbox(
         self,
         mock_glob,
-        mock_process_cls,
+        mock_pool_cls,
         mock_init_clients,
         mock_is_mbox,
         mock_get_mbox,
     ):
-        """SIGTERM during one-shot processing: the in-flight child is
-        joined normally (no work lost), the file-batch loop stops before
-        spawning the next batch, and the subsequent mbox loop breaks on
-        its first iteration (the flag is already set). Output clients are
-        still closed.
+        """SIGTERM during one-shot processing: ``parallel_map``'s
+        ``should_stop`` check (polled after each yielded result, see
+        ``parsedmarc/parallel.py``) stops submitting new jobs once the flag
+        is set, and the subsequent mbox loop breaks on its first iteration
+        (the flag is already set). Output clients are still closed.
 
-        Two ``.xml`` files give the batch loop a second iteration to hit
-        its break; one ``.mbox`` file routes into ``mbox_paths`` so the
-        mbox break is exercised too. ``is_mbox`` is keyed by suffix so the
-        fake filenames don't trigger ``mailbox.mbox(path, create=True)``."""
-        mock_glob.return_value = ["a.xml", "b.xml", "c.mbox"]
+        ``ProcessPoolExecutor`` is patched at the stdlib boundary (mirrors
+        the old ``cli.Process`` patch) with a fake whose ``submit(fn, arg)``
+        runs ``fn(arg)`` inline and returns an already-completed
+        ``Future``-like object, so no real subprocess is spawned and no
+        pickling occurs. SIGTERM is raised on the very first ``submit``
+        call, mirroring the old test's trigger on the first child's
+        ``start()``.
+
+        ``parallel_map`` primes its submission window up to
+        ``2 * n_procs`` jobs *before* the first result is harvested and
+        ``should_stop`` is ever checked (see ``parallel_map``'s docstring),
+        so with the default ``n_procs = 1`` the first two files are
+        submitted and run before the stop takes effect — the ``should_stop``
+        check only prevents a third submission. Four ``.xml`` files (more
+        than the window size) are supplied so that the stop is still
+        observable: exactly 2 of the 4 are submitted, not all of them. One
+        ``.mbox`` file routes into ``mbox_paths`` so the mbox break is
+        exercised too. ``is_mbox`` is keyed by suffix so the fake filenames
+        don't trigger ``mailbox.mbox(path, create=True)``."""
+        mock_glob.return_value = ["a.xml", "b.xml", "c.xml", "d.xml", "e.mbox"]
 
         kafka_client = MagicMock(spec=["close"])
         mock_init_clients.return_value = {"kafka": kafka_client}
 
-        starts = []
+        submitted = []
 
-        class FakeProc:
-            """Stand-in child that finishes its file and sends a result
-            even though SIGTERM arrived mid-batch."""
+        class FakeFuture:
+            def __init__(self, value):
+                self._value = value
 
-            def __init__(self, target=None, args=()):
-                self._args = args
+            def result(self, timeout=None):
+                return self._value
 
-            def start(self):
-                starts.append(self._args[0])
-                if len(starts) == 1:
+            def cancelled(self):
+                return False
+
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def submit(self, fn, arg):
+                if not submitted:
+                    # Mirrors the old test's trigger on the first child's
+                    # start(): SIGTERM arrives after the first job is
+                    # dispatched but while the submission window is still
+                    # being primed.
                     os.kill(os.getpid(), signal.SIGTERM)
-                # Child still completes and reports back over the pipe.
-                self._args[-3].send([None, self._args[0]])
+                submitted.append(arg)
+                return FakeFuture(fn(arg))
 
-            def join(self, timeout=None):
+            def shutdown(self, cancel_futures=True):
                 return None
 
-        mock_process_cls.side_effect = FakeProc
+        mock_pool_cls.side_effect = FakeExecutor
 
-        with patch.object(sys, "argv", ["parsedmarc", "a.xml", "b.xml", "c.mbox"]):
+        with patch.object(
+            sys, "argv", ["parsedmarc", "a.xml", "b.xml", "c.xml", "d.xml", "e.mbox"]
+        ):
             parsedmarc.cli._main()
 
-        # Only the first xml batch ran before the batch loop broke, and the
-        # mbox loop broke before processing its file.
-        self.assertEqual(len(starts), 1)
+        # The submission window (2 * n_procs, n_procs=1) primes 2 jobs
+        # before should_stop is first checked; the stop takes effect before
+        # a 3rd or 4th file is ever submitted.
+        self.assertEqual(len(submitted), 2)
         mock_get_mbox.assert_not_called()
         kafka_client.close.assert_called()
 
     @patch("parsedmarc.cli._init_output_clients")
-    @patch("parsedmarc.cli.cli_parse")
     @patch("parsedmarc.cli.glob")
     def testNormalOneShotExitClosesOutputClients(
         self,
         mock_glob,
-        mock_cli_parse,
         mock_init_clients,
     ):
         """A successful one-shot run with no signal still closes its
@@ -3026,13 +5095,674 @@ watch = true
         # No watch, no mailbox, no files → _main runs through with
         # empty parsing_results and returns normally.
         with patch.object(sys, "argv", ["parsedmarc", "nothing-here.xml"]):
-            try:
-                parsedmarc.cli._main()
-            except SystemExit:
-                pass
+            parsedmarc.cli._main()
 
         kafka_client.close.assert_called_once()
         es_client.close.assert_called_once()
+
+
+class _FakeSearchConnection:
+    """Stand-in for an Elasticsearch/OpenSearch client held in the real
+    connection registry. Records close() calls and nothing else, so no
+    network is touched while the registry itself stays real -- it is the
+    SDK boundary these handles are written against."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.close_count = 0
+
+    def __repr__(self):
+        return f"<fake {self.name} connection, closed {self.close_count}x>"
+
+    def close(self):
+        self.close_count += 1
+
+
+class _RaisingSearchConnection(_FakeSearchConnection):
+    """A client whose close() fails, e.g. because the transport is already
+    broken. The handles treat closing as best-effort."""
+
+    def close(self):
+        super().close()
+        raise RuntimeError("transport already closed")
+
+
+def _isolate_default_alias(test_case, connections):
+    """Restore whatever the process-wide registry held under the ``default``
+    alias, so a test that registers a client into a real Elasticsearch or
+    OpenSearch connection registry cannot leak into other tests regardless of
+    ordering."""
+    try:
+        previous = connections.get_connection("default")
+    except KeyError:
+        previous = None
+
+    def restore():
+        try:
+            connections.remove_connection("default")
+        except KeyError:
+            # Already gone: the test under this cleanup removed the
+            # alias itself, which is the state we are restoring to.
+            pass
+        if previous is not None:
+            connections.add_connection("default", previous)
+
+    test_case.addCleanup(restore)
+
+
+class TestSearchBackendHandles(unittest.TestCase):
+    """_ElasticsearchHandle / _OpenSearchHandle must close the client they
+    were built for, not whatever holds the ``default`` alias at close time.
+
+    A SIGHUP reload calls _init_output_clients -- which re-registers the
+    ``default`` alias with the replacement client -- before it calls
+    _close_output_clients on the old clients (the order is deliberate, so a
+    broken new config leaves the old clients running). A handle that
+    re-resolved the alias when closing therefore closed the *new* client and
+    then dropped the alias entirely: both SDKs' Connections.remove_connection()
+    deletes the alias from ``_conns`` and ``_kwargs`` outright, so every later
+    save raised KeyError("There is no connection with alias 'default'.") and
+    the original client was never closed.
+    """
+
+    def testElasticsearchHandleClosesItsOwnConnectionAfterReload(self):
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        old_conn = _FakeSearchConnection("old")
+        new_conn = _FakeSearchConnection("new")
+
+        connections.add_connection("default", cast(Elasticsearch, old_conn))
+        handle = parsedmarc.cli._ElasticsearchHandle(
+            connections.get_connection("default")
+        )
+        # What a reload does before the old handle is closed: the new
+        # client takes over the alias.
+        connections.add_connection("default", cast(Elasticsearch, new_conn))
+
+        handle.close()
+
+        self.assertEqual(old_conn.close_count, 1)
+        self.assertEqual(new_conn.close_count, 0)
+        self.assertIs(connections.get_connection("default"), new_conn)
+
+    def testElasticsearchHandleReleasesAliasOnShutdown(self):
+        """The normal teardown path still frees the alias it owns."""
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        conn = _FakeSearchConnection("only")
+
+        connections.add_connection("default", cast(Elasticsearch, conn))
+        handle = parsedmarc.cli._ElasticsearchHandle(
+            connections.get_connection("default")
+        )
+
+        handle.close()
+
+        self.assertEqual(conn.close_count, 1)
+        with self.assertRaises(KeyError):
+            connections.get_connection("default")
+
+    def testElasticsearchHandleCloseIsBestEffort(self):
+        """A client whose close() raises must not keep the handle from
+        releasing its alias. A second close() still calls the client's
+        close() again -- which raises and is swallowed -- even though the
+        alias-release step is now a no-op, since get_connection() raises
+        KeyError with the alias already gone."""
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        conn = _RaisingSearchConnection("raiser")
+
+        connections.add_connection("default", cast(Elasticsearch, conn))
+        handle = parsedmarc.cli._ElasticsearchHandle(
+            connections.get_connection("default")
+        )
+
+        handle.close()
+
+        self.assertEqual(conn.close_count, 1)
+        with self.assertRaises(KeyError):
+            connections.get_connection("default")
+
+        handle.close()
+
+        self.assertEqual(conn.close_count, 2)
+
+    def testOpenSearchHandleClosesItsOwnConnectionAfterReload(self):
+        connections = opensearch_module.connections
+        _isolate_default_alias(self, connections)
+        old_conn = _FakeSearchConnection("old")
+        new_conn = _FakeSearchConnection("new")
+
+        connections.add_connection("default", old_conn)
+        handle = parsedmarc.cli._OpenSearchHandle(connections.get_connection("default"))
+        connections.add_connection("default", new_conn)
+
+        handle.close()
+
+        self.assertEqual(old_conn.close_count, 1)
+        self.assertEqual(new_conn.close_count, 0)
+        self.assertIs(connections.get_connection("default"), new_conn)
+
+    def testOpenSearchHandleReleasesAliasOnShutdown(self):
+        """The normal teardown path still frees the alias it owns."""
+        connections = opensearch_module.connections
+        _isolate_default_alias(self, connections)
+        conn = _FakeSearchConnection("only")
+
+        connections.add_connection("default", conn)
+        handle = parsedmarc.cli._OpenSearchHandle(connections.get_connection("default"))
+
+        handle.close()
+
+        self.assertEqual(conn.close_count, 1)
+        with self.assertRaises(KeyError):
+            connections.get_connection("default")
+
+    def testOpenSearchHandleCloseIsBestEffort(self):
+        """A client whose close() raises must not keep the handle from
+        releasing its alias. A second close() still calls the client's
+        close() again -- which raises and is swallowed -- even though the
+        alias-release step is now a no-op, since get_connection() raises
+        KeyError with the alias already gone."""
+        connections = opensearch_module.connections
+        _isolate_default_alias(self, connections)
+        conn = _RaisingSearchConnection("raiser")
+
+        connections.add_connection("default", conn)
+        handle = parsedmarc.cli._OpenSearchHandle(connections.get_connection("default"))
+
+        handle.close()
+
+        self.assertEqual(conn.close_count, 1)
+        with self.assertRaises(KeyError):
+            connections.get_connection("default")
+
+        handle.close()
+
+        self.assertEqual(conn.close_count, 2)
+
+
+# A host nothing listens on. Every test below patches the SDK transport
+# method that would talk to it, so the client is only ever constructed --
+# which opens no socket -- and no test can reach the network even if a
+# patch is later removed by mistake.
+_UNREACHABLE_HOSTS = ["127.0.0.1:9299"]
+
+
+def _es_request_without_network(client, method, path, **kwargs):
+    """Stand-in for ``elasticsearch.Elasticsearch.perform_request``.
+
+    Every cluster call ``migrate_indexes()`` makes -- through
+    ``Index.exists()``, ``client.count()`` and ``client.update_by_query()``,
+    and through the namespaced clients, which delegate to the
+    ``Elasticsearch`` instance's own ``perform_request`` -- funnels through
+    this one method, so it is the SDK boundary at which a migration can be
+    made to succeed without a cluster.
+
+    A ``HEAD`` (``Index.exists()``) answers "no such index", which skips the
+    legacy ``published_policy.fo`` migration; anything else answers the
+    backfill's ``count`` query with zero matching documents, which skips the
+    ``update_by_query``. ``migrate_indexes()`` therefore returns having
+    logged nothing and changed nothing.
+    """
+    if method == "HEAD":
+        return {}
+    return {"count": 0}
+
+
+class TestInitOutputClientsRollback(unittest.TestCase):
+    """_init_output_clients() is all-or-nothing against the search backends'
+    process-wide ``default`` connection alias.
+
+    ``elastic.set_hosts()`` / ``opensearch.set_hosts()`` register the client
+    they build under that alias the moment it is constructed, but the rest of
+    the initialization -- the index migration, and every output configured
+    after them -- can still fail. The SIGHUP reload in _main() builds the
+    replacement clients *before* closing the old ones and keeps the old opts
+    when the build raises ("Config reload failed, continuing with previous
+    config"), so a mutated alias meant the save path -- every ``Search`` and
+    ``Document.save()`` in parsedmarc/elastic.py, each of which resolves the
+    ``default`` alias through its SDK -- reached the *new* cluster while
+    ``opts`` and ``index_prefix_domain_map`` still described the old one:
+    reports written to a destination the operator
+    never successfully configured, with the log saying the previous config
+    was still in effect. The half-built client leaked with it, as did every
+    client built earlier in the same failed call.
+    """
+
+    def _close_spy(self, cls):
+        """Patch *cls*.close() with a spy that still closes, and return the
+        list it appends each closed client to.
+
+        Patching the SDK client class -- not any parsedmarc function -- is
+        what makes "the client was closed" observable, and the real close()
+        still runs, so a client that is closed twice would still have to
+        survive it.
+        """
+        closed = []
+        real_close = cls.close
+
+        def spy(client):
+            closed.append(client)
+            real_close(client)
+
+        patcher = patch.object(cls, "close", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return closed
+
+    def test_interrupt_after_set_hosts_restores_the_previous_elasticsearch_client(self):
+        """Failure inside the Elasticsearch block, before the handle exists.
+
+        ``migrate_indexes()`` runs once ``set_hosts()`` has already handed the
+        ``default`` alias to the new client, and ``clients["elasticsearch"]``
+        is assigned only after it returns -- so a failure here leaves a
+        registered client that no handle owns. It has to be a BaseException:
+        ``elastic.migrate_indexes()`` wraps every cluster call in
+        ``except Exception`` and logs a warning (parsedmarc/elastic.py), so
+        what escapes this block is a Ctrl-C landing in one of them, not a
+        connection error.
+        """
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        old_conn = _FakeSearchConnection("old")
+        connections.add_connection("default", cast(Elasticsearch, old_conn))
+        closed = self._close_spy(Elasticsearch)
+        registered = []
+
+        def interrupt(client, *args, **kwargs):
+            # Whatever set_hosts() registered a moment ago: the client the
+            # rollback is responsible for.
+            registered.append(connections.get_connection("default"))
+            raise KeyboardInterrupt
+
+        opts = _output_client_opts(
+            save_aggregate=True,
+            elasticsearch_hosts=_UNREACHABLE_HOSTS,
+            elasticsearch_timeout=1.0,
+        )
+        with patch.object(Elasticsearch, "perform_request", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                parsedmarc.cli._init_output_clients(opts)
+
+        self.assertEqual(len(registered), 1)
+        new_conn = registered[0]
+        self.assertIsNot(new_conn, old_conn)
+        self.assertIs(connections.get_connection("default"), old_conn)
+        self.assertEqual(closed, [new_conn])
+        self.assertEqual(old_conn.close_count, 0)
+
+    def test_interrupt_after_set_hosts_restores_the_previous_opensearch_client(self):
+        """The same for OpenSearch, whose alias lives in a second registry.
+
+        The rollback ranges over both backends, and each has its own module,
+        registry and client class; a rollback that snapshotted or restored
+        one of them twice would pass the Elasticsearch test above.
+        """
+        connections = opensearch_module.connections
+        _isolate_default_alias(self, connections)
+        old_conn = _FakeSearchConnection("old")
+        connections.add_connection("default", old_conn)
+        closed = self._close_spy(opensearchpy.OpenSearch)
+        registered = []
+
+        def interrupt(transport, *args, **kwargs):
+            registered.append(connections.get_connection("default"))
+            raise KeyboardInterrupt
+
+        opts = _output_client_opts(
+            save_aggregate=True,
+            opensearch_hosts=_UNREACHABLE_HOSTS,
+            opensearch_timeout=1.0,
+        )
+        with patch.object(opensearchpy.Transport, "perform_request", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                parsedmarc.cli._init_output_clients(opts)
+
+        self.assertEqual(len(registered), 1)
+        new_conn = registered[0]
+        self.assertIsNot(new_conn, old_conn)
+        self.assertIs(connections.get_connection("default"), old_conn)
+        self.assertEqual(closed, [new_conn])
+        self.assertEqual(old_conn.close_count, 0)
+
+    def test_failure_with_no_previous_alias_leaves_the_alias_unset(self):
+        """The startup case: there was no ``default`` alias to restore.
+
+        Rolling back to "unset" is not the same as leaving the discarded
+        client in place. parsedmarc's own retry loop calls
+        _init_output_clients() again after a failed start, and elastic.py's
+        save path resolves the alias on every write, so a leftover
+        registration is a client for a configuration that never finished
+        being built.
+        """
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        try:
+            connections.remove_connection("default")
+        except KeyError:
+            # Nothing was registered: the startup state this test needs.
+            pass
+        closed = self._close_spy(Elasticsearch)
+        registered = []
+
+        def interrupt(client, *args, **kwargs):
+            registered.append(connections.get_connection("default"))
+            raise KeyboardInterrupt
+
+        opts = _output_client_opts(
+            save_aggregate=True,
+            elasticsearch_hosts=_UNREACHABLE_HOSTS,
+            elasticsearch_timeout=1.0,
+        )
+        with patch.object(Elasticsearch, "perform_request", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                parsedmarc.cli._init_output_clients(opts)
+
+        with self.assertRaises(KeyError):
+            connections.get_connection("default")
+        self.assertEqual(closed, registered)
+
+    def test_failure_in_a_later_output_closes_everything_already_built(self):
+        """Elasticsearch fully built, then a later step fails.
+
+        ``[opensearch] auth_type = awssigv4`` with no ``aws_region`` is a real
+        config error, raised by ``opensearch.set_hosts()`` before it
+        constructs anything -- and OpenSearch is the only output initialized
+        after Elasticsearch, so this is the shape of the reload that leaves an
+        _ElasticsearchHandle in ``clients``, owning the client that now holds
+        the alias. The handle must be closed (that is what releases the alias
+        again), the Kafka client built earlier in the same call must be closed
+        too, and both aliases must end up naming what they named on entry.
+
+        The Elasticsearch client is closed *exactly* once: the teardown does
+        it through the handle, and the restore then finds the alias already
+        released rather than closing the same client a second time.
+        """
+        es_connections = parsedmarc.elastic.connections
+        os_connections = opensearch_module.connections
+        _isolate_default_alias(self, es_connections)
+        _isolate_default_alias(self, os_connections)
+        old_es = _FakeSearchConnection("old es")
+        old_os = _FakeSearchConnection("old os")
+        es_connections.add_connection("default", cast(Elasticsearch, old_es))
+        os_connections.add_connection("default", old_os)
+        closed = self._close_spy(Elasticsearch)
+        built = []
+
+        def request(client, method, path, **kwargs):
+            # The client set_hosts() registered, recorded on its first
+            # cluster call, so the assertions below can name it.
+            if not built:
+                built.append(es_connections.get_connection("default"))
+            return _es_request_without_network(client, method, path, **kwargs)
+
+        opts = _output_client_opts(
+            save_aggregate=True,
+            kafka_hosts=["kafka.example.com:9092"],
+            elasticsearch_hosts=_UNREACHABLE_HOSTS,
+            elasticsearch_timeout=1.0,
+            opensearch_hosts=_UNREACHABLE_HOSTS,
+            opensearch_auth_type="awssigv4",
+        )
+        with (
+            patch("parsedmarc.kafkaclient.KafkaProducer") as mock_producer,
+            patch.object(Elasticsearch, "perform_request", request),
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                parsedmarc.cli._init_output_clients(opts)
+
+        self.assertIn("aws_region", str(context.exception))
+        mock_producer.return_value.close.assert_called_once()
+        self.assertEqual(built, closed)
+        self.assertEqual(len(closed), 1)
+        self.assertIs(es_connections.get_connection("default"), old_es)
+        self.assertIs(os_connections.get_connection("default"), old_os)
+        self.assertEqual(old_es.close_count, 0)
+        self.assertEqual(old_os.close_count, 0)
+
+    def test_a_failed_build_does_not_leave_the_serverless_flag_flipped(self):
+        """The alias is not the only module-level state ``set_hosts()`` writes.
+
+        ``elastic.set_hosts()`` also assigns ``elastic._SERVERLESS``, which
+        ``elastic.create_indexes()`` consults to decide whether to strip the
+        ``number_of_shards``/``number_of_replicas`` settings Elastic Cloud
+        Serverless rejects with HTTP 400. A reload that turns
+        ``[elasticsearch] serverless`` on and then fails would otherwise pair
+        the restored old client -- a normal cluster -- with the new flag, and
+        the next index created on it would silently lose its shard settings.
+
+        Both halves are observed: the flag really is flipped while the build
+        runs (otherwise the assertion after it would hold for the wrong
+        reason), and it is back to its old value once the rollback is done.
+        """
+        es_connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, es_connections)
+        old_es = _FakeSearchConnection("old es")
+        es_connections.add_connection("default", cast(Elasticsearch, old_es))
+        self.addCleanup(
+            setattr, parsedmarc.elastic, "_SERVERLESS", parsedmarc.elastic._SERVERLESS
+        )
+        parsedmarc.elastic._SERVERLESS = False
+        during = []
+
+        def request(client, method, path, **kwargs):
+            # The first cluster call happens after set_hosts() has written
+            # both the alias and the flag.
+            if not during:
+                during.append(parsedmarc.elastic._SERVERLESS)
+            return _es_request_without_network(client, method, path, **kwargs)
+
+        opts = _output_client_opts(
+            save_aggregate=True,
+            elasticsearch_hosts=_UNREACHABLE_HOSTS,
+            elasticsearch_timeout=1.0,
+            elasticsearch_serverless=True,
+            opensearch_hosts=_UNREACHABLE_HOSTS,
+            opensearch_auth_type="awssigv4",
+        )
+        with patch.object(Elasticsearch, "perform_request", request):
+            with self.assertRaises(RuntimeError):
+                parsedmarc.cli._init_output_clients(opts)
+
+        self.assertEqual(during, [True])
+        self.assertIs(parsedmarc.elastic._SERVERLESS, False)
+        self.assertIs(es_connections.get_connection("default"), old_es)
+
+    def test_an_interrupt_during_teardown_still_restores_the_alias(self):
+        """A second Ctrl-C, landing in the teardown of the first one's rollback.
+
+        The rollback exists because a KeyboardInterrupt can escape the
+        Elasticsearch block, and an operator holding the key sends more than
+        one. ``_close_output_clients()`` swallows only ``Exception``, and so
+        does ``_ElasticsearchHandle.close()``, so an interrupt raised by the
+        client's own ``close()`` propagates out of the teardown. Run as a
+        plain statement sequence, that would skip the hand-back and leave the
+        alias on the new cluster -- the very state the rollback is for -- so
+        the teardown is wrapped in ``try``/``finally`` and the discarded
+        client's ``close()`` swallows BaseException.
+        """
+        es_connections = parsedmarc.elastic.connections
+        os_connections = opensearch_module.connections
+        _isolate_default_alias(self, es_connections)
+        _isolate_default_alias(self, os_connections)
+        old_es = _FakeSearchConnection("old es")
+        old_os = _FakeSearchConnection("old os")
+        es_connections.add_connection("default", cast(Elasticsearch, old_es))
+        os_connections.add_connection("default", old_os)
+        attempted = []
+
+        def interrupting_close(client):
+            attempted.append(client)
+            raise KeyboardInterrupt
+
+        # Elasticsearch is built, then [opensearch] fails to build its
+        # client -- the same later-step failure as the test above -- and the
+        # interrupt arrives while the Elasticsearch handle is being closed.
+        opts = _output_client_opts(
+            save_aggregate=True,
+            elasticsearch_hosts=_UNREACHABLE_HOSTS,
+            elasticsearch_timeout=1.0,
+            opensearch_hosts=_UNREACHABLE_HOSTS,
+            opensearch_auth_type="awssigv4",
+        )
+        with (
+            patch.object(Elasticsearch, "perform_request", _es_request_without_network),
+            patch.object(Elasticsearch, "close", interrupting_close),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                parsedmarc.cli._init_output_clients(opts)
+
+        # Twice: once through the handle, and once more by the rollback,
+        # which still finds the alias unreleased because the handle's close()
+        # never got that far.
+        self.assertEqual(len(attempted), 2)
+        self.assertIs(es_connections.get_connection("default"), old_es)
+        self.assertIs(os_connections.get_connection("default"), old_os)
+        self.assertEqual(old_es.close_count, 0)
+
+    def test_a_discarded_client_that_cannot_be_closed_still_returns_the_alias(self):
+        """Closing the discarded client is best-effort; the hand-back is not.
+
+        A client whose transport is already broken raises from ``close()``.
+        Restoring the alias is the half that keeps the configuration still in
+        force writing to the cluster it was configured for, so it must not be
+        skipped because the client being thrown away could not be closed.
+        """
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        old_conn = _FakeSearchConnection("old")
+        connections.add_connection("default", cast(Elasticsearch, old_conn))
+        attempted = []
+
+        def failing_close(client):
+            attempted.append(client)
+            raise RuntimeError("transport already closed")
+
+        def interrupt(client, *args, **kwargs):
+            raise KeyboardInterrupt
+
+        opts = _output_client_opts(
+            save_aggregate=True,
+            elasticsearch_hosts=_UNREACHABLE_HOSTS,
+            elasticsearch_timeout=1.0,
+        )
+        with (
+            patch.object(Elasticsearch, "perform_request", interrupt),
+            patch.object(Elasticsearch, "close", failing_close),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                parsedmarc.cli._init_output_clients(opts)
+
+        self.assertEqual(len(attempted), 1)
+        self.assertIs(connections.get_connection("default"), old_conn)
+
+    def test_successful_init_hands_the_alias_to_the_new_client(self):
+        """The negative half: a successful call rolls nothing back.
+
+        The alias must name the client ``set_hosts()`` just built -- it is
+        what the save path resolves -- the previous client must be left
+        untouched for _main() to close on its own terms, and the returned
+        handle must own the new client, which is what makes
+        _close_output_clients() close it later. Ownership is observed by
+        closing the handle and watching which client's close() runs, not by
+        reading the handle's attributes.
+        """
+        connections = parsedmarc.elastic.connections
+        _isolate_default_alias(self, connections)
+        # set_hosts() assigns elastic._SERVERLESS, and on the success path
+        # nothing rolls it back, so restore it here or it leaks into the
+        # rest of the run.
+        self.addCleanup(
+            setattr, parsedmarc.elastic, "_SERVERLESS", parsedmarc.elastic._SERVERLESS
+        )
+        old_conn = _FakeSearchConnection("old")
+        connections.add_connection("default", cast(Elasticsearch, old_conn))
+        closed = self._close_spy(Elasticsearch)
+
+        opts = _output_client_opts(
+            save_aggregate=True,
+            elasticsearch_hosts=_UNREACHABLE_HOSTS,
+            elasticsearch_timeout=1.0,
+        )
+        with patch.object(
+            Elasticsearch, "perform_request", _es_request_without_network
+        ):
+            clients = parsedmarc.cli._init_output_clients(opts)
+            new_conn = connections.get_connection("default")
+
+            self.assertIsNot(new_conn, old_conn)
+            self.assertEqual(closed, [])
+            self.assertEqual(old_conn.close_count, 0)
+            self.assertEqual(sorted(clients), ["elasticsearch"])
+
+            clients["elasticsearch"].close()
+
+        self.assertEqual(closed, [new_conn])
+
+
+def _domain_map_tls_reports():
+    """Four SMTP TLS reports for the index_prefix_domain_map tests: two
+    whose policy domains fold to the mapped base domain example.com (one of
+    them mixed-case), one for an unmapped domain, and one with an empty
+    policies list -- parse_smtp_tls_report_json() accepts those, and
+    get_index_prefix() must treat them as unmappable (dropped by the
+    filter) rather than crash on policies[0]."""
+    return [
+        {
+            "organization_name": "Allowed Org",
+            "begin_date": "2024-01-01T00:00:00Z",
+            "end_date": "2024-01-01T23:59:59Z",
+            "report_id": "allowed-1",
+            "contact_info": "tls@allowed.example.com",
+            "policies": [
+                {
+                    "policy_domain": "allowed.example.com",
+                    "policy_type": "sts",
+                    "successful_session_count": 1,
+                    "failed_session_count": 0,
+                }
+            ],
+        },
+        {
+            "organization_name": "Unmapped Org",
+            "begin_date": "2024-01-01T00:00:00Z",
+            "end_date": "2024-01-01T23:59:59Z",
+            "report_id": "unmapped-1",
+            "contact_info": "tls@unmapped.example.net",
+            "policies": [
+                {
+                    "policy_domain": "unmapped.example.net",
+                    "policy_type": "sts",
+                    "successful_session_count": 5,
+                    "failed_session_count": 0,
+                }
+            ],
+        },
+        {
+            "organization_name": "Mixed Case Org",
+            "begin_date": "2024-01-01T00:00:00Z",
+            "end_date": "2024-01-01T23:59:59Z",
+            "report_id": "mixed-case-1",
+            "contact_info": "tls@mixedcase.example.com",
+            "policies": [
+                {
+                    "policy_domain": "MixedCase.Example.Com",
+                    "policy_type": "sts",
+                    "successful_session_count": 2,
+                    "failed_session_count": 0,
+                }
+            ],
+        },
+        {
+            "organization_name": "No Policies Org",
+            "begin_date": "2024-01-01T00:00:00Z",
+            "end_date": "2024-01-01T23:59:59Z",
+            "report_id": "no-policies-1",
+            "contact_info": "tls@nopolicies.example.org",
+            "policies": [],
+        },
+    ]
 
 
 class TestIndexPrefixDomainMapTlsFiltering(unittest.TestCase):
@@ -3048,63 +5778,13 @@ class TestIndexPrefixDomainMapTlsFiltering(unittest.TestCase):
     ):
         """TLS reports for domains not in the map should be silently dropped."""
         mock_imap_connection.return_value = object()
-        reports_dict = {
-            "aggregate_reports": [],
-            "failure_reports": [],
-            "smtp_tls_reports": [
-                {
-                    "organization_name": "Allowed Org",
-                    "begin_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2024-01-01T23:59:59Z",
-                    "report_id": "allowed-1",
-                    "contact_info": "tls@allowed.example.com",
-                    "policies": [
-                        {
-                            "policy_domain": "allowed.example.com",
-                            "policy_type": "sts",
-                            "successful_session_count": 1,
-                            "failed_session_count": 0,
-                        }
-                    ],
-                },
-                {
-                    "organization_name": "Unmapped Org",
-                    "begin_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2024-01-01T23:59:59Z",
-                    "report_id": "unmapped-1",
-                    "contact_info": "tls@unmapped.example.net",
-                    "policies": [
-                        {
-                            "policy_domain": "unmapped.example.net",
-                            "policy_type": "sts",
-                            "successful_session_count": 5,
-                            "failed_session_count": 0,
-                        }
-                    ],
-                },
-                {
-                    "organization_name": "Mixed Case Org",
-                    "begin_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2024-01-01T23:59:59Z",
-                    "report_id": "mixed-case-1",
-                    "contact_info": "tls@mixedcase.example.com",
-                    "policies": [
-                        {
-                            "policy_domain": "MixedCase.Example.Com",
-                            "policy_type": "sts",
-                            "successful_session_count": 2,
-                            "failed_session_count": 0,
-                        }
-                    ],
-                },
-            ],
-        }
-
-        def _fetch_and_save(**kwargs):
-            kwargs["save_callback"](reports_dict)
-            return reports_dict
-
-        mock_get_reports.side_effect = _fetch_and_save
+        mock_get_reports.side_effect = _fetch_invoking_save_callback(
+            {
+                "aggregate_reports": [],
+                "failure_reports": [],
+                "smtp_tls_reports": _domain_map_tls_reports(),
+            }
+        )
 
         domain_map = {"tenant_a": ["example.com"]}
         with NamedTemporaryFile("w", suffix=".yaml", delete=False) as map_file:
@@ -3134,6 +5814,9 @@ password = test-password
             with patch("sys.stdout", captured):
                 parsedmarc.cli._main()
 
+        # A single JSON document, not two: a run whose only reports came
+        # from the mailbox saves them inside save_callback and skips the
+        # second, empty pass rather than printing another blob after it.
         output = json.loads(captured.getvalue())
         tls_reports = output["smtp_tls_reports"]
         self.assertEqual(len(tls_reports), 2)
@@ -3141,6 +5824,9 @@ password = test-password
         self.assertIn("allowed-1", report_ids)
         self.assertIn("mixed-case-1", report_ids)
         self.assertNotIn("unmapped-1", report_ids)
+        # Unmappable (no policies -> no domain), dropped rather than an
+        # IndexError from get_index_prefix() on policies[0].
+        self.assertNotIn("no-policies-1", report_ids)
 
     @patch("parsedmarc.cli.email_results")
     @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
@@ -3151,83 +5837,29 @@ password = test-password
         mock_get_reports,
         mock_email_results,
     ):
-        """The shared parsing_results dict handed to email_results() must
-        be filtered by index_prefix_domain_map exactly like the batches
-        process_reports() actually saves.
+        """The combined results handed to email_results() are filtered by
+        index_prefix_domain_map exactly like the batches that were saved.
 
-        Regression test: get_dmarc_reports_from_mailbox() builds its
-        returned results independently of whatever process_reports()
-        mutated inside save_callback's batch dict, so filtering applied
-        only inside process_reports() never reached the parsing_results
-        copy that feeds email_results(). The mock mirrors that by handing
-        save_callback a *copy* of the TLS reports (so process_reports()'s
-        in-place filtering can't leak back) while mock_get_reports still
-        returns the full, unfiltered set — matching production, where the
-        mailbox function's return value is built from the accumulated
-        report lists, not from the batch dict passed to save_callback."""
+        Regression test: get_dmarc_reports_from_mailbox() builds its return
+        value from its own accumulated lists, not from the batch dict it
+        passes to save_callback, so the in-place filtering process_reports()
+        applies to each batch never reaches the combined dict. The mock
+        mirrors that by handing save_callback a copy while returning the
+        full, unfiltered set."""
         mock_imap_connection.return_value = object()
         reports_dict = {
             "aggregate_reports": [],
             "failure_reports": [],
-            "smtp_tls_reports": [
-                {
-                    "organization_name": "Allowed Org",
-                    "begin_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2024-01-01T23:59:59Z",
-                    "report_id": "allowed-1",
-                    "contact_info": "tls@allowed.example.com",
-                    "policies": [
-                        {
-                            "policy_domain": "allowed.example.com",
-                            "policy_type": "sts",
-                            "successful_session_count": 1,
-                            "failed_session_count": 0,
-                        }
-                    ],
-                },
-                {
-                    "organization_name": "Unmapped Org",
-                    "begin_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2024-01-01T23:59:59Z",
-                    "report_id": "unmapped-1",
-                    "contact_info": "tls@unmapped.example.net",
-                    "policies": [
-                        {
-                            "policy_domain": "unmapped.example.net",
-                            "policy_type": "sts",
-                            "successful_session_count": 5,
-                            "failed_session_count": 0,
-                        }
-                    ],
-                },
-                {
-                    "organization_name": "Mixed Case Org",
-                    "begin_date": "2024-01-01T00:00:00Z",
-                    "end_date": "2024-01-01T23:59:59Z",
-                    "report_id": "mixed-case-1",
-                    "contact_info": "tls@mixedcase.example.com",
-                    "policies": [
-                        {
-                            "policy_domain": "MixedCase.Example.Com",
-                            "policy_type": "sts",
-                            "successful_session_count": 2,
-                            "failed_session_count": 0,
-                        }
-                    ],
-                },
-            ],
+            "smtp_tls_reports": _domain_map_tls_reports(),
         }
-
-        def _fetch_and_save(**kwargs):
-            batch = {
-                "aggregate_reports": list(reports_dict["aggregate_reports"]),
-                "failure_reports": list(reports_dict["failure_reports"]),
+        mock_get_reports.side_effect = _fetch_invoking_save_callback(
+            reports_dict,
+            batch={
+                "aggregate_reports": [],
+                "failure_reports": [],
                 "smtp_tls_reports": list(reports_dict["smtp_tls_reports"]),
-            }
-            kwargs["save_callback"](batch)
-            return reports_dict
-
-        mock_get_reports.side_effect = _fetch_and_save
+            },
+        )
 
         domain_map = {"tenant_a": ["example.com"]}
         with NamedTemporaryFile("w", suffix=".yaml", delete=False) as map_file:
@@ -3264,12 +5896,690 @@ to = admin@example.com
 
         mock_email_results.assert_called_once()
         emailed_results = mock_email_results.call_args.args[0]
-        tls_reports = emailed_results["smtp_tls_reports"]
-        report_ids = {r["report_id"] for r in tls_reports}
-        self.assertEqual(len(tls_reports), 2)
-        self.assertIn("allowed-1", report_ids)
-        self.assertIn("mixed-case-1", report_ids)
-        self.assertNotIn("unmapped-1", report_ids)
+        report_ids = {r["report_id"] for r in emailed_results["smtp_tls_reports"]}
+        self.assertEqual(report_ids, {"allowed-1", "mixed-case-1"})
+
+
+class TestNormalizeIndexPrefix(unittest.TestCase):
+    """_normalize_index_prefix() is the single definition of how an
+    index_prefix_domain_map key becomes an index name prefix. The save path
+    and the migration path both call it, so these assertions pin the exact
+    strings both sides must agree on."""
+
+    def test_lowercases_and_strips(self):
+        self.assertEqual(parsedmarc.cli._normalize_index_prefix(" Acme "), "acme_")
+
+    def test_replaces_spaces_and_hyphens(self):
+        self.assertEqual(
+            parsedmarc.cli._normalize_index_prefix("Acme Corp-2"), "acme_corp_2_"
+        )
+
+    def test_strips_surrounding_underscores(self):
+        self.assertEqual(parsedmarc.cli._normalize_index_prefix("_tenant_"), "tenant_")
+
+    def test_key_that_normalizes_to_nothing_yields_a_bare_underscore(self):
+        """Documents rather than special-cases the degenerate result: the
+        save path writes such a report's documents to `_dmarc_aggregate-*`,
+        so the migration path has to target the same name."""
+        self.assertEqual(parsedmarc.cli._normalize_index_prefix("_"), "_")
+        self.assertEqual(parsedmarc.cli._normalize_index_prefix("   "), "_")
+
+
+class TestMigrationIndexNames(unittest.TestCase):
+    """_migration_index_names() resolves every index name an index
+    migration should target, widening both configurable axes (issue #868).
+    Each case asserts the whole list, in order, so it observes the names
+    that must be absent as well as the ones that must be present."""
+
+    def test_nothing_configured_is_unchanged(self):
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names("dmarc_aggregate", None, None, None),
+            ["dmarc_aggregate"],
+        )
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names("dmarc_aggregate", None, None, {}),
+            ["dmarc_aggregate"],
+        )
+
+    def test_suffix_also_targets_the_unsuffixed_name(self):
+        """`dmarc_aggregate_prod*` matches none of the operator's own
+        pre-suffix `dmarc_aggregate-*` indexes, so both are targeted."""
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names(
+                "dmarc_aggregate", "prod", None, None
+            ),
+            ["dmarc_aggregate_prod", "dmarc_aggregate"],
+        )
+
+    def test_empty_suffix_adds_no_duplicate(self):
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names("dmarc_aggregate", "", None, None),
+            ["dmarc_aggregate"],
+        )
+
+    def test_domain_map_fans_out_after_the_unprefixed_name(self):
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names(
+                "dmarc_aggregate",
+                None,
+                None,
+                {"Acme Corp": ["acme.example"], "widgets-inc": ["widgets.example"]},
+            ),
+            [
+                "dmarc_aggregate",
+                "acme_corp_dmarc_aggregate",
+                "widgets_inc_dmarc_aggregate",
+            ],
+        )
+
+    def test_keys_that_normalize_identically_are_deduplicated(self):
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names(
+                "dmarc_aggregate",
+                None,
+                None,
+                {"acme corp": ["a.example"], "Acme-Corp": ["b.example"]},
+            ),
+            ["dmarc_aggregate", "acme_corp_dmarc_aggregate"],
+        )
+
+    def test_configured_prefix_suppresses_the_domain_map_fan_out(self):
+        """A deployment with its own index_prefix writes only under that
+        prefix; submitting an _update_by_query against map-derived patterns
+        would touch another deployment's data on a shared cluster. The
+        suffix axis still applies."""
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names(
+                "dmarc_aggregate", "prod", "corp_", {"acme": ["acme.example"]}
+            ),
+            ["corp_dmarc_aggregate_prod", "corp_dmarc_aggregate"],
+        )
+
+    def test_configured_prefix_is_used_verbatim(self):
+        """The save path passes index_prefix through untouched, so the
+        migration path must not normalize it either."""
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names(
+                "dmarc_aggregate", None, "My-Prefix ", None
+            ),
+            ["My-Prefix dmarc_aggregate"],
+        )
+
+    def test_both_axes_compose_in_save_time_order(self):
+        """Save time builds `{prefix}{base}_{suffix}-{date}`: the prefix
+        precedes the base name and the suffix follows it."""
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names(
+                "smtp_tls", "prod", None, {"acme": ["acme.example"]}
+            ),
+            ["smtp_tls_prod", "smtp_tls", "acme_smtp_tls_prod", "acme_smtp_tls"],
+        )
+
+    def test_key_normalizing_to_an_underscore_is_targeted(self):
+        self.assertEqual(
+            parsedmarc.cli._migration_index_names(
+                "dmarc_aggregate", None, None, {"_": ["acme.example"]}
+            ),
+            ["dmarc_aggregate", "_dmarc_aggregate"],
+        )
+
+
+class TestMigrateIndexesDomainMapWiring(unittest.TestCase):
+    """Issue #868: the startup index migrations built their index names
+    from index_prefix/index_suffix alone, so a multi-tenant deployment
+    whose prefixes come from index_prefix_domain_map had its backfill
+    guard run against `dmarc_aggregate*`, which matches none of its real
+    `<tenant>_dmarc_aggregate-*` indexes -- a silent no-op. These tests
+    assert the index names actually handed to migrate_indexes()."""
+
+    def _write_config(self, config, domain_map=None):
+        paths = {}
+        if domain_map is not None:
+            import yaml
+
+            with NamedTemporaryFile("w", suffix=".yaml", delete=False) as map_file:
+                yaml.dump(domain_map, map_file)
+                paths["map"] = map_file.name
+            self.addCleanup(
+                lambda: os.path.exists(paths["map"]) and os.remove(paths["map"])
+            )
+            config = config.format(map_path=paths["map"])
+        with NamedTemporaryFile("w", suffix=".ini", delete=False) as config_file:
+            config_file.write(config)
+            paths["config"] = config_file.name
+        self.addCleanup(
+            lambda: os.path.exists(paths["config"]) and os.remove(paths["config"])
+        )
+        return paths["config"]
+
+    _IMAP = """
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+"""
+
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testElasticsearchMigrationFansOutOverDomainMap(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        mock_migrate,
+    ):
+        mock_imap_connection.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+save_smtp_tls = true
+silent = true
+index_prefix_domain_map = {map_path}
+"""
+            + self._IMAP
+            + """
+[elasticsearch]
+hosts = localhost
+""",
+            domain_map={"Tenant-A": ["example.com"], "tenant_b": ["example.net"]},
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            parsedmarc.cli._main()
+
+        kwargs = mock_migrate.call_args.kwargs
+        self.assertEqual(
+            kwargs["aggregate_indexes"],
+            [
+                "dmarc_aggregate",
+                "tenant_a_dmarc_aggregate",
+                "tenant_b_dmarc_aggregate",
+            ],
+        )
+        self.assertEqual(
+            kwargs["failure_indexes"],
+            ["dmarc_failure", "tenant_a_dmarc_failure", "tenant_b_dmarc_failure"],
+        )
+        self.assertEqual(
+            kwargs["smtp_tls_indexes"],
+            ["smtp_tls", "tenant_a_smtp_tls", "tenant_b_smtp_tls"],
+        )
+        # The legacy fo migration does not fan out over the map: it
+        # deletes the index it reindexes, and no index it could apply to
+        # can carry a tenant prefix.
+        self.assertEqual(kwargs["legacy_fo_indexes"], ["dmarc_aggregate"])
+
+    @patch("parsedmarc.cli.opensearch.migrate_indexes")
+    @patch("parsedmarc.cli.opensearch.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testOpenSearchMigrationFansOutWithSuffix(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        mock_migrate,
+    ):
+        """The OpenSearch block carries its own copy of the fan-out, so it
+        is asserted separately. With an index_suffix set, the unsuffixed
+        name is targeted too, for documents indexed before the suffix was
+        configured."""
+        mock_imap_connection.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+silent = true
+index_prefix_domain_map = {map_path}
+"""
+            + self._IMAP
+            + """
+[opensearch]
+hosts = localhost
+index_suffix = prod
+""",
+            domain_map={"Tenant-A": ["example.com"]},
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            parsedmarc.cli._main()
+
+        kwargs = mock_migrate.call_args.kwargs
+        self.assertEqual(
+            kwargs["aggregate_indexes"],
+            [
+                "dmarc_aggregate_prod",
+                "dmarc_aggregate",
+                "tenant_a_dmarc_aggregate_prod",
+                "tenant_a_dmarc_aggregate",
+            ],
+        )
+        self.assertEqual(
+            kwargs["smtp_tls_indexes"],
+            [
+                "smtp_tls_prod",
+                "smtp_tls",
+                "tenant_a_smtp_tls_prod",
+                "tenant_a_smtp_tls",
+            ],
+        )
+
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testConfiguredPrefixSuppressesDomainMapFanout(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        mock_migrate,
+    ):
+        """The negative half of the fan-out contract, and the one case here
+        that also passed before #868 was fixed: a deployment that sets its
+        own index_prefix must never submit an _update_by_query against a
+        map-derived index pattern it does not write to."""
+        mock_imap_connection.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+silent = true
+index_prefix_domain_map = {map_path}
+"""
+            + self._IMAP
+            + """
+[elasticsearch]
+hosts = localhost
+index_prefix = corp_
+""",
+            domain_map={"Tenant-A": ["example.com"]},
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            parsedmarc.cli._main()
+
+        kwargs = mock_migrate.call_args.kwargs
+        self.assertEqual(kwargs["aggregate_indexes"], ["corp_dmarc_aggregate"])
+        self.assertEqual(kwargs["failure_indexes"], ["corp_dmarc_failure"])
+        self.assertEqual(kwargs["smtp_tls_indexes"], ["corp_smtp_tls"])
+
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testLegacyFoMigrationHonorsPrefixAndSuffixButNotTheDomainMap(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        mock_migrate,
+    ):
+        """The published_policy.fo migration takes exact index names, and
+        index_prefix/index_suffix both date back to 4.1.0, so an affected
+        index may carry either. It cannot carry a tenant prefix, though:
+        index_prefix_domain_map arrived in 8.19.0, long after 5.0.0 fixed
+        the mapping. Asserting the full list covers both halves -- the
+        configured prefix and suffix are applied, and no map-derived name
+        is, which matters because this migration deletes the index it
+        reindexes."""
+        mock_imap_connection.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+silent = true
+index_prefix_domain_map = {map_path}
+"""
+            + self._IMAP
+            + """
+[elasticsearch]
+hosts = localhost
+index_prefix = corp_
+index_suffix = prod
+""",
+            domain_map={"Tenant-A": ["example.com"]},
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            parsedmarc.cli._main()
+
+        self.assertEqual(
+            mock_migrate.call_args.kwargs["legacy_fo_indexes"],
+            ["corp_dmarc_aggregate_prod", "corp_dmarc_aggregate"],
+        )
+
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testMigrationTargetsMatchSaveTimePrefix(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        mock_migrate,
+        mock_save_aggregate,
+    ):
+        """Both ends of the shared-normalization contract in one test: the
+        prefix a report is *saved* under has to appear among the index
+        names the migration targets, or the backfill misses that tenant's
+        data."""
+        mock_imap_connection.return_value = object()
+        report = _sample_aggregate_reports()[0]
+        report["policy_published"]["domain"] = "example.com"
+        mock_get_reports.side_effect = _fetch_invoking_save_callback(
+            {
+                "aggregate_reports": [report],
+                "failure_reports": [],
+                "smtp_tls_reports": [],
+            }
+        )
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+silent = true
+index_prefix_domain_map = {map_path}
+"""
+            + self._IMAP
+            + """
+[elasticsearch]
+hosts = localhost
+""",
+            domain_map={"Tenant-A": ["example.com"]},
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            parsedmarc.cli._main()
+
+        self.assertEqual(
+            mock_save_aggregate.call_args.kwargs["index_prefix"], "tenant_a_"
+        )
+        self.assertIn(
+            "tenant_a_dmarc_aggregate",
+            mock_migrate.call_args.kwargs["aggregate_indexes"],
+        )
+
+
+class TestMailboxSaveCallbackWiring(unittest.TestCase):
+    """The CLI's end of the #242 contract: the callback it hands to
+    get_dmarc_reports_from_mailbox() (and to watch_inbox()) reports whether
+    a batch reached every configured output destination, so the library
+    knows whether archiving that batch is safe."""
+
+    def setUp(self):
+        # _main()'s file-parsing loop dedups aggregate reports against this
+        # process-wide cache, so a sample parsed here would be dropped from
+        # a later test's results (and vice versa).
+        parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear()
+        self.addCleanup(parsedmarc.SEEN_AGGREGATE_REPORT_IDS.clear)
+
+    def _write_config(self, text):
+        with NamedTemporaryFile("w", suffix=".ini", delete=False) as config_file:
+            config_file.write(text)
+            config_path = config_file.name
+        self.addCleanup(lambda: os.path.exists(config_path) and os.remove(config_path))
+        return config_path
+
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testSaveCallbackIsFalseOnlyWhenAnOutputDestinationFailed(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        _mock_migrate_indexes,
+        mock_save_aggregate,
+    ):
+        """The save_callback saves the batch it is given and returns a
+        truthy value only when every destination accepted it. That verdict
+        is the whole basis on which get_dmarc_reports_from_mailbox() decides
+        whether to archive or delete the batch's messages."""
+        mock_imap_connection.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+silent = true
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+
+[elasticsearch]
+hosts = localhost
+"""
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            parsedmarc.cli._main()
+
+        save_callback = mock_get_reports.call_args.kwargs.get("save_callback")
+        self.assertTrue(callable(save_callback))
+
+        report = {"policy_published": {"domain": "example.com"}}
+        batch = {
+            "aggregate_reports": [report],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        self.assertTrue(save_callback(batch))
+        self.assertIs(mock_save_aggregate.call_args.args[0], report)
+
+        mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
+            "simulated output failure"
+        )
+        self.assertFalse(save_callback(batch))
+
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.watch_inbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testWatchCallbackIsTheSameAdapterAndRetryCapReachesBothCallSites(
+        self, mock_imap_connection, mock_watch_inbox, mock_get_reports
+    ):
+        """watch_inbox's callback must be the same save-then-report adapter
+        the single-shot fetch gets, not process_reports directly -- watch
+        mode would otherwise still archive before confirming the save. The
+        configured max_unsaved_retries has to reach both call sites too, or
+        one of the two paths would silently use the default cap."""
+        mock_imap_connection.return_value = object()
+        mock_get_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        mock_watch_inbox.side_effect = FileExistsError("stop-watch-loop")
+        config_path = self._write_config(
+            """[general]
+silent = true
+
+[imap]
+host = imap.example.com
+user = user
+password = pass
+
+[mailbox]
+watch = true
+max_unsaved_retries = 7
+"""
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            with self.assertRaises(SystemExit) as system_exit:
+                parsedmarc.cli._main()
+
+        self.assertEqual(system_exit.exception.code, 1)
+        single_shot_kwargs = mock_get_reports.call_args.kwargs
+        watch_kwargs = mock_watch_inbox.call_args.kwargs
+        self.assertTrue(callable(single_shot_kwargs.get("save_callback")))
+        self.assertIs(watch_kwargs.get("callback"), single_shot_kwargs["save_callback"])
+        self.assertEqual(single_shot_kwargs.get("max_unsaved_retries"), 7)
+        self.assertEqual(watch_kwargs.get("max_unsaved_retries"), 7)
+
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testFileOutputFailureIsRecordedAndReportsTheBatchUnsaved(
+        self, mock_imap_connection, mock_get_reports
+    ):
+        """A failed --output write is recorded like any other destination's
+        failure instead of escaping uncaught, so it blocks archiving too.
+        Pointing `output` at a regular file makes save_output() raise the
+        real ValueError it raises for a non-directory path."""
+        mock_imap_connection.return_value = object()
+        with NamedTemporaryFile("w", suffix=".txt", delete=False) as not_a_directory:
+            output_path = not_a_directory.name
+        self.addCleanup(lambda: os.path.exists(output_path) and os.remove(output_path))
+
+        reports_dict = {
+            "aggregate_reports": [{"policy_published": {"domain": "example.com"}}],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        verdicts = []
+
+        def _fetch_and_save(**kwargs):
+            verdicts.append(kwargs["save_callback"](reports_dict))
+            return reports_dict
+
+        mock_get_reports.side_effect = _fetch_and_save
+        config_path = self._write_config(
+            f"""[general]
+silent = true
+output = {output_path}
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+"""
+        )
+
+        with patch.object(sys, "argv", ["parsedmarc", "-c", config_path]):
+            with self.assertLogs("parsedmarc.log", level="ERROR") as cm:
+                parsedmarc.cli._main()
+
+        self.assertEqual(verdicts, [False])
+        self.assertTrue(
+            any("File output Error" in line for line in cm.output), cm.output
+        )
+
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testMailboxAndFileReportsAreEachSavedExactlyOnce(
+        self,
+        mock_imap_connection,
+        mock_get_reports,
+        _mock_set_hosts,
+        _mock_migrate_indexes,
+        mock_save_aggregate,
+    ):
+        """A run combining a file argument and a mailbox saves in two passes:
+        the mailbox batch inside save_callback, the file-derived reports
+        afterward. The final pass must run on the file snapshot alone --
+        running it on the combined results would send every mailbox report
+        to every destination a second time."""
+        mock_imap_connection.return_value = object()
+        mailbox_report = {"policy_published": {"domain": "mailbox.example.com"}}
+        mock_get_reports.side_effect = _fetch_invoking_save_callback(
+            {
+                "aggregate_reports": [mailbox_report],
+                "failure_reports": [],
+                "smtp_tls_reports": [],
+            }
+        )
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+silent = true
+offline = true
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+
+[elasticsearch]
+hosts = localhost
+"""
+        )
+
+        argv = ["parsedmarc", "-c", config_path, SAMPLE_AGGREGATE_REPORT_PATH]
+        with patch.object(sys, "argv", argv):
+            parsedmarc.cli._main()
+
+        saved_domains = [
+            call.args[0]["policy_published"]["domain"]
+            for call in mock_save_aggregate.call_args_list
+        ]
+        self.assertEqual(saved_domains.count("mailbox.example.com"), 1)
+        self.assertEqual(len(saved_domains), 2)
+
+    @patch("parsedmarc.cli.elastic.save_aggregate_report_to_elasticsearch")
+    @patch("parsedmarc.cli.elastic.migrate_indexes")
+    @patch("parsedmarc.cli.elastic.set_hosts")
+    def testFailOnOutputErrorExitsForFileDerivedReports(
+        self,
+        _mock_set_hosts,
+        _mock_migrate_indexes,
+        mock_save_aggregate,
+    ):
+        """fail_on_output_error still exits non-zero for reports that came
+        from a file argument rather than a mailbox: with no mailbox
+        connection there is no save_callback to raise inside, so the failure
+        surfaces from the final pass over the file snapshot instead."""
+        mock_save_aggregate.side_effect = parsedmarc.elastic.ElasticsearchError(
+            "simulated output failure"
+        )
+        config_path = self._write_config(
+            """[general]
+save_aggregate = true
+fail_on_output_error = true
+silent = true
+offline = true
+
+[elasticsearch]
+hosts = localhost
+"""
+        )
+
+        argv = ["parsedmarc", "-c", config_path, SAMPLE_AGGREGATE_REPORT_PATH]
+        with patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit) as system_exit:
+                parsedmarc.cli._main()
+
+        self.assertEqual(system_exit.exception.code, 1)
+        mock_save_aggregate.assert_called_once()
 
 
 class TestConfigAliases(unittest.TestCase):
@@ -3401,6 +6711,398 @@ class TestExpandPath(unittest.TestCase):
         self.assertEqual(_expand_path("relative/path"), "relative/path")
 
 
+class TestArchiveSubdirForResult(unittest.TestCase):
+    """Unit tests for _archive_subdir_for_result (issue #570): maps a
+    parsed report to its ``<year>/<month>/<Aggregate|Failure|SMTP-TLS>``
+    archive subdirectory, using minimal synthetic report dicts rather
+    than full sample parses."""
+
+    def test_aggregate_report_january_zero_pads_month(self):
+        from parsedmarc.cli import _archive_subdir_for_result
+
+        result = cast(
+            ParsedReport,
+            {
+                "report_type": "aggregate",
+                "report": {
+                    "report_metadata": {"begin_date": "2023-01-05 00:00:00"},
+                },
+            },
+        )
+        self.assertEqual(
+            _archive_subdir_for_result(result),
+            os.path.join("2023", "01", "Aggregate"),
+        )
+
+    def test_failure_report_january_zero_pads_month(self):
+        from parsedmarc.cli import _archive_subdir_for_result
+
+        result = cast(
+            ParsedReport,
+            {
+                "report_type": "failure",
+                "report": {"arrival_date_utc": "2023-01-05 12:00:00"},
+            },
+        )
+        self.assertEqual(
+            _archive_subdir_for_result(result),
+            os.path.join("2023", "01", "Failure"),
+        )
+
+    def test_smtp_tls_report_uses_hyphenated_folder_name(self):
+        from parsedmarc.cli import _archive_subdir_for_result
+
+        result = cast(
+            ParsedReport,
+            {
+                "report_type": "smtp_tls",
+                "report": {"begin_date": "2016-04-01T00:00:00Z"},
+            },
+        )
+        self.assertEqual(
+            _archive_subdir_for_result(result),
+            os.path.join("2016", "04", "SMTP-TLS"),
+        )
+
+    def test_missing_date_key_returns_none(self):
+        from parsedmarc.cli import _archive_subdir_for_result
+
+        result = cast(
+            ParsedReport,
+            {
+                "report_type": "aggregate",
+                "report": {"report_metadata": {}},
+            },
+        )
+        self.assertIsNone(_archive_subdir_for_result(result))
+
+    def test_unparseable_date_returns_none(self):
+        from parsedmarc.cli import _archive_subdir_for_result
+
+        result = cast(
+            ParsedReport,
+            {
+                "report_type": "failure",
+                "report": {"arrival_date_utc": "not-a-real-date"},
+            },
+        )
+        self.assertIsNone(_archive_subdir_for_result(result))
+
+    def test_unknown_report_type_returns_none(self):
+        from parsedmarc.cli import _archive_subdir_for_result
+
+        result = cast(ParsedReport, {"report_type": "unknown", "report": {}})
+        self.assertIsNone(_archive_subdir_for_result(result))
+
+
+class TestExcludeArchivedPaths(unittest.TestCase):
+    """Unit tests for _exclude_archived_paths (issue #570): filters out
+    paths already inside the archive directory so a re-run doesn't
+    re-parse and re-archive its own previous output."""
+
+    def test_files_inside_archive_dir_are_excluded(self):
+        from parsedmarc.cli import _exclude_archived_paths
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_dir = os.path.join(tmp_dir, "archive")
+            nested_dir = os.path.join(archive_dir, "2024", "01", "Aggregate")
+            os.makedirs(nested_dir)
+            inside_path = os.path.join(nested_dir, "report.xml")
+            with open(inside_path, "w") as f:
+                f.write("x")
+            outside_path = os.path.join(tmp_dir, "report.xml")
+            with open(outside_path, "w") as f:
+                f.write("x")
+
+            result = _exclude_archived_paths([inside_path, outside_path], archive_dir)
+
+        self.assertEqual(result, [outside_path])
+
+    def test_relative_paths_are_resolved_before_comparison(self):
+        from parsedmarc.cli import _exclude_archived_paths
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_dir = os.path.join(tmp_dir, "archive")
+            os.makedirs(archive_dir)
+            inside_path = os.path.join(archive_dir, "report.xml")
+            with open(inside_path, "w") as f:
+                f.write("x")
+
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp_dir)
+                result = _exclude_archived_paths(
+                    [os.path.join("archive", "report.xml")], "archive"
+                )
+            finally:
+                os.chdir(cwd)
+
+        self.assertEqual(result, [])
+
+    def test_files_outside_archive_dir_are_kept(self):
+        from parsedmarc.cli import _exclude_archived_paths
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_dir = os.path.join(tmp_dir, "archive")
+            os.makedirs(archive_dir)
+            other_path = os.path.join(tmp_dir, "elsewhere", "report.xml")
+            os.makedirs(os.path.dirname(other_path))
+            with open(other_path, "w") as f:
+                f.write("x")
+
+            result = _exclude_archived_paths([other_path], archive_dir)
+
+        self.assertEqual(result, [other_path])
+
+    def test_symlinked_archive_dir_still_excludes_real_path(self):
+        """A symlink doesn't defeat exclusion: if archive_directory is
+        configured through one spelling (e.g. a ``/data`` symlink) while
+        an input path is discovered through the real mount-point spelling
+        (e.g. ``/mnt/...``), ``os.path.realpath`` resolves both to the
+        same canonical path so the file already inside the archive is
+        still recognized and excluded rather than re-archived forever."""
+        from parsedmarc.cli import _exclude_archived_paths
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            real_archive_dir = os.path.join(tmp_dir, "real_archive")
+            os.makedirs(real_archive_dir)
+            symlinked_archive_dir = os.path.join(tmp_dir, "archive_link")
+            os.symlink(real_archive_dir, symlinked_archive_dir)
+
+            real_file_path = os.path.join(real_archive_dir, "report.xml")
+            with open(real_file_path, "w") as f:
+                f.write("x")
+
+            # archive_directory is configured via the symlinked spelling,
+            # while the file is discovered via the real spelling.
+            result = _exclude_archived_paths([real_file_path], symlinked_archive_dir)
+
+        self.assertEqual(result, [])
+
+    def test_non_comparable_paths_are_kept(self):
+        """Per the Python docs, ``os.path.commonpath`` raises
+        ``ValueError`` when the paths "are on the different drives"
+        (Windows) or mix absolute and relative pathnames
+        (https://docs.python.org/3/library/os.path.html#os.path.commonpath).
+        Both inputs here are realpath()-resolved so the mix can't occur
+        on POSIX, leaving the different-drives case unreachable on Linux
+        CI — hence the simulated raise. A path that can't be compared
+        with the archive root can't be inside it, so it must be kept
+        for parsing, and the ValueError must not propagate."""
+        from parsedmarc.cli import _exclude_archived_paths
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_dir = os.path.join(tmp_dir, "archive")
+            os.makedirs(archive_dir)
+            report_path = os.path.join(tmp_dir, "report.xml")
+            with open(report_path, "w") as f:
+                f.write("x")
+
+            with patch(
+                "parsedmarc.cli.os.path.commonpath",
+                side_effect=ValueError("Paths don't have the same drive"),
+            ):
+                result = _exclude_archived_paths([report_path], archive_dir)
+
+        self.assertEqual(result, [report_path])
+
+
+class TestMoveFileToArchive(unittest.TestCase):
+    """Unit tests for _move_file_to_archive (issue #570): the collision
+    loop that appends a numeric suffix rather than overwriting an
+    existing destination file."""
+
+    def test_no_collision_keeps_original_basename(self):
+        from parsedmarc.cli import _move_file_to_archive
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = os.path.join(tmp_dir, "src")
+            os.makedirs(src_dir)
+            src_path = os.path.join(src_dir, "report.xml")
+            with open(src_path, "w") as f:
+                f.write("content")
+            dest_dir = os.path.join(tmp_dir, "dest")
+
+            dest_path = _move_file_to_archive(src_path, dest_dir)
+
+        self.assertEqual(dest_path, os.path.join(dest_dir, "report.xml"))
+
+    def test_collision_appends_dash_one(self):
+        from parsedmarc.cli import _move_file_to_archive
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = os.path.join(tmp_dir, "src")
+            os.makedirs(src_dir)
+            src_path = os.path.join(src_dir, "report.xml")
+            with open(src_path, "w") as f:
+                f.write("new content")
+            dest_dir = os.path.join(tmp_dir, "dest")
+            os.makedirs(dest_dir)
+            existing_path = os.path.join(dest_dir, "report.xml")
+            with open(existing_path, "w") as f:
+                f.write("original content")
+
+            dest_path = _move_file_to_archive(src_path, dest_dir)
+
+            self.assertEqual(dest_path, os.path.join(dest_dir, "report-1.xml"))
+            with open(existing_path) as f:
+                self.assertEqual(f.read(), "original content")
+            with open(dest_path) as f:
+                self.assertEqual(f.read(), "new content")
+
+    def test_two_collisions_append_dash_two(self):
+        from parsedmarc.cli import _move_file_to_archive
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = os.path.join(tmp_dir, "src")
+            os.makedirs(src_dir)
+            src_path = os.path.join(src_dir, "report.xml")
+            with open(src_path, "w") as f:
+                f.write("newest content")
+            dest_dir = os.path.join(tmp_dir, "dest")
+            os.makedirs(dest_dir)
+            for name in ("report.xml", "report-1.xml"):
+                with open(os.path.join(dest_dir, name), "w") as f:
+                    f.write(f"original {name}")
+
+            dest_path = _move_file_to_archive(src_path, dest_dir)
+
+            self.assertEqual(dest_path, os.path.join(dest_dir, "report-2.xml"))
+            with open(os.path.join(dest_dir, "report.xml")) as f:
+                self.assertEqual(f.read(), "original report.xml")
+            with open(os.path.join(dest_dir, "report-1.xml")) as f:
+                self.assertEqual(f.read(), "original report-1.xml")
+
+    def test_failed_move_reraises_even_when_placeholder_cleanup_fails(self):
+        """When the move fails and removing the placeholder also fails,
+        the move failure still propagates: the OSError from the
+        best-effort cleanup must be swallowed, not allowed to mask the
+        actionable error. The move error is deliberately a non-OSError
+        type so the assertion proves which of the two exceptions
+        escaped; the placeholder is left behind, as expected when its
+        cleanup fails."""
+        from parsedmarc.cli import _move_file_to_archive
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_path = os.path.join(tmp_dir, "report.xml")
+            with open(src_path, "w") as f:
+                f.write("content")
+            dest_dir = os.path.join(tmp_dir, "dest")
+
+            with (
+                patch(
+                    "parsedmarc.cli.shutil.move",
+                    side_effect=RuntimeError("move failed"),
+                ),
+                patch(
+                    "parsedmarc.cli.os.remove",
+                    side_effect=OSError("remove failed"),
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    _move_file_to_archive(src_path, dest_dir)
+
+            # The source file is untouched and the zero-byte placeholder
+            # survives its failed cleanup.
+            self.assertTrue(os.path.isfile(src_path))
+            placeholder = os.path.join(dest_dir, "report.xml")
+            self.assertTrue(os.path.isfile(placeholder))
+            self.assertEqual(os.path.getsize(placeholder), 0)
+            # A leftover placeholder must never be executable or
+            # group/other-accessible: it's created with mode 0o600, not
+            # os.open's 0o777 default. The requested mode is masked by
+            # the process umask, which only clears bits, so asserting on
+            # the owner-exec and group/other bits is umask-independent.
+            placeholder_mode = stat.S_IMODE(os.stat(placeholder).st_mode)
+            self.assertEqual(placeholder_mode & 0o177, 0)
+
+
+class TestArchiveProcessedFile(unittest.TestCase):
+    """Unit tests for _archive_processed_file (issue #570): the
+    orchestrator that routes a processed file to Invalid/ on a parse
+    failure or the dated subdirectory on success, and never lets a move
+    failure abort the run."""
+
+    def test_exception_result_routes_to_invalid(self):
+        from parsedmarc.cli import _archive_processed_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_path = os.path.join(tmp_dir, "garbage.xml")
+            with open(src_path, "w") as f:
+                f.write("not a report")
+            archive_dir = os.path.join(tmp_dir, "archive")
+
+            _archive_processed_file(
+                src_path, archive_dir, parsedmarc.ParserError("boom")
+            )
+
+            self.assertTrue(
+                os.path.isfile(os.path.join(archive_dir, "Invalid", "garbage.xml"))
+            )
+
+    def test_move_failure_is_logged_and_does_not_raise(self):
+        """A filesystem error while moving a file into the archive is
+        logged, not raised: the file has already been definitively
+        classified (parsed or failed), so a move error must not abort
+        the run and lose that work."""
+        from parsedmarc.cli import _archive_processed_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_path = os.path.join(tmp_dir, "garbage.xml")
+            with open(src_path, "w") as f:
+                f.write("not a report")
+            archive_dir = os.path.join(tmp_dir, "archive")
+
+            with patch("shutil.move", side_effect=OSError("disk full")):
+                with self.assertLogs("parsedmarc.log", level="ERROR") as log_ctx:
+                    _archive_processed_file(
+                        src_path, archive_dir, parsedmarc.ParserError("boom")
+                    )
+
+            self.assertTrue(any("Error moving" in msg for msg in log_ctx.output))
+            # The move never completed, so the source file is untouched.
+            self.assertTrue(os.path.isfile(src_path))
+
+    def test_unresolvable_subdir_leaves_file_in_place(self):
+        """When _archive_subdir_for_result can't determine a destination
+        (unknown report type or unparseable date, already warned about by
+        that helper), the file is left where it is rather than guessed
+        at."""
+        from parsedmarc.cli import _archive_processed_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_path = os.path.join(tmp_dir, "report.json")
+            with open(src_path, "w") as f:
+                f.write("{}")
+            archive_dir = os.path.join(tmp_dir, "archive")
+
+            result = cast(ParsedReport, {"report_type": "unknown", "report": {}})
+            _archive_processed_file(src_path, archive_dir, result)
+
+            self.assertTrue(os.path.isfile(src_path))
+
+    def test_non_parser_error_leaves_file_in_place(self):
+        """Only a ParserError (every parse-failure exception, including
+        InvalidSMTPTLSReport, subclasses it) routes to Invalid/. A
+        transient OSError — e.g. from _parse_report_file_job's broad
+        catch, not a report-parsing failure — leaves the file in place
+        so a later run can retry it, and creates no Invalid/ directory
+        at all, since renaming it would permanently sideline a file that
+        was never actually shown to be an invalid report."""
+        from parsedmarc.cli import _archive_processed_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_path = os.path.join(tmp_dir, "report.xml")
+            with open(src_path, "w") as f:
+                f.write("<xml></xml>")
+            archive_dir = os.path.join(tmp_dir, "archive")
+
+            _archive_processed_file(src_path, archive_dir, OSError("transient"))
+
+            self.assertTrue(os.path.isfile(src_path))
+            self.assertFalse(os.path.isdir(archive_dir))
+
+
 # ---------------------------------------------------------------------------
 # _parse_config: per-section INI → opts mapping
 #
@@ -3441,6 +7143,83 @@ def _config_with(section: str, settings: dict) -> "ConfigParser":
     for k, v in settings.items():
         cp.set(section, k, str(v))
     return cp
+
+
+class TestParseConfigMailbox(unittest.TestCase):
+    """The [mailbox] section, including the per-report-type delete options
+    (issue #256). An option that is absent from the INI must be left alone
+    entirely: _main defaults the four per-type options to None so the library
+    inherits the overall ``delete`` value, and writing False for an absent key
+    would silently disable that inheritance."""
+
+    PER_TYPE_DELETE_OPTS = (
+        "mailbox_delete_aggregate",
+        "mailbox_delete_failure",
+        "mailbox_delete_smtp_tls",
+        "mailbox_delete_invalid",
+    )
+
+    def test_mailbox_full_section(self):
+        from parsedmarc.cli import _parse_config
+
+        cp = _config_with(
+            "mailbox",
+            {
+                "reports_folder": "Reports",
+                "archive_folder": "Processed",
+                "watch": "true",
+                "delete": "true",
+                "delete_aggregate": "true",
+                "delete_failure": "false",
+                "delete_smtp_tls": "true",
+                "delete_invalid": "false",
+                "test": "false",
+                "batch_size": "25",
+                "check_timeout": "60",
+                "max_unsaved_retries": "5",
+                "since": "3d",
+            },
+        )
+        opts = _opts()
+        _parse_config(cp, opts)
+        self.assertEqual(opts.mailbox_reports_folder, "Reports")
+        self.assertEqual(opts.mailbox_archive_folder, "Processed")
+        self.assertIs(opts.mailbox_watch, True)
+        self.assertIs(opts.mailbox_delete, True)
+        self.assertIs(opts.mailbox_delete_aggregate, True)
+        # Explicitly false, not None: this type opts out of delete = true.
+        self.assertIs(opts.mailbox_delete_failure, False)
+        self.assertIs(opts.mailbox_delete_smtp_tls, True)
+        self.assertIs(opts.mailbox_delete_invalid, False)
+        self.assertIs(opts.mailbox_test, False)
+        self.assertEqual(opts.mailbox_batch_size, 25)
+        self.assertEqual(opts.mailbox_check_timeout, 60)
+        self.assertEqual(opts.mailbox_max_unsaved_retries, 5)
+        self.assertEqual(opts.mailbox_since, "3d")
+
+    def test_mailbox_max_unsaved_retries_from_env_var(self):
+        """PARSEDMARC_MAILBOX_MAX_UNSAVED_RETRIES resolves to
+        [mailbox] max_unsaved_retries and parses as an int -- including 0,
+        which is a meaningful value ("never retry"), not an absent one."""
+        from parsedmarc.cli import _load_config, _parse_config
+
+        env = {"PARSEDMARC_MAILBOX_MAX_UNSAVED_RETRIES": "0"}
+        with patch.dict(os.environ, env, clear=False):
+            config = _load_config(None)
+        opts = _opts()
+        _parse_config(config, opts)
+        self.assertEqual(opts.mailbox_max_unsaved_retries, 0)
+
+    def test_mailbox_absent_per_type_delete_keys_are_not_set(self):
+        from parsedmarc.cli import _parse_config
+
+        cp = _config_with("mailbox", {"delete": "true"})
+        opts = _opts()
+        _parse_config(cp, opts)
+        self.assertIs(opts.mailbox_delete, True)
+        for option in self.PER_TYPE_DELETE_OPTS:
+            with self.subTest(option=option):
+                self.assertFalse(hasattr(opts, option))
 
 
 class TestParseConfigGeneral(unittest.TestCase):
@@ -3512,6 +7291,78 @@ class TestParseConfigGeneral(unittest.TestCase):
         self.assertEqual(opts.failure_json_filename, "fa.json")
         self.assertEqual(opts.failure_csv_filename, "fa.csv")
 
+    def _index_prefix_domain_map_config(self, yaml_text):
+        with NamedTemporaryFile("w", suffix=".yaml", delete=False) as map_file:
+            map_file.write(yaml_text)
+            map_path = map_file.name
+        self.addCleanup(lambda: os.path.exists(map_path) and os.remove(map_path))
+        return _config_with("general", {"index_prefix_domain_map": map_path})
+
+    def test_index_prefix_domain_map_accepts_a_mapping_of_lists(self):
+        from parsedmarc.cli import _parse_config
+
+        cp = self._index_prefix_domain_map_config(
+            "tenant_a:\n  - example.com\n  - example.net\n"
+        )
+        self.assertEqual(
+            _parse_config(cp, _opts()),
+            {"tenant_a": ["example.com", "example.net"]},
+        )
+
+    def test_index_prefix_domain_map_empty_file_is_unset(self):
+        """An empty file loads as None, which keeps multi-tenant prefixing
+        switched off rather than tripping the shape check."""
+        from parsedmarc.cli import _parse_config
+
+        cp = self._index_prefix_domain_map_config("")
+        self.assertIsNone(_parse_config(cp, _opts()))
+
+    def test_index_prefix_domain_map_rejects_a_non_mapping(self):
+        """A list-shaped file has no tenant names, so the save path cannot
+        derive index prefixes from it and the migration path would resolve
+        garbage index names from its items."""
+        from parsedmarc.cli import ConfigurationError, _parse_config
+
+        cp = self._index_prefix_domain_map_config("- example.com\n- example.net\n")
+        with self.assertRaises(ConfigurationError) as ctx:
+            _parse_config(cp, _opts())
+        self.assertIn("index_prefix_domain_map", str(ctx.exception))
+
+    def test_index_prefix_domain_map_rejects_a_scalar_domain_value(self):
+        """The save path tests `domain in <value>`, and `in` on a str is a
+        substring test, not equality
+        (https://docs.python.org/3/reference/expressions.html
+        #membership-test-operations) -- so a scalar value silently claims
+        every domain that contains it, e.g. "example.co" matching
+        "example.com"."""
+        from parsedmarc.cli import ConfigurationError, _parse_config
+
+        cp = self._index_prefix_domain_map_config("tenant_a: example.co\n")
+        with self.assertRaises(ConfigurationError) as ctx:
+            _parse_config(cp, _opts())
+        self.assertIn("list of domain names", str(ctx.exception))
+
+    def test_index_prefix_domain_map_rejects_a_non_string_domain(self):
+        """A non-string list item never compares equal to the base domain
+        the save path looks up, so `tenant_a: [42]` would match nothing at
+        all -- the same silent-misbehavior class as a scalar value, and the
+        reason the check covers the list's items and not just its type."""
+        from parsedmarc.cli import ConfigurationError, _parse_config
+
+        cp = self._index_prefix_domain_map_config("tenant_a:\n  - 42\n")
+        with self.assertRaises(ConfigurationError) as ctx:
+            _parse_config(cp, _opts())
+        self.assertIn("all strings", str(ctx.exception))
+
+    def test_index_prefix_domain_map_rejects_a_non_string_key(self):
+        """A non-string tenant name cannot be normalized into an index
+        prefix; it used to raise AttributeError mid-save instead."""
+        from parsedmarc.cli import ConfigurationError, _parse_config
+
+        cp = self._index_prefix_domain_map_config("42:\n  - example.com\n")
+        with self.assertRaises(ConfigurationError):
+            _parse_config(cp, _opts())
+
     def test_general_dns_settings_with_defaults(self):
         from parsedmarc.cli import _parse_config
 
@@ -3532,6 +7383,59 @@ class TestParseConfigGeneral(unittest.TestCase):
         self.assertEqual(opts.dns_retries, 2)
         self.assertEqual(opts.nameservers, ["1.1.1.1", "8.8.8.8"])
 
+    def test_general_nameservers_accept_doh_and_dot_entries(self):
+        """A nameservers list may mix DNS over HTTPS URLs and DNS over TLS
+        entries with plain IP addresses (issue #880); _parse_config splits
+        and strips them like any other list value, and hands them to the DNS
+        pre-flight check (mocked here so no network is needed)."""
+        from parsedmarc.cli import _parse_config
+
+        cp = _config_with(
+            "general",
+            {
+                "dns_test_address": "1.1.1.1",
+                "dns_timeout": "5.0",
+                "nameservers": (
+                    "https://cloudflare-dns.com/dns-query, tls://9.9.9.9#dns.quad9.net"
+                ),
+            },
+        )
+        opts = _opts()
+        with patch(
+            "parsedmarc.cli.get_reverse_dns", return_value="one.one.one.one"
+        ) as mock_reverse_dns:
+            _parse_config(cp, opts)
+        self.assertEqual(
+            opts.nameservers,
+            ["https://cloudflare-dns.com/dns-query", "tls://9.9.9.9#dns.quad9.net"],
+        )
+        self.assertEqual(
+            mock_reverse_dns.call_args.kwargs["nameservers"], opts.nameservers
+        )
+
+    def test_general_nameservers_malformed_dot_entry_fails_pre_flight(self):
+        """A malformed DNS over TLS nameservers entry raises a
+        ConfigurationError at startup, before any mailbox work begins. No
+        mocking is needed: the entry mapper rejects tls://not-an-ip with a
+        ValueError before any query is sent (the pre-flight path passes no
+        cache, so nothing can short-circuit it), and _parse_config wraps
+        any pre-flight failure in a ConfigurationError."""
+        from parsedmarc.cli import ConfigurationError, _parse_config
+
+        cp = _config_with(
+            "general",
+            {
+                "dns_test_address": "1.1.1.1",
+                "dns_timeout": "2.0",
+                "nameservers": "tls://not-an-ip",
+            },
+        )
+        opts = _opts()
+        with self.assertRaises(ConfigurationError) as ctx:
+            _parse_config(cp, opts)
+        self.assertIn("pre-flight", str(ctx.exception))
+        self.assertIn("tls://not-an-ip", str(ctx.exception))
+
     def test_general_normalize_timespan_threshold(self):
         from parsedmarc.cli import _parse_config
 
@@ -3539,6 +7443,33 @@ class TestParseConfigGeneral(unittest.TestCase):
         opts = _opts()
         _parse_config(cp, opts)
         self.assertEqual(opts.normalize_timespan_threshold_hours, 48.0)
+
+    def test_general_archive_directory_expands_env_var(self):
+        """archive_directory goes through _expand_path, so a $VAR
+        reference in the INI value is expanded (issue #570)."""
+        from parsedmarc.cli import _parse_config
+
+        cp = _config_with(
+            "general", {"archive_directory": "$SOME_ARCHIVE_VAR/reports-archive"}
+        )
+        opts = _opts()
+        with patch.dict(os.environ, {"SOME_ARCHIVE_VAR": "/opt/dmarc"}):
+            _parse_config(cp, opts)
+        self.assertEqual(opts.archive_directory, "/opt/dmarc/reports-archive")
+
+    def test_general_archive_directory_unset_leaves_attribute_absent(self):
+        """When archive_directory is absent from the INI, _parse_config
+        never sets opts.archive_directory at all — asserted here as the
+        attribute staying absent from this test's bare Namespace. (In the
+        real CLI the attribute pre-exists with the Namespace default of
+        None, so _parse_config leaving it untouched is what keeps
+        archiving disabled.)"""
+        from parsedmarc.cli import _parse_config
+
+        cp = _config_with("general", {"silent": "false"})
+        opts = _opts()
+        _parse_config(cp, opts)
+        self.assertFalse(hasattr(opts, "archive_directory"))
 
 
 class TestParseConfigElasticsearch(unittest.TestCase):
@@ -3578,6 +7509,31 @@ class TestParseConfigElasticsearch(unittest.TestCase):
         self.assertEqual(opts.elasticsearch_username, "alice")
         self.assertEqual(opts.elasticsearch_password, "secret")
         self.assertEqual(opts.elasticsearch_api_key, "base64key")
+
+    def test_elasticsearch_number_of_replicas_without_shards(self):
+        """Regression test: a [elasticsearch] section that sets only
+        number_of_replicas (no number_of_shards) must still set
+        opts.elasticsearch_number_of_replicas.
+
+        Before this fix, the number_of_replicas check was nested inside the
+        number_of_shards ``if`` block, so a replicas-only config was
+        silently ignored -- docs/source/usage.md lists number_of_shards and
+        number_of_replicas as independent options with no stated
+        dependency, and elastic.py's save functions accept them as
+        independent parameters with independent defaults, shards=1 and
+        replicas=0, but the accidental nesting made replicas silently
+        depend on shards also being set.
+        """
+        from parsedmarc.cli import _parse_config
+
+        cp = _config_with(
+            "elasticsearch",
+            {"hosts": "es:9200", "number_of_replicas": "2"},
+        )
+        opts = _opts()
+        _parse_config(cp, opts)
+        self.assertEqual(opts.elasticsearch_number_of_replicas, 2)
+        self.assertFalse(hasattr(opts, "elasticsearch_number_of_shards"))
 
     def test_elasticsearch_apikey_camelcase_alias_pre_8_20(self):
         """`apiKey` (camelCase) is the legacy 8.20-and-earlier name."""
@@ -3695,6 +7651,31 @@ class TestParseConfigOpenSearch(unittest.TestCase):
         self.assertEqual(opts.opensearch_auth_type, "basic")
         self.assertEqual(opts.opensearch_aws_region, "us-east-1")
         self.assertEqual(opts.opensearch_aws_service, "es")
+
+    def test_opensearch_number_of_replicas_without_shards(self):
+        """Regression test: a [opensearch] section that sets only
+        number_of_replicas (no number_of_shards) must still set
+        opts.opensearch_number_of_replicas.
+
+        Before this fix, the number_of_replicas check was nested inside the
+        number_of_shards ``if`` block, so a replicas-only config was
+        silently ignored -- docs/source/usage.md lists number_of_shards and
+        number_of_replicas as independent options with no stated
+        dependency, and opensearch.py's save functions accept them as
+        independent parameters with independent defaults, shards=1 and
+        replicas=0, but the accidental nesting made replicas silently
+        depend on shards also being set.
+        """
+        from parsedmarc.cli import _parse_config
+
+        cp = _config_with(
+            "opensearch",
+            {"hosts": "os:9200", "number_of_replicas": "3"},
+        )
+        opts = _opts()
+        _parse_config(cp, opts)
+        self.assertEqual(opts.opensearch_number_of_replicas, 3)
+        self.assertFalse(hasattr(opts, "opensearch_number_of_shards"))
 
     def test_opensearch_authentication_type_legacy_alias(self):
         """`authentication_type` is the legacy spelling of `auth_type`."""
@@ -3911,6 +7892,203 @@ class TestParseConfigSmtp(unittest.TestCase):
             _parse_config(cp, _opts())
 
 
+class TestSmtpAttachmentAndMessageWiring(unittest.TestCase):
+    """[smtp] attachment/message are documented and parsed into
+    opts.smtp_attachment/opts.smtp_message, but were never passed to
+    email_results(), so a configured custom attachment filename or
+    message body was silently ignored on the SMTP transport."""
+
+    def _write_config(self, config_text):
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
+            cfg.write(config_text)
+            cfg_path = cfg.name
+        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+        return cfg_path
+
+    def _run_main(self, cfg_path, *cli_args):
+        with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, *cli_args]):
+            parsedmarc.cli._main()
+
+    @patch("parsedmarc.cli.email_results")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testSmtpAttachmentAndMessageArePassedToEmailResults(
+        self, mock_imap_connection, mock_get_mailbox_reports, mock_email_results
+    ):
+        """A configured attachment filename and message body reach
+        email_results() rather than being silently dropped."""
+        mock_imap_connection.return_value = object()
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": _sample_aggregate_reports(),
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_text = """[general]
+silent = true
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+
+[smtp]
+host = smtp.example.com
+user = smtp-user
+password = smtp-password
+from = dmarc@example.com
+to = admin@example.com
+attachment = custom-report.zip
+message = Custom body text
+"""
+        cfg_path = self._write_config(config_text)
+        self._run_main(cfg_path)
+
+        mock_email_results.assert_called_once()
+        call_kwargs = mock_email_results.call_args.kwargs
+        # The configured value passes through _expand_path(), which is a
+        # no-op here since the filename has no ~ or $VAR references.
+        self.assertTrue(
+            call_kwargs["attachment_filename"].endswith("custom-report.zip")
+        )
+        self.assertEqual(call_kwargs["message"], "Custom body text")
+
+    @patch("parsedmarc.cli.email_results")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testSmtpDefaultsFlowThroughWhenNotConfigured(
+        self, mock_imap_connection, mock_get_mailbox_reports, mock_email_results
+    ):
+        """When [smtp] attachment/message are not set, email_results()
+        still gets the documented defaults (None for the attachment
+        filename, and the long-documented default message body) rather
+        than being called with no attachment/message context at all."""
+        mock_imap_connection.return_value = object()
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": _sample_aggregate_reports(),
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_text = """[general]
+silent = true
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+
+[smtp]
+host = smtp.example.com
+user = smtp-user
+password = smtp-password
+from = dmarc@example.com
+to = admin@example.com
+"""
+        cfg_path = self._write_config(config_text)
+        self._run_main(cfg_path)
+
+        mock_email_results.assert_called_once()
+        call_kwargs = mock_email_results.call_args.kwargs
+        self.assertIsNone(call_kwargs["attachment_filename"])
+        self.assertEqual(
+            call_kwargs["message"], "Please see the attached DMARC results."
+        )
+
+
+class TestSkipsResultsEmailWhenNoReportsParsed(unittest.TestCase):
+    """#200: a run that parses no reports at all (e.g. an empty inbox,
+    or a mailbox where every message failed to parse) must not send a
+    results email with headers-only, data-free CSVs. The email step is
+    now skipped, with an INFO log line, whenever aggregate_reports,
+    failure_reports, and smtp_tls_reports are all empty."""
+
+    def _write_config(self, config_text):
+        with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as cfg:
+            cfg.write(config_text)
+            cfg_path = cfg.name
+        self.addCleanup(lambda: os.path.exists(cfg_path) and os.remove(cfg_path))
+        return cfg_path
+
+    def _run_main(self, cfg_path, *cli_args):
+        with patch.object(sys, "argv", ["parsedmarc", "-c", cfg_path, *cli_args]):
+            parsedmarc.cli._main()
+
+    @patch("parsedmarc.send_email")
+    @patch("parsedmarc.cli.get_dmarc_reports_from_mailbox")
+    @patch("parsedmarc.cli.IMAPConnection")
+    def testSkipsResultsEmailWhenNothingWasParsed(
+        self, mock_imap_connection, mock_get_mailbox_reports, mock_send_email
+    ):
+        """Regression test for #200: with an empty inbox (no aggregate,
+        failure, or SMTP TLS reports), the SMTP results email must not
+        be sent, and an INFO log line should explain why it was
+        skipped."""
+        mock_imap_connection.return_value = object()
+        mock_get_mailbox_reports.return_value = {
+            "aggregate_reports": [],
+            "failure_reports": [],
+            "smtp_tls_reports": [],
+        }
+        config_text = """[general]
+silent = true
+verbose = true
+
+[imap]
+host = imap.example.com
+user = test-user
+password = test-password
+
+[smtp]
+host = smtp.example.com
+user = smtp-user
+password = smtp-password
+from = dmarc@example.com
+to = admin@example.com
+"""
+        cfg_path = self._write_config(config_text)
+
+        with self.assertLogs("parsedmarc.log", level="INFO") as logs:
+            self._run_main(cfg_path)
+
+        mock_send_email.assert_not_called()
+        self.assertTrue(
+            any("skipping the results email" in line for line in logs.output)
+        )
+
+    @patch("parsedmarc.send_email")
+    def testSendsResultsEmailWithRealPayloadWhenReportsExist(self, mock_send_email):
+        """When at least one report is parsed, the results email is
+        still sent, and the attached zip's aggregate.csv contains actual
+        data rows (not just a header row)."""
+        config_text = """[general]
+silent = true
+offline = true
+
+[smtp]
+host = smtp.example.com
+user = smtp-user
+password = smtp-password
+from = dmarc@example.com
+to = admin@example.com
+"""
+        cfg_path = self._write_config(config_text)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["parsedmarc", "-c", cfg_path, SAMPLE_AGGREGATE_REPORT_PATH],
+        ):
+            parsedmarc.cli._main()
+
+        mock_send_email.assert_called_once()
+        call_kwargs = mock_send_email.call_args.kwargs
+        attachments = call_kwargs["attachments"]
+        filename, zip_bytes = attachments[0]
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            csv_text = zf.read("aggregate.csv").decode("utf-8")
+
+        self.assertGreater(len(csv_text.strip().splitlines()), 1)
+
+
 class TestParseConfigS3(unittest.TestCase):
     def test_s3_complete(self):
         from parsedmarc.cli import _parse_config
@@ -4007,6 +8185,18 @@ class TestPostgreSQLCliWiring(unittest.TestCase):
     _init_output_clients wiring can't drift apart.
     """
 
+    def setUp(self):
+        # These tests simulate "[postgresql] configured and the SDK
+        # available", mocking PostgreSQLClient at the SDK boundary. CI's
+        # unit-test job deliberately omits the postgresql extra, so the
+        # module-level psycopg handle must be patched present too --
+        # otherwise _init_output_clients' presence check correctly
+        # reports the missing extra and _main exits 1 before any of the
+        # wiring under test runs.
+        patcher = patch.object(parsedmarc.cli.postgres, "psycopg", MagicMock())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_postgresql_config_constructs_client_and_creates_tables(self):
         config = """[general]
 save_aggregate = true
@@ -4076,21 +8266,17 @@ host = db.example.com
         self.addCleanup(lambda: os.path.exists(config_path) and os.remove(config_path))
 
         report = {"policy_published": {"domain": "example.com"}, "records": []}
-        reports_dict = {
-            "aggregate_reports": [report],
-            "failure_reports": [],
-            "smtp_tls_reports": [],
-        }
-
-        def _fetch_and_save(**kwargs):
-            kwargs["save_callback"](reports_dict)
-            return reports_dict
-
         with (
             patch("parsedmarc.cli.postgres.PostgreSQLClient") as mock_client_cls,
             patch(
                 "parsedmarc.cli.get_dmarc_reports_from_mailbox",
-                side_effect=_fetch_and_save,
+                side_effect=_fetch_invoking_save_callback(
+                    {
+                        "aggregate_reports": [report],
+                        "failure_reports": [],
+                        "smtp_tls_reports": [],
+                    }
+                ),
             ),
             patch("parsedmarc.cli.IMAPConnection", return_value=object()),
             patch.object(sys, "argv", ["parsedmarc", "-c", config_path]),
@@ -4128,18 +8314,11 @@ host = db.example.com
             config_path = config_file.name
         self.addCleanup(lambda: os.path.exists(config_path) and os.remove(config_path))
 
-        def _fetch_and_save(**kwargs):
-            # Simulate the real get_dmarc_reports_from_mailbox contract:
-            # save_callback is invoked with the batch before this function
-            # returns.
-            kwargs["save_callback"](reports)
-            return reports
-
         with (
             patch("parsedmarc.cli.postgres.PostgreSQLClient") as mock_client_cls,
             patch(
                 "parsedmarc.cli.get_dmarc_reports_from_mailbox",
-                side_effect=_fetch_and_save,
+                side_effect=_fetch_invoking_save_callback(reports),
             ),
             patch("parsedmarc.cli.IMAPConnection", return_value=object()),
             patch.object(sys, "argv", ["parsedmarc", "-c", config_path]),
@@ -4421,9 +8600,11 @@ class TestParseConfigWebhook(unittest.TestCase):
 
 
 class TestConfigureLogging(unittest.TestCase):
-    """_configure_logging is called in every child process for parallel
-    parsing — if it stops attaching a handler, log output goes dark in
-    multiprocessing mode."""
+    """cli._configure_logging is a thin wrapper around
+    parsedmarc.log.configure_logging (the parallel-parsing worker
+    initializer in parsedmarc/parallel.py calls configure_logging
+    directly) — if this wrapper stops attaching a handler, any remaining
+    caller's log output goes dark."""
 
     def setUp(self):
         from parsedmarc.log import logger as plog
@@ -4500,65 +8681,454 @@ class TestConfigureLogging(unittest.TestCase):
         self.assertTrue(any("Unable to write to log file" in m for m in cm.output))
 
 
-class TestCliParse(unittest.TestCase):
-    """cli_parse is the multiprocessing worker — it shells out to
-    parse_report_file, then sends the result (or error) back over a
-    pipe. Both branches matter: a regression would silently drop
-    results in parallel mode."""
+# Top-level module roots pulled in by parsedmarc's optional output and
+# mailbox extras. Blocking all of them makes an install with no extras
+# at all -- the new default (#883) -- look the way it does to the import
+# system.
+OPTIONAL_SDK_ROOTS = (
+    "azure",
+    "boto3",
+    "botocore",
+    "elastic_transport",
+    "elasticsearch",
+    "google",
+    "google_auth_oauthlib",
+    "googleapiclient",
+    "kafka",
+    "kiota_abstractions",
+    "kiota_authentication_azure",
+    "msgraph",
+    "msgraph_core",
+    "opensearchpy",
+    "pygelf",
+)
 
-    def test_cli_parse_sends_results_on_success(self):
-        from multiprocessing import Pipe
-        from unittest.mock import patch
-        from parsedmarc.cli import cli_parse
+# The parsedmarc submodules cli.py imports behind the extras guard, in
+# the order their guarded import blocks appear in cli.py.
+GUARDED_CLI_MODULES = (
+    "elastic",
+    "gelf",
+    "kafkaclient",
+    "loganalytics",
+    "opensearch",
+    "s3",
+)
 
-        parent_conn, child_conn = Pipe()
-        with patch("parsedmarc.cli.parse_report_file") as mock_parse:
-            mock_parse.return_value = {"report_type": "aggregate", "report": {}}
-            cli_parse(
-                "/path/to/report.xml",
-                False,
-                None,
-                2.0,
-                0,
-                None,
-                True,
-                True,
-                None,
-                None,
-                24.0,
-                child_conn,
+
+class _ImportBlocker(importlib.abc.MetaPathFinder):
+    """A meta path finder that makes chosen module roots unimportable.
+
+    Installed at the head of ``sys.meta_path``, it raises
+    ``ModuleNotFoundError`` for any module whose top-level root is
+    blocked — the exact exception a genuinely absent package produces,
+    and the only one cli.py's import guards catch, so a broken-but-
+    present SDK still fails loudly instead of masquerading as a missing
+    extra.
+    """
+
+    def __init__(self, roots: frozenset[str]) -> None:
+        self.roots = roots
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None = None,
+        target: ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        if fullname.split(".")[0] in self.roots:
+            raise ModuleNotFoundError(f"blocked for test: {fullname}")
+        return None
+
+
+def _is_affected(name: str) -> bool:
+    """Is *name* a module that has to be reloaded while the SDKs are blocked?
+
+    The blocked roots themselves, the whole ``mailsuite`` tree (its
+    ``mailbox`` package caches the ``gmail``/``graph`` submodules as
+    attributes once loaded, so a stale entry would satisfy
+    ``parsedmarc.mail``'s guarded imports without ever reaching a blocked
+    root), and the ``parsedmarc`` submodules that import the blocked SDKs.
+    """
+    root = name.split(".")[0]
+    if root in OPTIONAL_SDK_ROOTS or root == "mailsuite":
+        return True
+    return name in {f"parsedmarc.{m}" for m in (*GUARDED_CLI_MODULES, "mail")}
+
+
+@contextmanager
+def _cli_without_optional_sdks() -> Iterator[ModuleType]:
+    """Reload :mod:`parsedmarc.cli` with every optional SDK unimportable.
+
+    Yields the reloaded module -- the same object as before, since
+    ``importlib.reload`` re-executes in place. On exit, including when
+    the body raises, the finder is removed, anything imported while
+    blocked is discarded, the snapshots are put back, and
+    :mod:`parsedmarc.cli` is reloaded once more so later tests see the
+    real modules again. ``parsedmarc``'s own submodule attributes are
+    snapshotted and deleted too: ``from parsedmarc import elastic``
+    resolves against the package's attributes first, so leaving them in
+    place would satisfy the import without consulting the blocker.
+    """
+    blocker = _ImportBlocker(frozenset(OPTIONAL_SDK_ROOTS))
+    removed_modules: dict[str, ModuleType] = {}
+    for name in list(sys.modules):
+        if _is_affected(name):
+            removed_modules[name] = sys.modules.pop(name)
+    removed_attrs: dict[str, ModuleType] = {}
+    for attr in (*GUARDED_CLI_MODULES, "mail"):
+        if attr in vars(parsedmarc):
+            removed_attrs[attr] = getattr(parsedmarc, attr)
+            delattr(parsedmarc, attr)
+    # Every reload re-runs cli.py's module level, which adds a stream
+    # handler to the parsedmarc logger; restore the original list so the
+    # handlers do not accumulate across tests.
+    handlers = list(parsedmarc.log.logger.handlers)
+    sys.meta_path.insert(0, blocker)
+    try:
+        importlib.invalidate_caches()
+        importlib.reload(parsedmarc.cli)
+        yield parsedmarc.cli
+    finally:
+        sys.meta_path.remove(blocker)
+        for name in list(sys.modules):
+            if _is_affected(name):
+                del sys.modules[name]
+        sys.modules.update(removed_modules)
+        for attr, value in removed_attrs.items():
+            setattr(parsedmarc, attr, value)
+        importlib.invalidate_caches()
+        importlib.reload(parsedmarc.cli)
+        parsedmarc.log.logger.handlers[:] = handlers
+
+
+def _output_client_opts(**overrides) -> SimpleNamespace:
+    """Build the opts namespace ``_init_output_clients`` reads.
+
+    Every option defaults to ``None`` -- falsy, so each output's ``if``
+    guard is skipped -- and *overrides* turn on exactly one output.
+    """
+    names = (
+        "elasticsearch_api_key",
+        "elasticsearch_hosts",
+        "elasticsearch_index_prefix",
+        "elasticsearch_index_suffix",
+        "elasticsearch_password",
+        "elasticsearch_serverless",
+        "elasticsearch_skip_certificate_verification",
+        "elasticsearch_ssl",
+        "elasticsearch_ssl_cert_path",
+        "elasticsearch_timeout",
+        "elasticsearch_username",
+        "gelf_host",
+        "gelf_mode",
+        "gelf_port",
+        "hec",
+        "hec_index",
+        "hec_skip_certificate_verification",
+        "hec_token",
+        "kafka_hosts",
+        "kafka_password",
+        "kafka_skip_certificate_verification",
+        "kafka_username",
+        "la_dce",
+        "opensearch_api_key",
+        "opensearch_auth_type",
+        "opensearch_aws_region",
+        "opensearch_aws_service",
+        "opensearch_hosts",
+        "opensearch_index_prefix",
+        "opensearch_index_suffix",
+        "opensearch_password",
+        "opensearch_skip_certificate_verification",
+        "opensearch_ssl",
+        "opensearch_ssl_cert_path",
+        "opensearch_timeout",
+        "opensearch_username",
+        "postgresql_connection_string",
+        "postgresql_database",
+        "postgresql_host",
+        "postgresql_password",
+        "postgresql_port",
+        "postgresql_user",
+        "s3_access_key_id",
+        "s3_bucket",
+        "s3_endpoint_url",
+        "s3_path",
+        "s3_region_name",
+        "s3_secret_access_key",
+        "save_aggregate",
+        "save_failure",
+        "save_smtp_tls",
+        "syslog_cafile_path",
+        "syslog_certfile_path",
+        "syslog_keyfile_path",
+        "syslog_port",
+        "syslog_protocol",
+        "syslog_retry_attempts",
+        "syslog_retry_delay",
+        "syslog_server",
+        "syslog_timeout",
+        "webhook_aggregate_url",
+        "webhook_failure_url",
+        "webhook_smtp_tls_url",
+        "webhook_timeout",
+    )
+    unknown = set(overrides) - set(names)
+    assert not unknown, f"unknown opts: {sorted(unknown)}"
+    values: dict[str, object] = {name: None for name in names}
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestOptionalIntegrationExtras(unittest.TestCase):
+    """The optional-extras packaging split (#883).
+
+    ``pip install parsedmarc`` no longer ships the Elasticsearch,
+    OpenSearch, Kafka, AWS, Azure, Gmail, or Microsoft Graph SDKs, so
+    ``parsedmarc.cli`` must import without any of them, and a config
+    section whose extra is missing must fail with an actionable
+    ``ConfigurationError`` rather than an ``ImportError`` traceback or an
+    ``AttributeError`` on ``None``.
+    """
+
+    # (cli.py module global, INI section name, extra name, opts that
+    # select that output, the key _init_output_clients() adds for it --
+    # None for Log Analytics, whose client is built per batch in
+    # process_reports() instead)
+    GUARDED_OUTPUTS = (
+        (
+            "elastic",
+            "elasticsearch",
+            "elastic",
+            {"elasticsearch_hosts": ["host:9200"]},
+            "elasticsearch",
+        ),
+        (
+            "opensearch",
+            "opensearch",
+            "opensearch",
+            {"opensearch_hosts": ["host:9200"]},
+            "opensearch",
+        ),
+        (
+            "kafkaclient",
+            "kafka",
+            "kafka",
+            {"kafka_hosts": ["host:9092"]},
+            "kafka_client",
+        ),
+        ("s3", "s3", "s3", {"s3_bucket": "reports"}, "s3_client"),
+        (
+            "gelf",
+            "gelf",
+            "gelf",
+            {"gelf_host": "logger", "gelf_port": 12201},
+            "gelf_client",
+        ),
+        (
+            "loganalytics",
+            "log_analytics",
+            "loganalytics",
+            {"la_dce": "https://dce.example.com"},
+            None,
+        ),
+    )
+
+    def test_cli_imports_with_no_optional_sdk_installed(self):
+        """parsedmarc.cli imports with every optional SDK absent.
+
+        This is the base-install guarantee: the core CLI (file, IMAP,
+        Maildir, and mbox input; CSV/JSON, Splunk HEC, webhook, and
+        syslog output) works with none of the extras installed. Each
+        guarded module becomes ``None``; the eagerly imported outputs,
+        which need only httpx or the standard library, stay real.
+        """
+        with _cli_without_optional_sdks() as blocked_cli:
+            self.assertIs(blocked_cli, sys.modules["parsedmarc.cli"])
+            for name in GUARDED_CLI_MODULES:
+                with self.subTest(module=name):
+                    self.assertIsNone(getattr(blocked_cli, name))
+            for name in ("postgres", "splunk", "syslog", "webhook"):
+                with self.subTest(module=name):
+                    self.assertIsInstance(getattr(blocked_cli, name), ModuleType)
+
+        # The other half: once the SDKs are back, so are the modules --
+        # a guard that left them None would break every later test.
+        for name in GUARDED_CLI_MODULES:
+            with self.subTest(module=name):
+                self.assertIsInstance(getattr(parsedmarc.cli, name), ModuleType)
+
+    def test_graph_error_types_fall_back_to_sentinel_classes(self):
+        """The Graph error handling still works with the msgraph extra absent.
+
+        ``ClientAuthenticationError`` and ``APIError`` appear only in
+        ``except`` tuples and one ``isinstance`` check. Without the extra
+        a Graph connection cannot even be constructed -- its
+        ``parsedmarc.mail`` placeholder raises the extra's ImportError --
+        so those handlers are unreachable, and the placeholders exist
+        purely to keep the module importable. They must be exception
+        classes distinct from the real ones, must never match an
+        unrelated exception, and must leave ``_log_msgraph_failure``'s
+        non-APIError branch intact.
+        """
+        with _cli_without_optional_sdks() as blocked_cli:
+            for name in ("ClientAuthenticationError", "APIError"):
+                with self.subTest(name=name):
+                    sentinel = getattr(blocked_cli, name)
+                    self.assertTrue(issubclass(sentinel, Exception))
+                    self.assertIsNot(sentinel, globals()[name])
+
+            # A real error raised where Graph errors are handled is not
+            # swallowed by the sentinels.
+            with self.assertRaises(ValueError):
+                try:
+                    raise ValueError("boom")
+                except (
+                    blocked_cli.ClientAuthenticationError,
+                    blocked_cli.APIError,
+                    httpx.HTTPError,
+                ):
+                    self.fail("a sentinel caught an unrelated exception")
+
+            with self.assertLogs("parsedmarc.log", level="ERROR") as cm:
+                blocked_cli._log_msgraph_failure(
+                    ValueError("no  token"),
+                    stage="connection",
+                    mailbox="reports@example.com",
+                    tenant_id="tenant",
+                    auth_method="ClientSecret",
+                )
+            self.assertIn("ValueError: no token", cm.output[0])
+
+        self.assertIs(
+            parsedmarc.cli.ClientAuthenticationError, ClientAuthenticationError
+        )
+        self.assertIs(parsedmarc.cli.APIError, APIError)
+
+    def test_missing_extra_raises_configuration_error_with_install_hint(self):
+        """A configured output whose module is None names its extra.
+
+        ``None`` is exactly what the import guard leaves behind when the
+        extra is not installed, so patching the module global reproduces
+        that state without reloading. The message must name the INI
+        section and the pip command, and it must be a
+        ``ConfigurationError``: _main() reports those to the user
+        directly, while the ``RuntimeError`` wrappers around each
+        constructor would bury the hint in a traceback.
+        """
+        for module, section, extra, options, _key in self.GUARDED_OUTPUTS:
+            with self.subTest(extra=extra):
+                opts = _output_client_opts(save_aggregate=True, **options)
+                with patch.object(parsedmarc.cli, module, None):
+                    with self.assertRaises(
+                        parsedmarc.cli.ConfigurationError
+                    ) as context:
+                        parsedmarc.cli._init_output_clients(opts)
+                self.assertEqual(
+                    str(context.exception),
+                    f"The [{section}] configuration section requires the {extra} "
+                    f"extra: pip install parsedmarc[{extra}]",
+                )
+
+    def test_present_extra_initializes_without_the_hint(self):
+        """The same config is accepted when the module is importable.
+
+        The negative half of the test above: the check must key on the
+        module being absent, not on the section being configured. The
+        module is replaced by a mock so no client opens a real
+        connection, and the client the section asks for is the only one
+        built.
+        """
+        for module, _section, extra, options, key in self.GUARDED_OUTPUTS:
+            with self.subTest(extra=extra):
+                opts = _output_client_opts(save_aggregate=True, **options)
+                with patch.object(parsedmarc.cli, module, MagicMock()):
+                    clients = parsedmarc.cli._init_output_clients(opts)
+                self.assertEqual(sorted(clients), [key] if key else [])
+
+    def test_log_analytics_extra_is_checked_before_reports_are_parsed(self):
+        """The Log Analytics client is built per batch, checked at startup.
+
+        ``process_reports()`` constructs ``LogAnalyticsClient`` for every
+        batch under ``opts.la_dce``, long after reports have been fetched
+        and parsed. The presence check therefore lives in
+        ``_init_output_clients()``, which runs before any mailbox is
+        opened and again on a SIGHUP reload, so a missing extra is
+        reported immediately instead of once there is data to lose. With
+        no ``la_dce`` configured, a missing module is not an error at all.
+        """
+        with patch.object(parsedmarc.cli, "loganalytics", None):
+            self.assertEqual(
+                parsedmarc.cli._init_output_clients(_output_client_opts()), {}
             )
-        sent = parent_conn.recv()
-        self.assertEqual(sent[0], {"report_type": "aggregate", "report": {}})
-        self.assertEqual(sent[1], "/path/to/report.xml")
 
-    def test_cli_parse_sends_error_on_parser_error(self):
-        from multiprocessing import Pipe
-        from unittest.mock import patch
-        from parsedmarc.cli import cli_parse
-        from parsedmarc import ParserError
+    def test_missing_postgresql_extra_raises_configuration_error(self):
+        """A configured [postgresql] section without psycopg fails fast.
 
-        parent_conn, child_conn = Pipe()
-        with patch("parsedmarc.cli.parse_report_file") as mock_parse:
-            err = ParserError("bad report")
-            mock_parse.side_effect = err
-            cli_parse(
-                "/bad.xml",
-                False,
-                None,
-                2.0,
-                0,
-                None,
-                True,
-                True,
-                None,
-                None,
-                24.0,
-                child_conn,
-            )
-        sent = parent_conn.recv()
-        self.assertIsInstance(sent[0], ParserError)
-        self.assertEqual(sent[1], "/bad.xml")
+        postgres.py guards its own psycopg import, so the module is
+        always importable and ``postgres.psycopg is None`` is exactly the
+        missing-extra state. Without the presence check the constructor's
+        PostgreSQLError became a RuntimeError that the startup retry loop
+        retried for over a minute before exiting; a ConfigurationError
+        exits immediately with the install hint. The negative half:
+        with psycopg present, the same opts build the client.
+        """
+        opts = _output_client_opts(postgresql_host="db.example.com")
+        with patch.object(parsedmarc.cli.postgres, "psycopg", None):
+            with self.assertRaises(parsedmarc.cli.ConfigurationError) as context:
+                parsedmarc.cli._init_output_clients(opts)
+        self.assertEqual(
+            str(context.exception),
+            "The [postgresql] configuration section requires the postgresql "
+            "extra: pip install parsedmarc[postgresql]",
+        )
+        with (
+            patch.object(parsedmarc.cli.postgres, "psycopg", MagicMock()),
+            patch.object(parsedmarc.cli.postgres, "PostgreSQLClient") as mock_client,
+        ):
+            clients = parsedmarc.cli._init_output_clients(opts)
+        self.assertEqual(sorted(clients), ["postgresql_client"])
+        self.assertIs(clients["postgresql_client"], mock_client.return_value)
+
+    def test_missing_mailbox_extras_fail_fast_at_config_time(self):
+        """[msgraph]/[gmail_api] sections without their extra fail in
+        _parse_config with parsedmarc's own install hint.
+
+        Without the extra, parsedmarc.mail binds placeholder connection
+        classes outside the MailboxConnection hierarchy whose
+        construction raises mailsuite's ImportError — which named
+        mailsuite's extra, not parsedmarc's, and surfaced as a logged
+        traceback long after config parsing. The subclass check turns
+        that into an immediate ConfigurationError naming the parsedmarc
+        extra. The check reads parsedmarc.mail's own attributes — the
+        authoritative placeholder state — not cli's rebound names, which
+        other tests replace with MagicMock instances that issubclass()
+        would reject. The negative half — real classes pass the check —
+        is covered by every existing msgraph/gmail_api _parse_config
+        test, which runs with the real mailsuite classes imported.
+        """
+        from parsedmarc.cli import _parse_config
+
+        class _Placeholder:
+            """Stand-in for the parsedmarc.mail missing-extra placeholder."""
+
+        cases = (
+            ("MSGraphConnection", "msgraph", "msgraph"),
+            ("GmailConnection", "gmail_api", "gmail"),
+        )
+        for class_name, section, extra in cases:
+            with self.subTest(section=section):
+                cp = _config_with(section, {})
+                with patch.object(parsedmarc.mail, class_name, _Placeholder):
+                    with self.assertRaises(
+                        parsedmarc.cli.ConfigurationError
+                    ) as context:
+                        _parse_config(cp, _opts())
+                self.assertEqual(
+                    str(context.exception),
+                    f"The [{section}] configuration section requires the {extra} "
+                    f"extra: pip install parsedmarc[{extra}]",
+                )
 
 
 if __name__ == "__main__":

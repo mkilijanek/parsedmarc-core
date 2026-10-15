@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import TypedDict, cast
+from urllib.parse import urlsplit
 
 import mailparser
 from expiringdict import ExpiringDict
@@ -28,11 +29,15 @@ from importlib.resources import files
 
 
 import dns.exception
+import dns.inet
+import dns.message
+import dns.nameserver
+import dns.query
 import dns.resolver
 import dns.reversename
+import httpx
 import maxminddb
 import publicsuffixlist
-import requests
 from dateutil.parser import parse as parse_date
 
 import parsedmarc.resources.ipinfo
@@ -52,6 +57,11 @@ _RETRYABLE_DNS_ERRORS = (
     dns.resolver.NoNameservers,
     OSError,
 )
+
+# The process-wide httpx client used for DNS over HTTPS queries, and the PID
+# it was created under. See _get_doh_session().
+_DOH_SESSION: httpx.Client | None = None
+_DOH_SESSION_PID: int | None = None
 
 parenthesis_regex = re.compile(r"\s*\(.*\)\s*")
 
@@ -81,7 +91,7 @@ def load_psl_overrides(
         always_use_local_file (bool): Always use a local overrides file
         local_file_path (str): Path to a local overrides file
         url (str): URL to a PSL overrides file
-        offline (bool): Use the built-in copy of the overrides
+        offline (bool): Do not make online requests
 
     Returns:
         list[str]: the module-level ``psl_overrides`` list
@@ -105,10 +115,12 @@ def load_psl_overrides(
         try:
             logger.debug(f"Trying to fetch PSL overrides from {url}...")
             headers = {"User-Agent": USER_AGENT}
-            response = requests.get(url, headers=headers)
+            response = httpx.get(
+                url, headers=headers, timeout=60, follow_redirects=True
+            )
             response.raise_for_status()
             _load_text(response.text)
-        except requests.exceptions.RequestException as e:
+        except httpx.HTTPError as e:
             logger.warning(f"Failed to fetch PSL overrides: {e}")
 
     if len(psl_overrides) == 0:
@@ -185,7 +197,8 @@ def get_base_domain(domain: str) -> str | None:
         domain (str): A domain or subdomain
 
     Returns:
-        str: The base domain of the given domain
+        str: The base domain of the given domain, or ``None`` if one
+        cannot be determined
 
     """
     domain = domain.lower()
@@ -194,6 +207,170 @@ def get_base_domain(domain: str) -> str | None:
         if domain.endswith(override):
             return override.strip(".").strip("-")
     return publicsuffix
+
+
+def _get_doh_session() -> httpx.Client:
+    """
+    Returns the shared ``httpx.Client`` used for DNS over HTTPS queries.
+
+    The client is created on first use and reused afterwards, so DoH queries
+    share TLS connections instead of renegotiating one per lookup. It is
+    deliberately never closed: like the module's other shared state, it lives
+    for the life of the process.
+
+    The client is rebuilt when the current PID differs from the one it was
+    created under, because a ``fork()``-based worker pool (``n_procs``) would
+    otherwise inherit — and concurrently use — the parent's sockets.
+
+    ``httpx.Client`` defaults are what make this work behind a corporate
+    proxy: ``trust_env=True`` honors ``HTTP_PROXY``/``HTTPS_PROXY``/
+    ``NO_PROXY`` and ``SSL_CERT_FILE``/``SSL_CERT_DIR``, and ``verify=True``
+    keeps certificate verification on. Neither is overridden here.
+
+    Returns:
+        httpx.Client: The shared DoH client for this process
+    """
+    global _DOH_SESSION, _DOH_SESSION_PID
+    pid = os.getpid()
+    if _DOH_SESSION is None or _DOH_SESSION_PID != pid:
+        _DOH_SESSION = httpx.Client(http1=True, http2=True)
+        _DOH_SESSION_PID = pid
+    return _DOH_SESSION
+
+
+class _SessionDoHNameserver(dns.nameserver.DoHNameserver):
+    """
+    A DNS over HTTPS nameserver that queries through a shared ``httpx``
+    client.
+
+    dnspython's stock ``DoHNameserver`` calls ``dns.query.https()`` without a
+    ``session``, which makes that function build an ``httpx.Client`` with its
+    own custom transport — and httpx only reads proxy environment variables
+    when no transport is supplied (``allow_env_proxies = trust_env and
+    transport is None``). Stock DoH therefore ignores ``HTTPS_PROXY``
+    entirely — and a proxy is the only way out of the networks this exists
+    for (https://github.com/domainaware/parsedmarc/issues/880).
+
+    Passing our own session instead gets environment proxies, environment CA
+    configuration (``SSL_CERT_FILE``), and connection reuse across queries.
+    ``bootstrap_address`` is deliberately not passed: with a session, the DoH
+    server's hostname is resolved by httpx — locally through the OS resolver,
+    or by the proxy itself via ``CONNECT`` when one is configured — so no
+    UDP/53 access is required.
+    """
+
+    def query(
+        self,
+        request: dns.message.QueryMessage,
+        timeout: float,
+        source: str | None,
+        source_port: int,
+        max_size: bool = False,
+        one_rr_per_rrset: bool = False,
+        ignore_trailing: bool = False,
+    ) -> dns.message.Message:
+        return dns.query.https(
+            request,
+            self.url,
+            timeout=timeout,
+            source=source,
+            source_port=source_port,
+            one_rr_per_rrset=one_rr_per_rrset,
+            ignore_trailing=ignore_trailing,
+            verify=self.verify,
+            post=(not self.want_get),
+            http_version=self.http_version,
+            session=_get_doh_session(),
+        )
+
+
+def _parse_dot_nameserver(entry: str) -> dns.nameserver.DoTNameserver:
+    """
+    Parses a ``tls://ip[:port][#hostname]`` nameserver entry.
+
+    The optional ``#hostname`` suffix names the TLS certificate identity to
+    use for SNI and verification, matching systemd-resolved's syntax.
+
+    Args:
+        entry (str): A ``tls://`` nameserver entry
+
+    Returns:
+        dns.nameserver.DoTNameserver: The parsed nameserver
+
+    Raises:
+        ValueError: The entry has no host, an unusable port, a host that
+            is not a literal IP address, or extra URL components
+    """
+    parts = urlsplit(entry)
+    try:
+        port = parts.port
+    except ValueError as e:
+        # urlsplit only validates the port when it is accessed
+        raise ValueError(f"Invalid DNS over TLS nameserver {entry}: {e}") from e
+    if parts.username or parts.path or parts.query:
+        # Catch tls://9.9.9.9/dns.quad9.net — a plausible slash-for-#
+        # typo that would otherwise "work" with no certificate identity
+        # and fail only at query time with an opaque TLS error
+        raise ValueError(
+            f"Invalid DNS over TLS nameserver {entry}: only "
+            "tls://ip[:port][#hostname] is supported — the TLS certificate "
+            "identity is given after #, not /"
+        )
+    address = parts.hostname
+    if not address:
+        raise ValueError(f"Invalid DNS over TLS nameserver {entry}: missing IP address")
+    if not dns.inet.is_address(address):
+        raise ValueError(
+            f"Invalid DNS over TLS nameserver {entry}: {address} is not an IP "
+            "address. Use tls://ip[:port][#hostname], where the optional "
+            "#hostname is the TLS certificate identity of the server"
+        )
+    hostname = parts.fragment or None
+    if port is None:
+        return dns.nameserver.DoTNameserver(address, hostname=hostname)
+    return dns.nameserver.DoTNameserver(address, port, hostname)
+
+
+def _nameservers_to_resolver_input(
+    nameservers: list[str],
+) -> list[str | dns.nameserver.Nameserver]:
+    """
+    Converts configured nameserver strings into values that
+    ``dns.resolver.Resolver.nameservers`` accepts.
+
+    ``https://`` entries become DNS over HTTPS nameservers that share this
+    process's ``httpx`` client (so proxy and CA environment variables apply),
+    and ``tls://ip[:port][#hostname]`` entries become DNS over TLS
+    nameservers. Everything else — plain IPv4/IPv6 addresses — is passed
+    through untouched, leaving dnspython to enrich and validate it exactly as
+    before.
+
+    Args:
+        nameservers (list[str]): The configured nameservers
+
+    Returns:
+        list: A list of strings and/or ``dns.nameserver.Nameserver`` objects,
+        in the configured order
+
+    Raises:
+        ValueError: A ``tls://`` entry is malformed
+    """
+    resolver_input: list[str | dns.nameserver.Nameserver] = []
+    for entry in nameservers:
+        try:
+            # urlsplit lowercases the scheme, so HTTPS:// and TLS:// work too
+            scheme = urlsplit(entry).scheme
+        except ValueError:
+            # e.g. an unbalanced IPv6 bracket; let dnspython reject it with
+            # its own message about what a nameserver may be
+            scheme = ""
+        if scheme == "https":
+            resolver_input.append(_SessionDoHNameserver(entry))
+        elif scheme == "tls":
+            resolver_input.append(_parse_dot_nameserver(entry))
+        else:
+            resolver_input.append(entry)
+    return resolver_input
 
 
 def query_dns(
@@ -217,7 +394,12 @@ def query_dns(
             (Cloudflare's public DNS resolvers by default). Pass
             ``parsedmarc.constants.RECOMMENDED_DNS_NAMESERVERS`` for a
             cross-provider mix that fails over when one provider's path is
-            slow or broken.
+            slow or broken. Each entry is an IP address (DNS over UDP/TCP
+            port 53), an ``https://`` URL (DNS over HTTPS, honoring the
+            ``HTTP_PROXY``/``HTTPS_PROXY``/``NO_PROXY`` and ``SSL_CERT_FILE``
+            environment variables), or ``tls://ip[:port][#hostname]`` (DNS
+            over TLS, port 853 by default, with the optional ``#hostname``
+            naming the server's TLS certificate identity).
         timeout (float): Overall DNS lifetime budget in seconds per
             configured nameserver. Per-query UDP attempts are capped at
             ``min(1.0, timeout)`` so dnspython retries within the lifetime on
@@ -235,7 +417,7 @@ def query_dns(
     """
     domain = str(domain).lower()
     record_type = record_type.upper()
-    cache_key = "{0}_{1}".format(domain, record_type)
+    cache_key = f"{domain}_{record_type}"
     if cache:
         cached_records = cache.get(cache_key, None)
         if isinstance(cached_records, list):
@@ -250,7 +432,7 @@ def query_dns(
             "2606:4700:4700::1111",
             "2606:4700:4700::1001",
         ]
-    resolver.nameservers = nameservers
+    resolver.nameservers = _nameservers_to_resolver_input(nameservers)
     # Cap per-query UDP timeout at 1s so dnspython retries within the
     # lifetime window on transient packet loss — otherwise with a single
     # nameserver and timeout == lifetime, one dropped UDP datagram consumes
@@ -391,7 +573,7 @@ def human_timestamp_to_unix_timestamp(
     Converts a human-readable timestamp into a UNIX timestamp
 
     Args:
-        human_timestamp (str): A timestamp in `YYYY-MM-DD HH:MM:SS`` format
+        human_timestamp (str): A timestamp in ``YYYY-MM-DD HH:MM:SS`` format
         assume_utc (bool): Treat a timestamp that carries no UTC offset as
             UTC wall-clock time instead of local time
 
@@ -420,7 +602,9 @@ def load_ip_db(
 ) -> None:
     """
     Downloads the IP-to-country MMDB database from a URL and caches it
-    locally. Falls back to the bundled copy on failure or when offline.
+    locally. An existing ``local_file_path`` is used as-is, with no
+    download. On download failure (or when offline), a previously cached
+    download is used if available, falling back to the bundled copy.
 
     Args:
         always_use_local_file: Always use a local/bundled database file
@@ -449,7 +633,9 @@ def load_ip_db(
         try:
             logger.debug(f"Trying to fetch IP database from {url}...")
             headers = {"User-Agent": USER_AGENT}
-            response = requests.get(url, headers=headers, timeout=60)
+            response = httpx.get(
+                url, headers=headers, timeout=60, follow_redirects=True
+            )
             response.raise_for_status()
             os.makedirs(cache_dir, exist_ok=True)
             tmp_path = cached_path + ".tmp"
@@ -459,7 +645,7 @@ def load_ip_db(
             _IP_DB_PATH = cached_path
             logger.info("IP database updated successfully")
             return
-        except requests.exceptions.RequestException as e:
+        except httpx.HTTPError as e:
             logger.warning(f"Failed to fetch IP database: {e}")
         except Exception as e:
             logger.warning(f"Failed to save IP database: {e}")
@@ -508,9 +694,9 @@ def configure_ipinfo_api(
     """Configure the IPinfo Lite REST API as the primary source for IP lookups.
 
     When a token is configured, ``get_ip_address_db_record()`` hits the API
-    first for every lookup and falls back to the MMDB on network errors. An
-    invalid token raises ``InvalidIPinfoAPIKey`` — the CLI catches that and
-    exits fatally.
+    first for every lookup and falls back to the MMDB on network errors or
+    non-2xx responses. An invalid token raises ``InvalidIPinfoAPIKey`` — the
+    CLI catches that and exits fatally.
 
     Args:
         token: IPinfo API token. ``None`` or empty disables the API.
@@ -537,8 +723,9 @@ def configure_ipinfo_api(
 def _ipinfo_api_lookup(ip_address: str) -> _IPDatabaseRecord | None:
     """Look up an IP via the IPinfo Lite REST API.
 
-    Returns the normalized record on success, or ``None`` on network error or
-    any non-2xx response (other than 401/403). 401/403 raises
+    Returns the normalized record on success, or ``None`` when no token is
+    configured, on network error, on a malformed response body, or on any
+    non-2xx response other than 401/403. 401/403 raises
     ``InvalidIPinfoAPIKey``.
     """
     if not _IPINFO_API_TOKEN:
@@ -548,10 +735,14 @@ def _ipinfo_api_lookup(ip_address: str) -> _IPDatabaseRecord | None:
     params = {"token": _IPINFO_API_TOKEN}
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     try:
-        response = requests.get(
-            url, headers=headers, params=params, timeout=_IPINFO_API_TIMEOUT
+        response = httpx.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=_IPINFO_API_TIMEOUT,
+            follow_redirects=True,
         )
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPError as e:
         logger.debug(f"IPinfo API request for {ip_address} failed: {e}")
         return None
 
@@ -559,7 +750,7 @@ def _ipinfo_api_lookup(ip_address: str) -> _IPDatabaseRecord | None:
         raise InvalidIPinfoAPIKey(
             f"IPinfo API rejected the configured token (HTTP {response.status_code})"
         )
-    if not response.ok:
+    if not response.is_success:
         logger.debug(
             f"IPinfo API returned HTTP {response.status_code} for {ip_address}"
         )
@@ -696,13 +887,14 @@ def get_ip_address_db_record(
     """Look up an IP and return country + ASN fields.
 
     If the IPinfo Lite API is configured via ``configure_ipinfo_api()``, the
-    API is queried first; any non-fatal failure (rate limit, quota, network)
-    falls through to the MMDB. An invalid API token raises
-    ``InvalidIPinfoAPIKey`` and is not caught here.
+    API is queried first; any non-fatal failure (a network error, or a
+    non-2xx response other than 401/403) falls through to the MMDB. An
+    invalid API token raises ``InvalidIPinfoAPIKey`` and is not caught here.
 
-    IPinfo Lite carries ``country_code``, ``as_name``, and ``as_domain`` on
-    every record. MaxMind/DBIP country-only databases carry only country, so
-    ``as_name`` / ``as_domain`` come back None for those users.
+    IPinfo Lite carries ``country_code``, ``asn``, ``as_name``, and
+    ``as_domain`` on every record. MaxMind/DBIP country-only databases carry
+    only country, so ``asn`` / ``as_name`` / ``as_domain`` come back None
+    for those users.
     """
     api_record = _ipinfo_api_lookup(ip_address)
     if api_record is not None:
@@ -733,7 +925,8 @@ def get_ip_address_country(
         db_path (str): Path to a MMDB file from IPinfo, MaxMind, or DBIP
 
     Returns:
-        str: And ISO country code associated with the given IP address
+        str: An ISO country code associated with the given IP address,
+        or ``None`` if the country is unknown
     """
     return get_ip_address_db_record(ip_address, db_path=db_path)["country"]
 
@@ -751,9 +944,9 @@ def load_reverse_dns_map(
     """
     Loads the reverse DNS map from a URL or local file.
 
-    Clears and repopulates the given map dict in place. If the map is
-    fetched from a URL, that is tried first; on failure (or if offline/local
-    mode is selected) the bundled CSV is used as a fallback.
+    Clears and repopulates the given map dict in place. The URL is tried
+    first; on failure (or when ``offline``/``always_use_local_file`` is set)
+    the local path is used, defaulting to the bundled CSV.
 
     ``psl_overrides.txt`` is reloaded at the same time using the same
     ``offline`` / ``always_use_local_file`` flags (with separate path/URL
@@ -765,7 +958,7 @@ def load_reverse_dns_map(
         always_use_local_file (bool): Always use a local map file
         local_file_path (str): Path to a local map file
         url (str): URL to a reverse DNS map
-        offline (bool): Use the built-in copy of the reverse DNS map
+        offline (bool): Do not make online requests
         psl_overrides_path (str): Path to a local PSL overrides file
         psl_overrides_url (str): URL to a PSL overrides file
     """
@@ -802,12 +995,14 @@ def load_reverse_dns_map(
         try:
             logger.debug(f"Trying to fetch reverse DNS map from {url}...")
             headers = {"User-Agent": USER_AGENT}
-            response = requests.get(url, headers=headers)
+            response = httpx.get(
+                url, headers=headers, timeout=60, follow_redirects=True
+            )
             response.raise_for_status()
             csv_file.write(response.text)
             csv_file.seek(0)
             load_csv(csv_file)
-        except requests.exceptions.RequestException as e:
+        except httpx.HTTPError as e:
             logger.warning(f"Failed to fetch reverse DNS map: {e}")
         except Exception:
             logger.warning("Not a valid CSV file")
@@ -834,6 +1029,8 @@ def get_service_from_reverse_dns_base_domain(
     url: str | None = None,
     offline: bool = False,
     reverse_dns_map: ReverseDNSMap | None = None,
+    psl_overrides_path: str | None = None,
+    psl_overrides_url: str | None = None,
 ) -> ReverseDNSService:
     """
     Returns the service name of a given base domain name from reverse DNS.
@@ -842,13 +1039,16 @@ def get_service_from_reverse_dns_base_domain(
         base_domain (str): The base domain of the reverse DNS lookup
         always_use_local_file (bool): Always use a local map file
         local_file_path (str): Path to a local map file
-        url (str): URL ro a reverse DNS map
-        offline (bool): Use the built-in copy of the reverse DNS map
+        url (str): URL to a reverse DNS map
+        offline (bool): Do not make online requests
         reverse_dns_map (dict): A reverse DNS map
+        psl_overrides_path (str): Path to a local PSL overrides file
+        psl_overrides_url (str): URL to a PSL overrides file
+
     Returns:
         dict: A dictionary containing name and type.
         If the service is unknown, the name will be
-        the supplied reverse_dns_base_domain and the type will be None
+        the supplied ``base_domain`` and the type will be None
     """
 
     base_domain = base_domain.lower().strip()
@@ -865,6 +1065,8 @@ def get_service_from_reverse_dns_base_domain(
             local_file_path=local_file_path,
             url=url,
             offline=offline,
+            psl_overrides_path=psl_overrides_path,
+            psl_overrides_url=psl_overrides_url,
         )
 
     service: ReverseDNSService
@@ -889,16 +1091,19 @@ def get_ip_address_info(
     nameservers: list[str] | None = None,
     timeout: float = DEFAULT_DNS_TIMEOUT,
     retries: int = DEFAULT_DNS_MAX_RETRIES,
+    psl_overrides_path: str | None = None,
+    psl_overrides_url: str | None = None,
 ) -> IPAddressInfo:
     """
-    Returns reverse DNS and country information for the given IP address
+    Returns reverse DNS, country, ASN, and service information for the
+    given IP address
 
     Args:
         ip_address (str): The IP address to check
-        ip_db_path (str): path to a MMDB file from MaxMind or DBIP
+        ip_db_path (str): Path to a MMDB file from IPinfo, MaxMind, or DBIP
         reverse_dns_map_path (str): Path to a reverse DNS map file
-        reverse_dns_map_url (str): URL to the reverse DNS map file
         always_use_local_files (bool): Do not download files
+        reverse_dns_map_url (str): URL to the reverse DNS map file
         cache (ExpiringDict): Cache storage
         reverse_dns_map (dict): A reverse DNS map
         offline (bool): Do not make online queries for geolocation or DNS
@@ -907,9 +1112,12 @@ def get_ip_address_info(
         timeout (float): Sets the DNS timeout in seconds
         retries (int): Number of times to retry on timeout or other transient
             errors
+        psl_overrides_path (str): Path to a local PSL overrides file
+        psl_overrides_url (str): URL to a PSL overrides file
 
     Returns:
-        dict: ``ip_address``, ``reverse_dns``, ``country``
+        dict: ``ip_address``, ``reverse_dns``, ``country``, ``base_domain``,
+        ``name``, ``type``, ``asn``, ``as_name``, ``as_domain``
 
     """
     ip_address = ip_address.lower()
@@ -959,6 +1167,8 @@ def get_ip_address_info(
                 url=reverse_dns_map_url,
                 always_use_local_file=always_use_local_files,
                 reverse_dns_map=reverse_dns_map,
+                psl_overrides_path=psl_overrides_path,
+                psl_overrides_url=psl_overrides_url,
             )
             info["base_domain"] = base_domain
             info["type"] = service["type"]
@@ -978,6 +1188,8 @@ def get_ip_address_info(
                 local_file_path=reverse_dns_map_path,
                 url=reverse_dns_map_url,
                 offline=offline,
+                psl_overrides_path=psl_overrides_path,
+                psl_overrides_url=psl_overrides_url,
             )
         if info["as_domain"] and info["as_domain"] in map_value:
             service = map_value[info["as_domain"]]
@@ -1031,37 +1243,54 @@ def parse_email_address(original_address: str) -> dict[str, str | None]:
     }
 
 
-def get_filename_safe_string(string: str) -> str:
+def get_filename_safe_string(string: str | None) -> str:
     """
-    Converts a string to a string that is safe for a filename
+    Converts a string to a string that is safe to use as a filename
+
+    The returned string is a single path component, never a path: it
+    contains no path separator (``/`` or ``\\``), no drive separator
+    (``:``), and no NUL byte, so it cannot be absolute, drive-relative, or
+    escape the directory it is joined to. It never ends in ``.`` or a
+    space (Windows drops both when creating a file, which would make two
+    distinct subjects collide on one name), and it is never ``.`` or ``..``
+    (both consist only of stripped characters and collapse to ``""``). It
+    is at most 100 characters long. It can be empty -- when the input is
+    empty, consists only of stripped characters, or is truncated to a run
+    of dots and spaces -- so callers that need a non-empty name must supply
+    their own fallback (e.g. ``get_filename_safe_string(subject) or
+    "sample"``). Windows reserved device names such as ``CON`` are not
+    rewritten.
 
     Args:
-        string (str): A string to make safe for a filename
+        string (str | None): A string to make safe for a filename.
+            ``None`` is treated as the literal string ``"None"``.
 
     Returns:
         str: A string safe for a filename
     """
-    invalid_filename_chars = ["\\", "/", ":", '"', "*", "?", "|", "\n", "\r"]
+    invalid_filename_chars = ["\\", "/", ":", '"', "*", "?", "|", "\n", "\r", "\x00"]
     if string is None:
         string = "None"
     for char in invalid_filename_chars:
         string = string.replace(char, "")
-    string = string.rstrip(".")
 
+    # Truncate before stripping trailing dots and spaces, so that a name cut
+    # off just after one cannot end in it.
     string = (string[:100]) if len(string) > 100 else string
+    string = string.rstrip(". ")
 
     return string
 
 
 def is_mbox(path: str) -> bool:
     """
-    Checks if the given content is an MBOX mailbox file
+    Checks if the file at the given path is an mbox mailbox file
 
     Args:
-        path: Content to check
+        path (str): Path to the file to check
 
     Returns:
-        bool: A flag that indicates if the file is an MBOX mailbox file
+        bool: A flag that indicates if the file is an mbox mailbox file
     """
     _is_mbox = False
     try:
@@ -1069,7 +1298,7 @@ def is_mbox(path: str) -> bool:
         if len(mbox.keys()) > 0:
             _is_mbox = True
     except Exception as e:
-        logger.debug("Error checking for MBOX file: {0}".format(e.__str__()))
+        logger.debug(f"Error checking for MBOX file: {e.__str__()}")
 
     return _is_mbox
 
@@ -1091,14 +1320,18 @@ def is_outlook_msg(content) -> bool:
 
 def convert_outlook_msg(msg_bytes: bytes) -> bytes:
     """
-    Uses the ``msgconvert`` Perl utility to convert an Outlook MS file to
+    Uses the ``msgconvert`` Perl utility to convert an Outlook MSG file to
     standard RFC 822 format
 
     Args:
         msg_bytes (bytes): the content of the .msg file
 
     Returns:
-        A RFC 822 bytes payload
+        An RFC 822 bytes payload
+
+    Raises:
+        ValueError: The supplied bytes are not an Outlook MSG file
+        EmailParserError: The ``msgconvert`` utility is not installed
     """
     if not is_outlook_msg(msg_bytes):
         raise ValueError("The supplied bytes are not an Outlook MSG file")
@@ -1204,35 +1437,29 @@ def parse_email(data: bytes | str, *, strip_attachment_payloads: bool = False) -
     # single representation, matching how "to"/"cc"/"bcc" are handled.
     if "reply-to" in parsed_email:
         parsed_email["reply_to"] = list(
-            map(lambda x: parse_email_address(x), parsed_email.pop("reply-to"))
+            map(parse_email_address, parsed_email.pop("reply-to"))
         )
     else:
         parsed_email["reply_to"] = []
 
     if "to" in parsed_email:
-        parsed_email["to"] = list(
-            map(lambda x: parse_email_address(x), parsed_email["to"])
-        )
+        parsed_email["to"] = list(map(parse_email_address, parsed_email["to"]))
     else:
         parsed_email["to"] = []
 
     if "cc" in parsed_email:
-        parsed_email["cc"] = list(
-            map(lambda x: parse_email_address(x), parsed_email["cc"])
-        )
+        parsed_email["cc"] = list(map(parse_email_address, parsed_email["cc"]))
     else:
         parsed_email["cc"] = []
 
     if "bcc" in parsed_email:
-        parsed_email["bcc"] = list(
-            map(lambda x: parse_email_address(x), parsed_email["bcc"])
-        )
+        parsed_email["bcc"] = list(map(parse_email_address, parsed_email["bcc"]))
     else:
         parsed_email["bcc"] = []
 
     if "delivered-to" in parsed_email:
         parsed_email["delivered_to"] = list(
-            map(lambda x: parse_email_address(x), parsed_email.pop("delivered-to"))
+            map(parse_email_address, parsed_email.pop("delivered-to"))
         )
 
     if "attachments" not in parsed_email:
@@ -1249,7 +1476,7 @@ def parse_email(data: bytes | str, *, strip_attachment_payloads: bool = False) -
                             payload = str.encode(payload)
                     attachment["sha256"] = hashlib.sha256(payload).hexdigest()
                 except Exception as e:
-                    logger.debug("Unable to decode attachment: {0}".format(e.__str__()))
+                    logger.debug(f"Unable to decode attachment: {e.__str__()}")
         if strip_attachment_payloads:
             for attachment in parsed_email["attachments"]:
                 if "payload" in attachment:
