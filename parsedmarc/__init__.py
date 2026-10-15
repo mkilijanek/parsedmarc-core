@@ -17,6 +17,7 @@ import os
 import quopri
 import re
 import shutil
+import string
 import tempfile
 import traceback
 import xml.parsers.expat as expat
@@ -87,9 +88,9 @@ logger.debug(f"parsedmarc v{__version__}")
 # before the CR, so the value must exclude the line ending explicitly rather
 # than relying on ``.`` — otherwise every field value keeps a trailing CR.
 feedback_report_regex = re.compile(r"^([\w\-]+): ([^\r\n]+)\r?$", re.MULTILINE)
+_TEXT_REPORT_NAME_CHARS = frozenset(string.ascii_letters + " \t")
 xml_header_regex = re.compile(r"^<\?xml .*?>", re.MULTILINE)
 xml_schema_regex = re.compile(r"</??xs:schema.*>", re.MULTILINE)
-text_report_regex = re.compile(r"\s*([a-zA-Z\s]+):\s(.+)", re.MULTILINE)
 # Captures the value of any xmlns (default or prefixed) declaration so the
 # RFC 9990 namespace can be detected before xmltodict drops it.
 xml_namespace_regex = re.compile(
@@ -2046,6 +2047,36 @@ def _decode_mime_payload(part: email.message.Message, fallback: str) -> str:
         return fallback
 
 
+def _parse_text_report_fields(text: str) -> dict[str, str]:
+    """Extract ``Field Name: value`` lines from a plain-text failure report.
+
+    Linear-time replacement for the former ``\\s*([a-zA-Z\\s]+):\\s(.+)``
+    regex, whose overlapping ``\\s*`` and ``[a-zA-Z\\s]+`` backtracked
+    catastrophically on whitespace with no colon (a ReDoS).
+
+    A line is a field when it has a colon, the text before it is non-empty
+    and made only of ASCII letters and spaces/tabs, and the colon is followed
+    by a whitespace character and at least one more character. Field names
+    are lowercased with spaces replaced by hyphens; values are stripped.
+
+    Args:
+        text (str): The text before the "detected." marker.
+
+    Returns:
+        dict[str, str]: Field names mapped to values (last occurrence wins).
+    """
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        name, sep, rest = line.partition(":")
+        if not sep or len(rest) < 2 or not rest[0].isspace():
+            continue
+        name = name.strip()
+        if not name or not all(c in _TEXT_REPORT_NAME_CHARS for c in name):
+            continue
+        fields[name.lower().replace(" ", "-")] = rest.strip()
+    return fields
+
+
 def parse_report_email(
     input_: bytes | str,
     *,
@@ -2180,11 +2211,7 @@ def parse_report_email(
             if "A message claiming to be from you has failed" in payload:
                 try:
                     parts = payload.split("detected.", 1)
-                    field_matches = text_report_regex.findall(parts[0])
-                    fields = dict()
-                    for match in field_matches:
-                        field_name = match[0].lower().replace(" ", "-")
-                        fields[field_name] = match[1].strip()
+                    fields = _parse_text_report_fields(parts[0])
 
                     feedback_report = "Arrival-Date: {}\nSource-IP: {}".format(
                         fields["received-date"], fields["sender-ip-address"]

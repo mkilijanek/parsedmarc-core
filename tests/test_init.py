@@ -16,6 +16,7 @@ import logging
 import mailbox
 import os
 import quopri
+import time
 import unittest
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -339,6 +340,87 @@ class Test(unittest.TestCase):
         assert report["feedback_type"] == "auth-failure"
         assert "authentication_results" in report
         assert report["source"]["ip_address"] == "203.0.113.68"
+
+    def testPlainTextFailureReportFieldsParsed(self):
+        """A well-formed ``text/plain`` failure report still yields its fields.
+
+        The plain-text field extraction used to be the regex
+        ``\\s*([a-zA-Z\\s]+):\\s(.+)``; the linear line parser replacing it
+        must keep producing the same ``Received date`` / ``Sender IP Address``
+        values the failure report is built from."""
+        message = (
+            "From: no-reply@example.net\r\n"
+            "To: dmarc@example.com\r\n"
+            "Subject: DMARC failure report\r\n"
+            "Content-Type: text/plain; charset=us-ascii\r\n\r\n"
+            "A message claiming to be from you has failed the published "
+            "DMARC policy for your domain.\r\n\r\n"
+            "  Sender Domain: example.com\r\n"
+            "  Sender IP Address: 203.0.113.68\r\n"
+            "  Received date: Mon, 07 Apr 2025 23:16:09 +0200\r\n"
+            "  SPF Alignment: no\r\n"
+            "\r\n"
+            "------ This is a copy of the headers that were received before "
+            "the error was detected.\r\n\r\n"
+            "From: user@example.com\r\n"
+            "To: someone@example.org\r\n"
+            "Subject: hi\r\n"
+        )
+        result = parsedmarc.parse_report_email(message, offline=OFFLINE_MODE)
+        self.assertEqual(result["report_type"], "failure")
+        report = cast(FailureReport, result["report"])
+        self.assertEqual(report["source"]["ip_address"], "203.0.113.68")
+        self.assertEqual(report["arrival_date"], "Mon, 07 Apr 2025 23:16:09 +0200")
+
+    def testParseTextReportFieldsLineRules(self):
+        """``_parse_text_report_fields`` keeps only ``Letters Only: value`` lines.
+
+        Names with non-letter characters, a colon without a following
+        whitespace character and value, and a value on the next line are
+        all skipped; names are lowercased and hyphenated."""
+        fields = parsedmarc._parse_text_report_fields(
+            "  Sender IP Address: 203.0.113.68\n"
+            "X-Header-1: digits and hyphens\n"
+            "Time:12:00\n"
+            "Empty:\n"
+            "Next Line:\n  value\n"
+            "Received date: Mon, 07 Apr 2025\r\n"
+        )
+        self.assertEqual(
+            fields,
+            {
+                "sender-ip-address": "203.0.113.68",
+                "received-date": "Mon, 07 Apr 2025",
+            },
+        )
+
+    def testPlainTextFailureReportWhitespaceNoBacktracking(self):
+        """A ``text/plain`` failure report padded with whitespace and no
+        colon is rejected promptly instead of hanging the parser.
+
+        The old ``\\s*([a-zA-Z\\s]+):\\s(.+)`` regex had overlapping ``\\s*``
+        and ``[a-zA-Z\\s]+``, and ``findall`` retries at every offset, so a
+        whitespace run with no colon backtracked catastrophically (ReDoS):
+        measured 0.28 s for 500 spaces, 2.3 s for 1000, ~18 s for 2000, and
+        hours for tens of KB. Anyone able to email the mailbox could stall the
+        parser. The input here is ~50 KB, which took hours before; the 5
+        second bound is generous for the linear parser (milliseconds) and only
+        guards against reintroducing super-linear behavior. The missing
+        required fields surface as ``InvalidDMARCReport`` like any other
+        malformed text report."""
+        padding = (" " * 60 + "\r\n") * 800
+        message = (
+            "From: attacker@example.net\r\n"
+            "To: dmarc@example.com\r\n"
+            "Subject: DMARC failure report\r\n"
+            "Content-Type: text/plain; charset=us-ascii\r\n\r\n"
+            "A message claiming to be from you has failed the published "
+            "DMARC policy for your domain.\r\n" + padding + "detected.\r\n"
+        )
+        start = time.monotonic()
+        with self.assertRaises(parsedmarc.InvalidDMARCReport):
+            parsedmarc.parse_report_email(message, offline=OFFLINE_MODE)
+        self.assertLess(time.monotonic() - start, 5.0)
 
     def testFailureSampleQuotedPrintableSamplePart(self):
         """A quoted-printable ``text/rfc822-headers`` sample part is decoded
