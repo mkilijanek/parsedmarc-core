@@ -31,6 +31,7 @@ from tempfile import NamedTemporaryFile, mkdtemp
 from typing import BinaryIO, cast
 from unittest.mock import MagicMock, patch
 
+import dns.resolver
 from lxml import etree  # type: ignore[import-untyped]
 
 import parsedmarc
@@ -42,6 +43,7 @@ from parsedmarc.types import (
     ParsingResults,
     SMTPTLSReport,
 )
+from tests.dnsfake import FakeDNS
 
 # Detect if running in GitHub Actions to skip DNS lookups
 OFFLINE_MODE = os.environ.get("GITHUB_ACTIONS", "false").lower() == "true"
@@ -2833,6 +2835,201 @@ class TestPolicyPublishedEdgeCases(unittest.TestCase):
         report = parsedmarc.parse_aggregate_report_xml(xml, offline=True)
         # At least the valid record should be parsed
         self.assertGreaterEqual(len(report["records"]), 1)
+
+
+class TestDmarcLookupPolicy(unittest.TestCase):
+    """``ParserConfig.dmarc_lookup_policy``: parse_aggregate_report_xml
+    compares policy_published with the DMARC policy currently published in
+    DNS (RFC 9989 §4.10 discovery) and logs a warning on a difference. DNS
+    is faked at the dnspython boundary (see tests/dnsfake.py); every name
+    outside the fake zone, including the reverse DNS lookups of the record
+    source IPs, is NXDOMAIN."""
+
+    XML = """<?xml version="1.0"?>
+<feedback>
+  <report_metadata>
+    <org_name>reporter.example</org_name>
+    <email>dmarc@reporter.example</email>
+    <report_id>lookup-1</report_id>
+    <date_range><begin>1680000000</begin><end>1680086400</end></date_range>
+  </report_metadata>
+  <policy_published>
+    <domain>example.com</domain>
+    {policy}
+  </policy_published>
+  <record>
+    <row><source_ip>203.0.113.1</source_ip><count>1</count>
+      <policy_evaluated><disposition>none</disposition><dkim>pass</dkim><spf>pass</spf></policy_evaluated>
+    </row>
+    <identifiers><header_from>example.com</header_from></identifiers>
+    <auth_results><spf><domain>example.com</domain><result>pass</result></spf></auth_results>
+  </record>
+</feedback>"""
+
+    def _parse(self, zone: FakeDNS, policy: str, **config_options):
+        options = {
+            "dmarc_lookup_policy": True,
+            "always_use_local_files": True,
+            "nameservers": ["192.0.2.53"],
+        }
+        options.update(config_options)
+        config = parsedmarc.ParserConfig(**options)
+        with zone.patch():
+            return parsedmarc.parse_aggregate_report_xml(
+                self.XML.format(policy=policy), config=config
+            )
+
+    def test_matching_policy_logs_no_warning(self):
+        """Effective values are compared: the report's sp (filled from p by
+        the parser when absent) matches DNS's sp-or-p, and adkim/aspf
+        default to "r" on both sides. A report value's case is ignored."""
+        zone = FakeDNS(txt={"_dmarc.example.com": ["v=DMARC1; p=reject; adkim=r"]})
+        with self.assertNoLogs("parsedmarc.log", level="WARNING"):
+            report = self._parse(zone, "<p>Reject</p>")
+        self.assertEqual(zone.names()[0], "_dmarc.example.com")
+        self.assertEqual(report["policy_published"]["p"], "Reject")
+
+    def test_mismatch_logs_one_warning_listing_each_difference(self):
+        zone = FakeDNS(
+            txt={"_dmarc.example.com": ["v=DMARC1; p=reject; sp=quarantine; aspf=s"]}
+        )
+        policy = "<p>none</p><sp>none</sp><adkim>r</adkim><aspf>r</aspf>"
+        with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+            report = self._parse(zone, policy)
+        warnings = [m for m in cm.output if "_dmarc.example.com" in m]
+        self.assertEqual(len(warnings), 1, cm.output)
+        message = warnings[0]
+        self.assertIn("lookup-1", message)
+        self.assertIn("p=none in the report, p=reject in DNS", message)
+        self.assertIn("sp=none in the report, sp=quarantine in DNS", message)
+        self.assertIn("aspf=r in the report, aspf=s in DNS", message)
+        self.assertNotIn("adkim", message)
+        self.assertNotIn("np=", message)
+        # The report keeps what the reporter sent; nothing from DNS is added.
+        self.assertEqual(report["policy_published"]["p"], "none")
+        self.assertEqual(report["policy_published"]["sp"], "none")
+        self.assertEqual(report["policy_published"]["aspf"], "r")
+        self.assertEqual(
+            set(report["policy_published"]),
+            {
+                "domain",
+                "adkim",
+                "aspf",
+                "p",
+                "sp",
+                "pct",
+                "fo",
+                "np",
+                "testing",
+                "discovery_method",
+            },
+        )
+
+    def test_np_compared_only_when_report_has_it(self):
+        """np is compared with DNS's np-or-sp-or-p (RFC 9989 §4.7), and only
+        when the report carries np."""
+        zone = FakeDNS(txt={"_dmarc.example.com": ["v=DMARC1; p=reject; sp=none"]})
+        with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+            self._parse(zone, "<p>reject</p><sp>none</sp><np>reject</np>")
+        self.assertTrue(
+            any("np=reject in the report, np=none in DNS" in m for m in cm.output),
+            cm.output,
+        )
+        zone = FakeDNS(txt={"_dmarc.example.com": ["v=DMARC1; p=reject; np=none"]})
+        with self.assertNoLogs("parsedmarc.log", level="WARNING"):
+            self._parse(zone, "<p>reject</p>")
+        self.assertIn("_dmarc.example.com", zone.names())
+
+    def test_parent_record_mismatch_warning_names_both_domains(self):
+        """With no record at the report's domain, the warning says so and
+        names the parent whose record is the comparison target."""
+        zone = FakeDNS(txt={"_dmarc.example.com": ["v=DMARC1; p=reject"]})
+        xml = self.XML.format(policy="<p>none</p>").replace(
+            "<domain>example.com</domain>", "<domain>mail.example.com</domain>"
+        )
+        config = parsedmarc.ParserConfig(
+            dmarc_lookup_policy=True,
+            always_use_local_files=True,
+            nameservers=["192.0.2.53"],
+        )
+        with zone.patch(), self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+            parsedmarc.parse_aggregate_report_xml(xml, config=config)
+        warnings = [m for m in cm.output if "p=none in the report" in m]
+        self.assertEqual(len(warnings), 1, cm.output)
+        self.assertIn(
+            "No DMARC policy record is currently published at "
+            "_dmarc.mail.example.com, so the comparison is against the record "
+            "at its parent _dmarc.example.com",
+            warnings[0],
+        )
+
+    def test_no_record_in_dns_logs_warning(self):
+        zone = FakeDNS()
+        with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+            report = self._parse(zone, "<p>reject</p>")
+        self.assertTrue(
+            any("No usable DMARC policy record" in m for m in cm.output), cm.output
+        )
+        self.assertEqual(report["policy_published"]["p"], "reject")
+
+    def test_dns_error_never_fails_parsing(self):
+        zone = FakeDNS(errors={"_dmarc.example.com": dns.resolver.NoNameservers()})
+        with self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+            report = self._parse(zone, "<p>reject</p>")
+        self.assertTrue(
+            any(
+                "Could not look up the DMARC policy for example.com" in m
+                for m in cm.output
+            ),
+            cm.output,
+        )
+        self.assertEqual(len(report["records"]), 1)
+
+    def test_invalid_domain_never_fails_parsing(self):
+        zone = FakeDNS()
+        xml_policy = "<p>reject</p>"
+        config = parsedmarc.ParserConfig(
+            dmarc_lookup_policy=True,
+            always_use_local_files=True,
+            nameservers=["192.0.2.53"],
+        )
+        xml = self.XML.format(policy=xml_policy).replace(
+            "<domain>example.com</domain>", "<domain>a..example.com</domain>"
+        )
+        with zone.patch(), self.assertLogs("parsedmarc.log", level="WARNING") as cm:
+            report = parsedmarc.parse_aggregate_report_xml(xml, config=config)
+        self.assertTrue(
+            any("Could not look up the DMARC policy" in m for m in cm.output),
+            cm.output,
+        )
+        self.assertEqual(report["policy_published"]["domain"], "a..example.com")
+
+    def test_empty_domain_skips_lookup(self):
+        zone = FakeDNS()
+        config = parsedmarc.ParserConfig(
+            dmarc_lookup_policy=True,
+            always_use_local_files=True,
+            nameservers=["192.0.2.53"],
+        )
+        xml = self.XML.format(policy="<p>reject</p>").replace(
+            "<domain>example.com</domain>", "<domain></domain>"
+        )
+        with zone.patch(), self.assertNoLogs("parsedmarc.log", level="WARNING"):
+            parsedmarc.parse_aggregate_report_xml(xml, config=config)
+        self.assertEqual(zone.names("TXT"), [])
+
+    def test_no_lookup_when_disabled_or_offline(self):
+        """The option defaults to off, and offline mode wins over it: no
+        _dmarc query reaches the resolver either way."""
+        for options in ({"dmarc_lookup_policy": False}, {"offline": True}):
+            with self.subTest(options=options):
+                zone = FakeDNS()
+                with self.assertNoLogs("parsedmarc.log", level="WARNING"):
+                    self._parse(zone, "<p>reject</p>", **options)
+                self.assertEqual(
+                    [n for n in zone.names() if n.startswith("_dmarc.")], []
+                )
+        self.assertFalse(parsedmarc.ParserConfig().dmarc_lookup_policy)
 
 
 class TestParseReportFile(unittest.TestCase):

@@ -1343,6 +1343,45 @@ class TestQueryDnsRetries(unittest.TestCase):
         self.assertEqual(mock_resolve.call_count, 3)
 
 
+class TestQueryDnsTxt(unittest.TestCase):
+    """query_dns renders TXT answers from their raw character-strings,
+    mocking at the dnspython SDK boundary (Resolver.resolve) with real TXT
+    rdata."""
+
+    @staticmethod
+    def _txt(presentation: str):
+        return dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.TXT, presentation)
+
+    def testMultiStringTxtIsConcatenatedWithoutSeparator(self):
+        """A TXT record longer than 255 bytes is split into several
+        character-strings, which "MUST be concatenated together before use
+        with no intervening whitespace" (RFC 6376 §3.6.2.2; RFC 7208 §3.3
+        says the same for SPF). Rendering with to_text() joined them with a
+        space instead, splitting "reject" into "rej ect"."""
+        answers = [
+            self._txt('"v=DMARC1; p=rej" "ect; rua=mailto:a@ex" "ample.com"'),
+            self._txt('"v=spf1 -all"'),
+        ]
+        with patch.object(dns.resolver.Resolver, "resolve", return_value=answers):
+            records = parsedmarc.utils.query_dns("_dmarc.example.com", "TXT")
+        self.assertEqual(
+            records,
+            ["v=DMARC1; p=reject; rua=mailto:a@example.com", "v=spf1 -all"],
+        )
+
+    def testTxtKeepsQuotesBackslashesAndUtf8(self):
+        """The raw bytes are returned: an embedded quote or backslash is not
+        left as a presentation-format escape, a UTF-8 string is decoded, and
+        a trailing dot is kept; undecodable bytes are shown as escapes."""
+        answers = [
+            self._txt('"a\\"b\\\\c" "caf\\195\\169."'),
+            self._txt('"\\255"'),
+        ]
+        with patch.object(dns.resolver.Resolver, "resolve", return_value=answers):
+            records = parsedmarc.utils.query_dns("example.com", "TXT")
+        self.assertEqual(records, ['a"b\\ccafé.', "\\xff"])
+
+
 class TestEncryptedDnsNameservers(unittest.TestCase):
     """Tests for the DNS over HTTPS and DNS over TLS transports selected by
     the form of each ``nameservers`` entry

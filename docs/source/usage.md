@@ -187,6 +187,18 @@ The full set of configuration options is:
   - `offline` - bool: Do not use online queries for geolocation
       or DNS. Also disables automatic downloading of the IP-to-country
       database and reverse DNS map.
+  - `dmarc_lookup_policy` - bool: Look up the DMARC policy currently
+      published in DNS for the `policy_published` domain of each aggregate
+      report, and log a warning when its `p`, `sp`, `adkim`, or `aspf` (or
+      `np`, only when the report sets it) differs from the report's `policy_published` (Default: `False`). The
+      lookup follows the RFC 9989 DNS Tree Walk, so it costs up to eight
+      TXT queries per report, plus at most one query to test whether the
+      domain exists when the record was found at a parent domain whose
+      `sp` and `np` policies differ. It only logs: the
+      parsed report is not changed, and a DNS error never fails parsing.
+      A report covers a past period while DNS shows the present, so a
+      warning can also mean the policy changed since. Ignored when
+      `offline` is set. (env var: `PARSEDMARC_GENERAL_DMARC_LOOKUP_POLICY`)
   - `always_use_local_files` - bool: Disables the download of the
       IP-to-country database and reverse DNS map
   - `local_reverse_dns_map_path` - str: Overrides the default local file path to use for the reverse DNS map
@@ -1474,8 +1486,8 @@ for that batch have completed. The following settings are reloaded:
   the referenced YAML file is re-read on reload)
 - DNS and GeoIP settings (`nameservers`, `dns_timeout`, `ip_db_path`,
   `ipinfo_url`, `offline`, etc.)
-- Processing flags (`strip_attachment_payloads`, `batch_size`,
-  `check_timeout`, etc.)
+- Processing flags (`strip_attachment_payloads`, `dmarc_lookup_policy`,
+  `batch_size`, `check_timeout`, etc.)
 - Log level (`debug`, `verbose`, `warnings`, `silent`)
 
 Mailbox connection settings (IMAP host/credentials, Microsoft Graph,
